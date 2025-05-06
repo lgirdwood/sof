@@ -42,6 +42,11 @@ if(zephyr) ###  Zephyr ###
 		library/native_system_service.c
 	)
 
+	if(CONFIG_USERSPACE)
+		zephyr_library_sources_ifdef(CONFIG_INTEL_MODULES
+			${SOF_AUDIO_PATH}/module_adapter/module/modules_userspace.c)
+	endif()
+
 	zephyr_library_sources_ifdef(CONFIG_PASSTHROUGH_CODEC
 		module/passthrough.c
 	)

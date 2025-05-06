@@ -21,6 +21,7 @@
 #include <sof/audio/pipeline.h>
 #include <sof/debug/telemetry/telemetry.h>
 #include <rtos/idc.h>
+#include <rtos/userspace_helper.h>
 #include <sof/lib/dai.h>
 #include <sof/schedule/schedule.h>
 #include <ipc/control.h>
@@ -553,6 +554,7 @@ struct comp_driver {
 	const struct sof_uuid *uid;			/**< Address to UUID value */
 	struct tr_ctx *tctx;				/**< Pointer to trace context */
 	struct comp_ops ops;				/**< component operations */
+	struct sys_heap *drv_heap;
 	const struct module_interface *adapter_ops;	/**< module specific operations.
 							  * Intended to replace the ops field.
 							  * Currently used by module_adapter.

@@ -26,6 +26,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sof/audio/module_adapter/module/generic.h>
 
 LOG_MODULE_DECLARE(pipe, CONFIG_SOF_LOG_LEVEL);
 
@@ -395,7 +396,8 @@ int pipeline_comp_dp_task_init(struct comp_dev *comp)
 					     &ops,
 					     mod,
 					     comp->ipc_config.core,
-					     TASK_DP_STACK_SIZE);
+					     TASK_DP_STACK_SIZE,
+					     mod->is_non_priviledged ? K_USER : 0);
 		if (ret < 0)
 			return ret;
 	}

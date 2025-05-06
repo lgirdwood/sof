@@ -184,7 +184,25 @@ int lib_manager_register_module(const uint32_t component_id);
  *
  * Gets firmware manifest descriptor using module_id to locate it
  */
+const struct sof_man_fw_desc *lib_manager_get_library_module_desc(int module_id);
+
+/*
+ * \brief Get library module manifest descriptor
+ *
+ * param[in] module_id - used to get text manifest offset
+ *
+ * Gets firmware manifest descriptor using module_id to locate it
+ */
 const struct sof_man_fw_desc *lib_manager_get_library_manifest(int module_id);
+
+/*
+ * \brief Get module manifest
+ *
+ * param[in] module_id - used to get text manifest offset
+ *
+ * Gets firmware manifest descriptor using module_id to locate it
+ */
+const struct sof_man_module *lib_manager_get_man_module(int module_id);
 
 struct processing_module;
 /*

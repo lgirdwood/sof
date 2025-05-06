@@ -7,11 +7,13 @@
 
 #include <sof/audio/module_adapter/module/generic.h>
 #include <sof/audio/module_adapter/module/modules.h>
+#include <sof/audio/module_adapter/module/modules_userspace.h>
 #include <utilities/array.h>
 #include <iadk_module_adapter.h>
 #include <system_agent.h>
 #include <sof/lib_manager.h>
 #include <sof/audio/module_adapter/module/module_interface.h>
+#include <sof/audio/module_adapter/library/native_system_agent.h>
 
 /* Intel module adapter is an extension to SOF module adapter component that allows to integrate
  * modules developed under IADK (Intel Audio Development Kit) Framework. IADK modules uses uniform
@@ -45,6 +47,175 @@ LOG_MODULE_REGISTER(sof_modules, CONFIG_SOF_LOG_LEVEL);
 SOF_DEFINE_REG_UUID(modules);
 DECLARE_TR_CTX(intel_codec_tr, SOF_UUID(modules_uuid), LOG_LEVEL_INFO);
 
+int modules_init_helper(struct processing_module *mod, uint32_t module_id,
+			       uint32_t instance_id, uint32_t log_handle, void *mod_cfg)
+{
+	struct module_data *md = &mod->priv;
+	int ret = -EINVAL;
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+	const struct ipc4_base_module_cfg *src_cfg = &md->cfg.base_cfg;
+	const struct comp_ipc_config *config = &dev->ipc_config;
+	void *adapter;
+
+	uintptr_t module_entry_point = lib_manager_allocate_module(config, src_cfg);
+
+	if (module_entry_point == 0) {
+		comp_err(dev, "modules_init(), lib_manager_allocate_module() failed!");
+		return -EINVAL;
+	}
+
+	/* Call module specific init function if exists. */
+	if (mod->is_native_sof) {
+		((struct comp_driver *)drv)->adapter_ops = native_system_agent_start(module_entry_point,
+							       module_id, instance_id, 0,
+							       log_handle,
+							       mod_cfg);
+		if (!drv->adapter_ops)
+			return ret;
+
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		/* The order of preference */
+		if (mod_in->process)
+			mod->proc_type = MODULE_PROCESS_TYPE_SOURCE_SINK;
+		else if (mod_in->process_audio_stream)
+			mod->proc_type = MODULE_PROCESS_TYPE_STREAM;
+		else if (mod_in->process_raw_data)
+			mod->proc_type = MODULE_PROCESS_TYPE_RAW;
+		else
+			return -EINVAL;
+
+		ret = mod_in->init(mod);
+	} else {
+		mod->proc_type = MODULE_PROCESS_TYPE_RAW;
+		// TODO: fix
+		//((struct comp_driver *)drv)->adapter_ops = system_agent_start(module_entry_point, module_id,
+		//			     instance_id, 0, log_handle, mod_cfg, &adapter);
+
+		if (drv->adapter_ops)
+			ret = iadk_wrapper_init((void *)drv->adapter_ops);
+	}
+	return ret;
+}
+
+int modules_prepare_helper(struct processing_module *mod)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+			return mod_in->prepare(mod, NULL, 0, NULL, 0);
+	} else {
+
+		return iadk_wrapper_prepare(module_get_private_data(mod));
+	}
+}
+
+int modules_free_helper(struct processing_module *mod)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->free(mod);
+	} else {
+		return iadk_wrapper_free(module_get_private_data(mod));
+	}
+}
+
+int modules_reset_helper(struct processing_module *mod)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->reset(mod);
+	}
+	return iadk_wrapper_reset(module_get_private_data(mod));
+}
+
+int modules_set_configuration_helper(struct processing_module *mod, uint32_t config_id,
+		     enum module_cfg_fragment_position pos,
+		     uint32_t data_offset_size, const uint8_t *fragment,
+		     size_t fragment_size, uint8_t *response,
+		     size_t response_size)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->set_configuration(mod, config_id, pos,
+						 data_offset_size,
+						 fragment, fragment_size,
+						 response, response_size);
+	}
+	return iadk_wrapper_set_configuration(module_get_private_data(mod),
+					      config_id, pos, data_offset_size,
+					      fragment, fragment_size, response,
+					      response_size);
+}
+
+int modules_get_configuration_helper(struct processing_module *mod, uint32_t config_id,
+		     enum module_cfg_fragment_position pos,
+		     uint32_t *data_offset_size, uint8_t *fragment,
+		     size_t fragment_size)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->get_configuration(mod, config_id,
+						 data_offset_size,
+						 fragment, fragment_size);
+	}
+	return iadk_wrapper_get_configuration(module_get_private_data(mod),
+					      config_id, pos, data_offset_size,
+					      fragment, fragment_size);
+}
+
+int modules_set_processing_mode_helper(struct processing_module *mod,
+				       enum module_processing_mode mode)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->set_processing_mode(mod, mode);
+	}
+	return iadk_wrapper_set_processing_mode(module_get_private_data(mod), mode);
+}
+
+enum module_processing_mode modules_get_processing_mode_helper(struct processing_module *mod)
+{
+	struct comp_dev *dev = mod->dev;
+	const struct comp_driver *const drv = dev->drv;
+	if (mod->is_native_sof) {
+		struct module_interface *mod_in =
+					(struct module_interface *)drv->adapter_ops;
+
+		return mod_in->get_processing_mode(mod);
+	}
+	return iadk_wrapper_get_processing_mode(module_get_private_data(mod));
+}
+
 /**
  * \brief modules_init.
  * \param[in] mod - processing module pointer.
@@ -62,6 +233,12 @@ static int modules_init(struct processing_module *mod)
 	void *adapter;
 	int ret;
 
+	const uint32_t module_id = IPC4_MOD_ID(mod->dev->ipc_config.id);
+	const uint32_t instance_id = IPC4_INST_ID(mod->dev->ipc_config.id);
+	const uint32_t log_handle = (uint32_t) mod->dev->drv->tctx;
+
+	const struct sof_man_module *module_entry = lib_manager_get_man_module(module_id);
+
 	uintptr_t module_entry_point = lib_manager_allocate_module(config, src_cfg);
 
 	if (module_entry_point == 0) {
@@ -69,12 +246,19 @@ static int modules_init(struct processing_module *mod)
 		return -EINVAL;
 	}
 
+#if CONFIG_USERSPACE
+	if (module_entry->type.user_mode) {
+		mod->is_non_priviledged = true;
+		int ret = modules_user_worker(mod);
+		if (ret < 0) {
+			comp_err(dev, "modules_init(), modules_user_worker() failed!");
+			return -EINVAL;
+		}
+	}
+#endif
+
 	/* At this point module resources are allocated and it is moved to L2 memory. */
 	comp_info(dev, "modules_init() start");
-
-	const uint32_t module_id = IPC4_MOD_ID(config->id);
-	const uint32_t instance_id = IPC4_INST_ID(config->id);
-	const uint32_t log_handle = (uint32_t)drv->tctx;
 
 	byte_array_t mod_cfg = {
 		.data = (uint8_t *)md->cfg.init_data,
@@ -117,6 +301,12 @@ static int modules_prepare(struct processing_module *mod,
 
 	comp_info(dev, "modules_prepare()");
 
+#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged) {
+		return module_prepare_user(mod);
+	}
+#endif
+
 	return iadk_wrapper_prepare(module_get_private_data(mod));
 }
 
@@ -138,10 +328,16 @@ static int modules_process(struct processing_module *mod,
 static int modules_free(struct processing_module *mod)
 {
 	struct comp_dev *dev = mod->dev;
-	int ret;
+	int ret = 0;
 
 	comp_info(dev, "modules_free()");
-	ret = iadk_wrapper_free(module_get_private_data(mod));
+
+	if (!mod->is_non_priviledged)
+		ret = iadk_wrapper_free(module_get_private_data(mod));
+#if CONFIG_USERSPACE
+	else
+		ret = module_free_user(mod);
+#endif
 	if (ret)
 		comp_err(dev, "modules_free(): iadk_wrapper_free failed with error: %d", ret);
 
@@ -169,6 +365,16 @@ static int modules_set_configuration(struct processing_module *mod, uint32_t con
 				     size_t fragment_size, uint8_t *response,
 				     size_t response_size)
 {
+	#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged)
+		return module_set_configuration_user(mod,
+						     config_id, pos,
+						     data_offset_size,
+						     fragment,
+						     fragment_size,
+						     response,
+						     response_size);
+#endif
 	return iadk_wrapper_set_configuration(module_get_private_data(mod), config_id, pos,
 					      data_offset_size, fragment, fragment_size,
 					      response, response_size);
@@ -190,8 +396,17 @@ static int modules_get_configuration(struct processing_module *mod, uint32_t con
 				     uint32_t *data_offset_size, uint8_t *fragment,
 				     size_t fragment_size)
 {
+	#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged)
+		return module_get_configuration_user(mod,
+						     config_id,
+						     MODULE_CFG_FRAGMENT_SINGLE,
+						     data_offset_size,
+						     fragment,
+						     fragment_size);
+#endif
 	return iadk_wrapper_get_configuration(module_get_private_data(mod), config_id,
-					      MODULE_CFG_FRAGMENT_SINGLE, *data_offset_size,
+					      MODULE_CFG_FRAGMENT_SINGLE, data_offset_size,
 					      fragment, fragment_size);
 }
 
@@ -205,6 +420,10 @@ static int modules_get_configuration(struct processing_module *mod, uint32_t con
 static int modules_set_processing_mode(struct processing_module *mod,
 				       enum module_processing_mode mode)
 {
+	#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged)
+		return module_set_processing_mode_user(mod, mode);
+#endif
 	return iadk_wrapper_set_processing_mode(module_get_private_data(mod), mode);
 }
 
@@ -216,6 +435,10 @@ static int modules_set_processing_mode(struct processing_module *mod,
  */
 static enum module_processing_mode modules_get_processing_mode(struct processing_module *mod)
 {
+	#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged)
+		return module_get_processing_mode_user(mod);
+#endif
 	return iadk_wrapper_get_processing_mode(module_get_private_data(mod));
 }
 
@@ -228,8 +451,13 @@ static enum module_processing_mode modules_get_processing_mode(struct processing
  */
 static int modules_reset(struct processing_module *mod)
 {
+#if CONFIG_USERSPACE
+	if (mod->is_non_priviledged)
+		return module_reset_user(mod);
+#endif
 	return iadk_wrapper_reset(module_get_private_data(mod));
 }
+extern const struct module_interface processing_module_adapter_interface;
 
 /* Processing Module Adapter API*/
 const struct module_interface processing_module_adapter_interface = {

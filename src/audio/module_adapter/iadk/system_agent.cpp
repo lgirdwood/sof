@@ -22,6 +22,13 @@
 #include <system_agent.h>
 #include <sof/audio/module_adapter/library/native_system_service.h>
 
+#ifdef CONFIG_USERSPACE
+#define _USER_DATA_ __attribute__((section("data_smem_ipc_partition_data")))
+#else
+#define _USER_DATA_
+#endif
+
+
 using namespace intel_adsp;
 using namespace intel_adsp::system;
 using namespace dsp_fw;

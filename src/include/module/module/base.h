@@ -15,6 +15,7 @@
 
 #include "interface.h"
 #include "../ipc4/base-config.h"
+#include <rtos/userspace_helper.h>
 
 #define module_get_private_data(mod) ((mod)->priv.private)
 #define module_set_private_data(mod, data) ((mod)->priv.private = data)
@@ -168,6 +169,15 @@ struct processing_module {
 	 */
 	bool stream_copy_single_to_single;
 
+	/* flag to insure that module is loadable */
+	bool is_native_sof;
+
+	/* flag to insure that module should be load in non_priviledged mode */
+	bool is_non_priviledged;
+
+	/* pointer to system services for loadable modules */
+	uint32_t *sys_service;
+
 	/* total processed data after stream started */
 	uint64_t total_data_consumed;
 	uint64_t total_data_produced;
@@ -175,8 +185,12 @@ struct processing_module {
 	/* max source/sinks supported by the module */
 	uint32_t max_sources;
 	uint32_t max_sinks;
-
 	enum module_processing_type proc_type;
+
+#ifdef CONFIG_USERSPACE
+	struct processing_module_user dev_user;
+#endif
+
 #endif /* SOF_MODULE_PRIVATE */
 };
 

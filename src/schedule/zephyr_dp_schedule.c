@@ -42,7 +42,23 @@ struct task_dp_pdata {
 	struct processing_module *mod;	/* the module to be scheduled */
 	uint32_t ll_cycles_to_start;    /* current number of LL cycles till delayed start */
 };
+#ifdef CONFIG_USERSPACE
+/* Single CPU-wide lock
+ * The irq_lock is not available for USERSPACE (non-privileged) threads.
+ * Therefore semaphore is used to control critical section.
+ */
+static APP_TASK_DATA struct sys_sem dp_lock[CONFIG_MP_MAX_NUM_CPUS];
+static inline unsigned int scheduler_dp_lock(uint16_t core)
+{
+	return sys_sem_take(&dp_lock[core], K_FOREVER);
+}
 
+static inline void scheduler_dp_unlock(unsigned int key, uint16_t core)
+{
+	sys_sem_give(&dp_lock[core]);
+}
+
+#else
 /* Single CPU-wide lock
  * as each per-core instance if dp-scheduler has separate structures, it is enough to
  * use irq_lock instead of cross-core spinlocks
@@ -56,7 +72,7 @@ static inline void scheduler_dp_unlock(unsigned int key)
 {
 	irq_unlock(key);
 }
-
+#endif
 /* dummy LL task - to start LL on secondary cores */
 static enum task_state scheduler_dp_ll_tick_dummy(void *data)
 {
@@ -226,7 +242,11 @@ void scheduler_dp_ll_tick(void *receiver_data, enum notify_id event_type, void *
 	unsigned int lock_key;
 	struct scheduler_dp_data *dp_sch = scheduler_get_data(SOF_SCHEDULE_DP);
 
+	#ifdef CONFIG_USERSPACE
+	lock_key = scheduler_dp_lock(cpu_get_id());
+	#else
 	lock_key = scheduler_dp_lock();
+	#endif
 	list_for_item(tlist, &dp_sch->tasks) {
 		curr_task = container_of(tlist, struct task, list);
 		pdata = curr_task->priv_data;
@@ -260,7 +280,11 @@ void scheduler_dp_ll_tick(void *receiver_data, enum notify_id event_type, void *
 			}
 		}
 	}
+#ifdef CONFIG_USERSPACE
+	scheduler_dp_unlock(lock_key, cpu_get_id());
+#else 
 	scheduler_dp_unlock(lock_key);
+#endif
 }
 
 static int scheduler_dp_task_cancel(void *data, struct task *task)
@@ -271,8 +295,11 @@ static int scheduler_dp_task_cancel(void *data, struct task *task)
 
 
 	/* this is asyn cancel - mark the task as canceled and remove it from scheduling */
+	#ifdef CONFIG_USERSPACE
+	lock_key = scheduler_dp_lock(cpu_get_id());
+	#else
 	lock_key = scheduler_dp_lock();
-
+	#endif
 	task->state = SOF_TASK_STATE_CANCEL;
 	list_item_del(&task->list);
 
@@ -282,8 +309,11 @@ static int scheduler_dp_task_cancel(void *data, struct task *task)
 
 	/* if the task is waiting on a semaphore - let it run and self-terminate */
 	k_sem_give(&pdata->sem);
+#ifdef CONFIG_USERSPACE
+	scheduler_dp_unlock(lock_key, cpu_get_id());
+#else
 	scheduler_dp_unlock(lock_key);
-
+#endif
 	/* wait till the task has finished, if there was any task created */
 	if (pdata->thread_id)
 		k_thread_join(pdata->thread_id, K_FOREVER);
@@ -302,6 +332,9 @@ static int scheduler_dp_task_free(void *data, struct task *task)
 	 */
 	if (pdata->thread_id) {
 		k_thread_abort(pdata->thread_id);
+	#ifdef CONFIG_USERSPACE
+		user_sem_release((uintptr_t)pdata->mod);
+	#endif
 		pdata->thread_id = NULL;
 	}
 
@@ -335,8 +368,11 @@ static void dp_thread_fn(void *p1, void *p2, void *p3)
 			state = task_run(task);
 		else
 			state = task->state;	/* to avoid undefined variable warning */
-
+		#ifdef CONFIG_USERSPACE
+		lock_key = scheduler_dp_lock(task->core);
+		#else
 		lock_key = scheduler_dp_lock();
+		#endif
 		/*
 		 * check if task is still running, may have been canceled by external call
 		 * if not, set the state returned by run procedure
@@ -364,8 +400,11 @@ static void dp_thread_fn(void *p1, void *p2, void *p3)
 		/* if true exit the while loop, terminate the thread */
 		task_stop = task->state == SOF_TASK_STATE_COMPLETED ||
 			task->state == SOF_TASK_STATE_CANCEL;
-
+#ifdef CONFIG_USERSPACE
+		scheduler_dp_unlock(lock_key, task->core);
+#else
 		scheduler_dp_unlock(lock_key);
+#endif
 	} while (!task_stop);
 
 	/* call task_complete  */
@@ -381,13 +420,19 @@ static int scheduler_dp_task_shedule(void *data, struct task *task, uint64_t sta
 	unsigned int lock_key;
 	uint64_t deadline_clock_ticks;
 	int ret;
-
+#ifdef CONFIG_USERSPACE
+	lock_key = scheduler_dp_lock(cpu_get_id());
+#else
 	lock_key = scheduler_dp_lock();
-
+#endif
 	if (task->state != SOF_TASK_STATE_INIT &&
 	    task->state != SOF_TASK_STATE_CANCEL &&
 	    task->state != SOF_TASK_STATE_COMPLETED) {
+	#ifdef CONFIG_USERSPACE
+		scheduler_dp_unlock(lock_key, cpu_get_id());
+	#else
 		scheduler_dp_unlock(lock_key);
+	#endif
 		return -EINVAL;
 	}
 
@@ -424,14 +469,21 @@ static int scheduler_dp_task_shedule(void *data, struct task *task, uint64_t sta
 	pdata->deadline_clock_ticks = deadline_clock_ticks;
 	pdata->ll_cycles_to_start = period / LL_TIMER_PERIOD_US;
 	pdata->mod->dp_startup_delay = true;
+	#ifdef CONFIG_USERSPACE
+	scheduler_dp_unlock(lock_key, cpu_get_id());
+	#else
 	scheduler_dp_unlock(lock_key);
-
+	#endif
 	tr_dbg(&dp_tr, "DP task scheduled with period %u [us]", (uint32_t)period);
 	return 0;
 
 err:
 	/* cleanup - unlock and free all allocated resources */
+	#ifdef CONFIG_USERSPACE
+	scheduler_dp_unlock(lock_key, cpu_get_id());
+	#else
 	scheduler_dp_unlock(lock_key);
+	#endif
 	k_thread_abort(pdata->thread_id);
 	return ret;
 }
@@ -474,7 +526,8 @@ int scheduler_dp_task_init(struct task **task,
 			   const struct task_ops *ops,
 			   struct processing_module *mod,
 			   uint16_t core,
-			   size_t stack_size)
+			   size_t stack_size,
+			   uint32_t options)
 {
 	void __sparse_cache *p_stack = NULL;
 
@@ -530,6 +583,23 @@ int scheduler_dp_task_init(struct task **task,
 	/* initialize semaprhore */
 	k_sem_init(&task_memory->pdata.sem, 0, 1);
 
+#ifdef CONFIG_USERSPACE
+	if (options & K_USER) {
+		//TODO
+		k_tid_t thread_id;	
+		ret = user_memory_init_shd(thread_id,(uintptr_t)mod);
+		if (ret < 0) {
+			tr_err(&dp_tr, "zephyr_dp_task_init(): user_memory_init() failed");
+			goto err;
+		}
+
+		ret = user_sem_acquire((uintptr_t)mod, (struct sys_sem **)&task_memory->pdata.sem);
+		if (ret < 0) {
+			tr_err(&dp_tr, "zephyr_dp_task_init(): user_sem_acquire() failed");
+			goto err;
+		}
+	}
+#endif
 	/* success, fill the structures */
 	task_memory->task.priv_data = &task_memory->pdata;
 	task_memory->pdata.p_stack = p_stack;
@@ -541,6 +611,9 @@ int scheduler_dp_task_init(struct task **task,
 	return 0;
 err:
 	/* cleanup - free all allocated resources */
+#ifdef CONFIG_USERSPACE
+	user_sem_release((uintptr_t)mod);
+#endif
 	rfree((__sparse_force void *)p_stack);
 	rfree(task_memory);
 	return ret;
@@ -554,7 +627,16 @@ void scheduler_get_task_info_dp(struct scheduler_props *scheduler_props, uint32_
 	struct scheduler_dp_data *dp_sch =
 		(struct scheduler_dp_data *)scheduler_get_data(SOF_SCHEDULE_DP);
 
+	#ifdef CONFIG_USERSPACE
+	lock_key = scheduler_dp_lock(cpu_get_id());
+	#else
 	lock_key = scheduler_dp_lock();
+	#endif
+	
 	scheduler_get_task_info(scheduler_props, data_off_size,  &dp_sch->tasks);
+	#ifdef CONFIG_USERSPACE
+	scheduler_dp_unlock(lock_key, cpu_get_id());
+	#else
 	scheduler_dp_unlock(lock_key);
+	#endif
 }

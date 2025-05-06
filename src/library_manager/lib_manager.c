@@ -18,6 +18,7 @@
 #include <rtos/clk.h>
 #include <rtos/sof.h>
 #include <rtos/spinlock.h>
+#include <rtos/userspace_helper.h>
 #include <sof/lib/cpu-clk-manager.h>
 #include <sof/lib_manager.h>
 #include <sof/llext_manager.h>
@@ -149,7 +150,7 @@ static int lib_manager_load_data_from_storage(void __sparse_cache *vma, void *s_
 	return sys_mm_drv_update_region_flags((__sparse_force void *)vma, size, flags);
 }
 
-static int lib_manager_load_module(const uint32_t module_id,
+static int lib_manager_load_module(const struct comp_dev *dev, const uint32_t module_id,
 				   const struct sof_man_module *const mod)
 {
 	struct lib_manager_mod_ctx *ctx = lib_manager_get_mod_ctx(module_id);
@@ -177,6 +178,20 @@ static int lib_manager_load_module(const uint32_t module_id,
 		ret = lib_manager_load_data_from_storage(va_base, src, size, flags);
 		if (ret < 0)
 			goto err;
+
+				/* For non_priviledged mode of operation we need to add module memory to its
+	 * private memory domain
+	 */
+#if CONFIG_USERSPACE
+	struct processing_module *procmod = comp_get_drvdata(dev);
+	if (procmod->is_non_priviledged) {
+		ret = user_add_memory(procmod->dev_user.comp_dom,
+				      (uintptr_t)va_base, size,
+				      K_MEM_PARTITION_P_RX_U_RX);
+		if (ret < 0)
+			goto err;
+	}
+#endif
 	}
 
 	return 0;
@@ -219,7 +234,7 @@ static int lib_manager_unload_module(const struct sof_man_module *const mod)
 /* There are modules marked as lib_code. This is code shared between several modules inside
  * the library. Load all lib_code modules with first none lib_code module load.
  */
-static int lib_manager_load_libcode_modules(const uint32_t module_id)
+static int lib_manager_load_libcode_modules(const struct comp_dev *dev, const uint32_t module_id)
 {
 	const struct sof_man_fw_desc *const desc = lib_manager_get_library_manifest(module_id);
 	struct ext_library *const ext_lib = ext_lib_get();
@@ -233,7 +248,7 @@ static int lib_manager_load_libcode_modules(const uint32_t module_id)
 
 	for (idx = 0; idx < desc->header.num_module_entries; ++idx, ++module_entry) {
 		if (module_entry->type.lib_code) {
-			ret = lib_manager_load_module(lib_id << LIB_MANAGER_LIB_ID_SHIFT | idx,
+			ret = lib_manager_load_module(dev, lib_id << LIB_MANAGER_LIB_ID_SHIFT | idx,
 						      module_entry);
 			if (ret < 0)
 				goto err;
@@ -294,7 +309,8 @@ static void lib_manager_get_instance_bss_address(uint32_t instance_id,
 	       (__sparse_force void *)*va_addr);
 }
 
-static int lib_manager_allocate_module_instance(uint32_t instance_id, uint32_t is_pages,
+static int lib_manager_allocate_module_instance(const struct comp_dev *dev, uint32_t module_id, uint32_t instance_id,
+						uint32_t is_pages,
 						const struct sof_man_module *mod)
 {
 	size_t bss_size;
@@ -314,6 +330,20 @@ static int lib_manager_allocate_module_instance(uint32_t instance_id, uint32_t i
 	if (sys_mm_drv_map_region((__sparse_force void *)va_base, POINTER_TO_UINT(NULL),
 				  bss_size, SYS_MM_MEM_PERM_RW) < 0)
 		return -ENOMEM;
+
+	/* For non_priviledged mode of operation we need to add module memory to its
+	 * private memory domain
+	 */
+#if CONFIG_USERSPACE
+	struct processing_module *procmod = comp_get_drvdata(dev);
+	if (procmod->is_non_priviledged) {
+		int ret = user_add_memory(procmod->dev_user.comp_dom,
+				      (uintptr_t)va_base, bss_size,
+				      K_MEM_PARTITION_P_RW_U_RW);
+		if (ret < 0)
+			return ret;
+	}
+#endif
 
 	memset((__sparse_force void *)va_base, 0, bss_size);
 
@@ -338,7 +368,8 @@ uintptr_t lib_manager_allocate_module(const struct comp_ipc_config *ipc_config,
 	const struct sof_man_module *mod;
 	const struct ipc4_base_module_cfg *base_cfg = ipc_specific_config;
 	const uint32_t module_id = IPC4_MOD_ID(ipc_config->id);
-	int ret;
+	//const struct comp_driver *drv = proc->dev->drv;
+	int ret = 0;
 
 	tr_dbg(&lib_manager_tr, "mod_id: %#x", ipc_config->id);
 
@@ -350,19 +381,19 @@ uintptr_t lib_manager_allocate_module(const struct comp_ipc_config *ipc_config,
 
 	if (module_is_llext(mod))
 		return llext_manager_allocate_module(ipc_config, ipc_specific_config);
-
-	ret = lib_manager_load_module(module_id, mod);
+	//TODO
+	//ret = lib_manager_load_module(proc->dev, module_id, mod);
 	if (ret < 0)
 		return 0;
 
 #ifdef CONFIG_LIBCODE_MODULE_SUPPORT
-	ret = lib_manager_load_libcode_modules(module_id);
+	//ret = lib_manager_load_libcode_modules(proc->dev, module_id);
 	if (ret < 0)
 		goto err;
 #endif /* CONFIG_LIBCODE_MODULE_SUPPORT */
 
-	ret = lib_manager_allocate_module_instance(IPC4_INST_ID(ipc_config->id), base_cfg->is_pages,
-						   mod);
+	//ret = lib_manager_allocate_module_instance(proc->dev, module_id, IPC4_INST_ID(ipc_config->id), base_cfg->is_pages,
+	//					   mod);
 	if (ret < 0) {
 		tr_err(&lib_manager_tr, "module allocation failed: %d", ret);
 #ifdef CONFIG_LIBCODE_MODULE_SUPPORT
@@ -439,6 +470,17 @@ void lib_manager_init(void)
 		sof->ext_library = &loader_ext_lib;
 }
 
+const struct sof_man_fw_desc *lib_manager_get_library_module_desc(int module_id)
+{
+	uint32_t lib_id = LIB_MANAGER_GET_LIB_ID(module_id);
+	struct ext_library *_ext_lib = ext_lib_get();
+	char *buffptr = (char *)_ext_lib->desc[lib_id];
+
+	if (!buffptr)
+		return NULL;
+	return (const struct sof_man_fw_desc *)(buffptr + SOF_MAN_ELF_TEXT_OFFSET);
+}
+
 const struct sof_man_fw_desc *lib_manager_get_library_manifest(int module_id)
 {
 	struct lib_manager_mod_ctx *ctx = lib_manager_get_mod_ctx(module_id);
@@ -447,6 +489,21 @@ const struct sof_man_fw_desc *lib_manager_get_library_manifest(int module_id)
 	if (!buffptr)
 		return NULL;
 	return (struct sof_man_fw_desc *)(buffptr + SOF_MAN_ELF_TEXT_OFFSET);
+}
+
+const struct sof_man_module *lib_manager_get_man_module(int module_id)
+{
+	const struct sof_man_fw_desc *desc;
+	uint32_t entry_index = LIB_MANAGER_GET_MODULE_INDEX(module_id);
+
+	desc = lib_manager_get_library_module_desc(module_id);
+	if (!desc) {
+		tr_err(&lib_manager_tr, "modules_init(): Failed to load manifest");
+		return NULL;
+	}
+	const struct sof_man_module *module_entry =
+		(const struct sof_man_module *)((char *)desc + SOF_MAN_MODULE_OFFSET(entry_index));
+	return module_entry;
 }
 
 static void lib_manager_update_sof_ctx(void *base_addr, uint32_t lib_id)
@@ -593,6 +650,7 @@ int lib_manager_register_module(const uint32_t component_id)
 	const struct sof_module_api_build_info *build_info;
 	struct comp_driver_info *new_drv_info;
 	struct comp_driver *drv = NULL;
+	struct sys_heap *drv_heap = NULL;
 	const struct sof_man_module *mod;
 	int ret;
 
@@ -607,10 +665,22 @@ int lib_manager_register_module(const uint32_t component_id)
 		return -ENOENT;
 	}
 
-	/* allocate new comp_driver_info */
-	new_drv_info = rmalloc(SOF_MEM_ZONE_RUNTIME_SHARED, 0,
-			       SOF_MEM_CAPS_RAM | SOF_MEM_FLAG_COHERENT,
-			       sizeof(struct comp_driver_info));
+	mod = (struct sof_man_module *)((const uint8_t *)desc + SOF_MAN_MODULE_OFFSET(entry_index));
+	const struct sof_uuid *uid = (struct sof_uuid *)&mod->uuid;
+
+#if CONFIG_USERSPACE
+	if (mod->type.user_mode) {
+		drv_heap = drv_heap_init();
+		if (!drv_heap) {
+			return -ENOMEM;
+		}
+	}
+#endif
+
+	/* Use user_rmalloc() to allocate from private module heap when user_mode set */
+	new_drv_info = drv_heap_rmalloc(drv_heap, SOF_MEM_ZONE_RUNTIME_SHARED, 0,
+					SOF_MEM_CAPS_RAM | SOF_MEM_FLAG_COHERENT,
+					sizeof(struct comp_driver_info));
 
 	if (!new_drv_info) {
 		tr_err(&lib_manager_tr, "failed to allocate comp_driver_info");
@@ -618,18 +688,21 @@ int lib_manager_register_module(const uint32_t component_id)
 		goto cleanup;
 	}
 
-	drv = rzalloc(SOF_MEM_ZONE_RUNTIME_SHARED, 0,
-		      SOF_MEM_CAPS_RAM | SOF_MEM_FLAG_COHERENT,
-		      sizeof(struct comp_driver));
+	/* Use user_rmalloc() to allocate from private module heap when user_mode set */
+	drv = drv_heap_rmalloc(drv_heap, SOF_MEM_ZONE_RUNTIME_SHARED, 0,
+			       SOF_MEM_CAPS_RAM | SOF_MEM_FLAG_COHERENT,
+			       sizeof(struct comp_driver));
 	if (!drv) {
 		tr_err(&lib_manager_tr, "failed to allocate comp_driver");
 		ret = -ENOMEM;
 		goto cleanup;
 	}
+	memset(drv, 0, sizeof(struct comp_driver));
 
-	mod = (const struct sof_man_module *)((const uint8_t *)desc +
-					      SOF_MAN_MODULE_OFFSET(entry_index));
-	const struct sof_uuid *uid = (const struct sof_uuid *)&mod->uuid;
+	// TODO
+	//mod = (const struct sof_man_module *)((const uint8_t *)desc +
+	//				      SOF_MAN_MODULE_OFFSET(entry_index));
+	//const struct sof_uuid *uid = (const struct sof_uuid *)&mod->uuid;
 
 	lib_manager_prepare_module_adapter(drv, uid);
 
@@ -669,11 +742,14 @@ int lib_manager_register_module(const uint32_t component_id)
 
 	/* Register new driver in the list */
 	ret = comp_register(new_drv_info);
+	drv->drv_heap = drv_heap;
 
 cleanup:
 	if (ret < 0) {
-		rfree(drv);
-		rfree(new_drv_info);
+		if (drv)
+			drv_heap_free(drv_heap, drv);
+		if (new_drv_info)
+			drv_heap_free(drv_heap, new_drv_info);
 	}
 
 	return ret;

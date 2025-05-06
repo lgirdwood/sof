@@ -9,6 +9,7 @@
 #define __SOF_AUDIO_MODULES__
 
 #include <sof/audio/module_adapter/module/generic.h>
+#include <iadk_module_adapter.h>
 
 /* Intel module adapter is an extension to SOF module adapter component that allows to integrate
  * modules developed under IADK (Intel Audio Development Kit)
@@ -39,7 +40,62 @@
  * with version read from elf file.
  */
 
-/* Processing Module Adapter API */
+
+struct comp_dev *modules_shim_new(const struct comp_driver *drv,
+				  const struct comp_ipc_config *config,
+				  const void *spec);
+
+static inline void declare_dynamic_module_adapter(struct comp_driver *drv,
+						  enum sof_comp_type mtype,
+						  const struct sof_uuid *uuid,
+						  struct tr_ctx *tr)
+{
+	drv->type = mtype;
+	drv->uid = uuid;
+	drv->tctx = tr;
+	drv->ops.create = modules_shim_new;
+	drv->ops.prepare = module_adapter_prepare;
+	drv->ops.params = module_adapter_params;
+	drv->ops.copy = module_adapter_copy;
+#if CONFIG_IPC_MAJOR_3
+	drv->ops.cmd = module_adapter_cmd;
+#endif
+	drv->ops.trigger = module_adapter_trigger;
+	drv->ops.reset = module_adapter_reset;
+	drv->ops.free = module_adapter_free;
+	drv->ops.set_large_config = module_set_large_config;
+	drv->ops.get_large_config = module_get_large_config;
+	drv->ops.get_attribute = module_adapter_get_attribute;
+	drv->ops.bind = module_adapter_bind;
+	drv->ops.unbind = module_adapter_unbind;
+}
+
+int modules_init_helper(struct processing_module *mod,
+			uint32_t module_id,
+			uint32_t instance_id,
+			uint32_t log_handle,
+			void *mod_cfg);
+int modules_prepare_helper(struct processing_module *mod);
+int modules_free_helper(struct processing_module *mod);
+int modules_reset_helper(struct processing_module *mod);
+int modules_set_configuration_helper(struct processing_module *mod,
+				     uint32_t config_id,
+				     enum module_cfg_fragment_position pos,
+				     uint32_t data_offset_size,
+				     const uint8_t *fragment,
+				     size_t fragment_size,
+				     uint8_t *response,
+				     size_t response_size);
+int modules_get_configuration_helper(struct processing_module *mod,
+				     uint32_t config_id,
+				     enum module_cfg_fragment_position pos,
+				     uint32_t *data_offset_size,
+				     uint8_t *fragment,
+				     size_t fragment_size);
+int modules_set_processing_mode_helper(struct processing_module *mod,
+				       enum module_processing_mode mode);
+enum module_processing_mode modules_get_processing_mode_helper(struct processing_module *mod);
+
 extern const struct module_interface processing_module_adapter_interface;
 
 #endif /* __SOF_AUDIO_MODULES__ */
