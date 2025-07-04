@@ -65,7 +65,7 @@ void task_context_set(void *task_ctx)
 
 int task_context_alloc(void **task_ctx)
 {
-	*task_ctx = rzalloc(SOF_MEM_ZONE_SYS_RUNTIME, 0, SOF_MEM_CAPS_RAM,
+	*task_ctx = rzalloc(SOF_MEM_FLAG_USER,
 			    sizeof(xtos_task_context));
 	if (!*task_ctx)
 		return -ENOMEM;
@@ -83,7 +83,7 @@ int task_context_init(void *task_ctx, void *entry, void *arg0, void *arg1,
 		ctx->stack_base = stack;
 		ctx->stack_size = stack_size;
 	} else {
-		ctx->stack_base = rballoc(0, SOF_MEM_CAPS_RAM,
+		ctx->stack_base = rballoc(SOF_MEM_FLAG_USER,
 					  PLATFORM_TASK_DEFAULT_STACK_SIZE);
 		if (!ctx->stack_base)
 			return -ENOMEM;
