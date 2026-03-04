@@ -17,6 +17,8 @@
 
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
+#include <sof_versions.h>
+
 static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 		       size_t argc, char *argv[])
 {
@@ -62,9 +64,18 @@ static int cmd_sof_module_heap_usage(const struct shell *sh,
 			continue;
 
 		usage = module_adapter_heap_usage(comp_mod(icd->cd), &hwm);
-		shell_print(sh, "comp id 0x%08x%9zu usage%9zu hwm %9zu max\tbytes",
-			    icd->id, usage, hwm, comp_mod(icd->cd)->priv.cfg.heap_bytes);
+		shell_print(sh, "comp id 0x%08x%9zu usage%9zu hwm",
+			    icd->id, usage, hwm);
 	}
+	return 0;
+}
+
+static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
+{
+	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
+		    SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_TAG, SOF_BUILD);
+	shell_print(sh, "Git Tag: %s", SOF_GIT_TAG);
+	shell_print(sh, "Source Hash: 0x%08x", SOF_SRC_HASH);
 	return 0;
 }
 
@@ -76,6 +87,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(module_heap_usage, NULL,
 		  "Print heap memory usage of each module\n",
 		  cmd_sof_module_heap_usage),
+
+	SHELL_CMD(version, NULL,
+		  "Print the current SOF software version\n",
+		  cmd_sof_version),
 
 	SHELL_SUBCMD_SET_END
 );
