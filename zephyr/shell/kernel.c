@@ -60,6 +60,8 @@ SHELL_SUBCMD_SET_CREATE(sub_sof, (sof));
 
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
+#include <sof_versions.h>
+
 __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 						size_t argc, char *argv[])
 {
@@ -925,5 +927,18 @@ SHELL_SUBCMD_ADD((sof), core_off, NULL,
 		 "core_id must be 1..CONFIG_CORE_COUNT-1 (core 0 is primary).\n",
 		 cmd_sof_core_off, 2, 0);
 #endif
+
+static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
+{
+	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
+		    SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_TAG, SOF_BUILD);
+	shell_print(sh, "Git Tag: %s", SOF_GIT_TAG);
+	shell_print(sh, "Source Hash: 0x%08x", SOF_SRC_HASH);
+	return 0;
+}
+
+SHELL_SUBCMD_ADD((sof), version, NULL,
+		 "Print the current SOF software version\n",
+		 cmd_sof_version, 0, 0);
 SHELL_CMD_REGISTER(sof, &sub_sof,
 		   "SOF application commands", NULL);
