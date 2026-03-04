@@ -61,6 +61,8 @@
 
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
+#include <sof_versions.h>
+
 __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 		       size_t argc, char *argv[])
 {
@@ -1486,6 +1488,15 @@ __cold static int cmd_sof_llext_purge(const struct shell *sh,
 
 #endif /* CONFIG_SOF_SHELL_LLEXT_PURGE */
 
+static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
+{
+	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
+		    SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_TAG, SOF_BUILD);
+	shell_print(sh, "Git Tag: %s", SOF_GIT_TAG);
+	shell_print(sh, "Source Hash: 0x%08x", SOF_SRC_HASH);
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
@@ -1619,6 +1630,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 		  "mapped in SRAM (i.e. a pipeline using it is still active).\n",
 		  cmd_sof_llext_purge, 2, 0),
 #endif
+
+	SHELL_CMD(version, NULL,
+		  "Print the current SOF software version\n",
+		  cmd_sof_version),
 
 	SHELL_SUBCMD_SET_END
 );
