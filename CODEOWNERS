@@ -2,7 +2,7 @@
 # Each line is a file pattern followed by one or more owners.
 
 # These owners will be the default owners for everything in the repo.
-*       @lgirdwood @plbossart @mmaka1 @lbetlej @dbaluta @kv2019i
+*       @lgirdwood @plbossart @dbaluta @kv2019i
 
 # Order is important. The last matching pattern has the most precedence.
 # File patterns work mostly like .gitignore. Try to keep this file
@@ -12,14 +12,14 @@
 # include files
 src/include/sof/drivers/dmic.h		@singalsu
 src/include/ipc/**			@thesofproject/steering-committee
-src/include/ipc/**			@randerwang @tmleman @pblaszko
-src/include/ipc4/**			@randerwang @tmleman @pblaszko
+src/include/ipc/**			@tmleman
+src/include/ipc4/**			@tmleman
 src/include/kernel/**			@thesofproject/steering-committee
 src/include/user/**			@thesofproject/steering-committee
 src/include/sof/debug/gdb/*		@abonislawski
 src/include/sof/audio/aria/*		@abonislawski
-src/include/sof/audio/kpb.h		@fkwasowi @iganakov
-src/include/sof/audio/mux.h		@fkwasowi
+src/include/sof/audio/kpb.h		@iganakov
+# src/include/sof/audio/mux.h		TODO
 src/include/sof/audio/up_down_mixer/*	@abonislawski
 src/include/sof/audio/codec_adapter/*	@cujomalainey @abonislawski @dbaluta
 src/include/sof/audio/module_adapter/*	@ranj063 @jxstelter
@@ -29,13 +29,13 @@ src/include/sof/drivers/afe*		@yaochunhung
 # audio component
 src/audio/src*				@singalsu @abonislawski
 # src/audio/chain_dma*			TODO
-src/audio/copier/*			@randerwang @abonislawski @pblaszko
+src/audio/copier/*			@abonislawski
 src/audio/eq*				@singalsu
 src/audio/eq_fir*			@singalsu
 src/audio/eq_iir*			@singalsu
 src/audio/tone.c			@singalsu
-src/audio/kpb.c				@fkwasowi @iganakov
-src/audio/mux/*				@fkwasowi
+src/audio/kpb.c				@iganakov
+# src/audio/mux/*				TODO
 src/audio/dcblock*			@thesofproject/google
 src/audio/crossover*			@thesofproject/google
 src/audio/tdfb*                         @singalsu
@@ -62,10 +62,10 @@ src/drivers/mediatek/mt8195/*		@yaochunhung @kuanhsuncheng
 
 # other libs
 src/math/*				@singalsu
-src/ipc/*				@bardliao @tmleman @pblaszko
+src/ipc/*				@bardliao @tmleman
 # src/lib/*				TODO
 src/debug/gdb/*				@abonislawski
-src/schedule				@pblaszko @marcinszkudlinski @dbaluta @LaurentiuM1234
+src/schedule				@dbaluta @LaurentiuM1234
 
 # samples
 samples/audio/detect_test.c		@iganakov
@@ -75,7 +75,7 @@ samples/audio/detect_test.c		@iganakov
 # scripts/*				TODO
 
 # tools(old 'soft' repo)
-tools/logger/*				@bkokoszx @akloniex
+# tools/logger/*				TODO
 tools/topology/**			@ranj063
 tools/topology/topology2/**		@ranj063 @jsarha
 tools/testbench/*			@ranj063
@@ -89,8 +89,8 @@ tools/oss-fuzz/*			@thesofproject/google
 
 zephyr/**				@kv2019i @lyakh @iuliana-prodan @dbaluta @abonislawski
 zephyr/lib/cpu.c			@tmleman
-zephyr/lib/alloc.c			@dabekjakub
-zephyr/lib/regions_mm.c			@dabekjakub
+# zephyr/lib/alloc.c			TODO
+# zephyr/lib/regions_mm.c			TODO
 
 # installer
 # installer/**				TODO
@@ -111,7 +111,7 @@ zephyr/lib/regions_mm.c			@dabekjakub
 
 # *.sh					TODO
 # *.bash				TODO
-*trace.*				@akloniex
+# *trace.*				TODO
 
 /.github/				@dbaluta @cujomalainey @lgirdwood
 
