@@ -38,6 +38,12 @@
 #endif /* CONFIG_XTENSA_MMU */
 #endif /* CONFIG_SOF_SHELL_MMU_DBG */
 
+#if CONFIG_SOF_SHELL_LLEXT_LOAD
+#include <sof/shell_llext_load.h>
+#include <sof/lib_manager.h>
+#include <adsp_debug_window.h>
+#endif /* CONFIG_SOF_SHELL_LLEXT_LOAD */
+
 #include <stdlib.h>
 
 /*
@@ -301,7 +307,7 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 	/* Parse start address */
 	{
 		char *ep;
-		ulong v = strtoul(argv[1], &ep, 0);
+		unsigned long v = strtoul(argv[1], &ep, 0);
 
 		if (ep == argv[1]) {
 			shell_print(sh, "error: invalid address '%s'", argv[1]);
@@ -312,7 +318,7 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 
 	if (argc > 2) {
 		char *ep;
-		ulong v = strtoul(argv[2], &ep, 0);
+		unsigned long v = strtoul(argv[2], &ep, 0);
 
 		if (ep == argv[2]) {
 			shell_print(sh, "error: invalid address '%s'", argv[2]);
@@ -482,7 +488,7 @@ __cold static int cmd_sof_page_info(const struct shell *sh,
 
 	{
 		char *ep;
-		ulong v = strtoul(argv[1], &ep, 0);
+		unsigned long v = strtoul(argv[1], &ep, 0);
 
 		if (ep == argv[1]) {
 			shell_print(sh, "error: invalid address '%s'", argv[1]);
@@ -493,7 +499,7 @@ __cold static int cmd_sof_page_info(const struct shell *sh,
 
 	if (argc > 2) {
 		char *ep;
-		ulong v = strtoul(argv[2], &ep, 0);
+		unsigned long v = strtoul(argv[2], &ep, 0);
 
 		if (ep == argv[2]) {
 			shell_print(sh, "error: invalid address '%s'", argv[2]);
@@ -555,5 +561,126 @@ SHELL_SUBCMD_ADD((sof), page_info, NULL,
 		 " and cache mode for each page currently in the DTLB.\n",
 		 cmd_sof_page_info, 2, 1);
 #endif
+
+#if CONFIG_SOF_SHELL_LLEXT_LOAD
+
+/* parse_long: shared numeric argument parser for kernel shell commands. */
+__cold static int parse_long(const struct shell *sh, const char *s, long *out,
+			     long min_val, long max_val)
+{
+	char *endptr;
+	long v = strtol(s, &endptr, 0);
+
+	if (endptr == s || v < min_val || v > max_val) {
+		shell_print(sh, "error: invalid value '%s' (allowed %ld..%ld)",
+			    s, min_val, max_val);
+		return -EINVAL;
+	}
+	*out = v;
+	return 0;
+}
+
+#define SOF_SHELL_LLEXT_TIMEOUT_MSEC  120000U
+#define SOF_SHELL_LLEXT_POLL_MSEC       500U
+
+__cold static int cmd_sof_llext_load(const struct shell *sh,
+				     size_t argc, char *argv[])
+{
+	const char *name = argv[1];
+	uint32_t lib_id = 1;
+	volatile struct sof_shell_llext_slot *slot;
+	uint32_t elapsed = 0;
+	uint32_t state;
+
+	if (argc > 2) {
+		long val;
+		int ret = parse_long(sh, argv[2], &val, 1, LIB_MANAGER_MAX_LIBS - 1);
+
+		if (ret)
+			return ret;
+		lib_id = (uint32_t)val;
+	}
+
+	/* Acquire or reuse the LLEXT_LOAD debug window slot */
+#if CONFIG_INTEL_ADSP_DEBUG_SLOT_MANAGER
+	{
+		struct adsp_dw_desc slot_desc = { .type = ADSP_DW_SLOT_LLEXT_LOAD };
+		size_t slot_size;
+
+		slot = adsp_dw_request_slot(&slot_desc, &slot_size);
+		if (!slot) {
+			shell_error(sh, "Failed to acquire debug window slot");
+			return -ENOMEM;
+		}
+	}
+#else
+	/* Fall back to a compile-time fixed slot index */
+	slot = (volatile struct sof_shell_llext_slot *)
+		ADSP_DW->slots[CONFIG_SOF_SHELL_LLEXT_LOAD_SLOT_NUM];
+	ADSP_DW->descs[CONFIG_SOF_SHELL_LLEXT_LOAD_SLOT_NUM].type =
+		ADSP_DW_SLOT_LLEXT_LOAD;
+#endif
+
+	state = slot->state;
+	if (state != SOF_SHELL_LLEXT_IDLE) {
+		shell_error(sh, "llext_load slot busy (state=%u) — try again later",
+			    state);
+		return -EBUSY;
+	}
+
+	/* Initialise the shared slot word-by-word (MMIO/uncached region) */
+	{
+		volatile uint32_t *p = (volatile uint32_t *)slot;
+		size_t nwords = sizeof(struct sof_shell_llext_slot) / sizeof(uint32_t);
+
+		for (size_t i = 0; i < nwords; i++)
+			p[i] = 0;
+	}
+	strncpy((char *)slot->name, name, sizeof(slot->name) - 1);
+	slot->lib_id = lib_id;
+	slot->magic  = SOF_SHELL_LLEXT_MAGIC;
+	/* Publish state last so the host only sees REQUESTING once all fields are set */
+	slot->state  = SOF_SHELL_LLEXT_REQUESTING;
+
+	shell_print(sh, "Slot ready: name=%s  lib_id=%u  timeout=%us",
+		    name, lib_id, SOF_SHELL_LLEXT_TIMEOUT_MSEC / 1000);
+	shell_print(sh, "On host:    dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load bs=$(stat -c%%s <module.ri>) count=1");
+
+	/* Poll waiting for the host to finish DMA + library load */
+	while (elapsed < SOF_SHELL_LLEXT_TIMEOUT_MSEC) {
+		k_msleep(SOF_SHELL_LLEXT_POLL_MSEC);
+		elapsed += SOF_SHELL_LLEXT_POLL_MSEC;
+
+		state = slot->state;
+
+		if (state == SOF_SHELL_LLEXT_DMA_DONE) {
+			shell_print(sh,
+				    "llext_load OK: lib_id=%u  %u bytes transferred",
+				    lib_id, slot->xfer_bytes);
+			slot->state = SOF_SHELL_LLEXT_IDLE;
+			return 0;
+		}
+
+		if (state == SOF_SHELL_LLEXT_ERROR) {
+			shell_error(sh, "llext_load FAILED: result=%d", slot->result);
+			slot->state = SOF_SHELL_LLEXT_IDLE;
+			return (int)slot->result;
+		}
+	}
+
+	shell_error(sh, "llext_load timeout after %us",
+		    SOF_SHELL_LLEXT_TIMEOUT_MSEC / 1000);
+	slot->state = SOF_SHELL_LLEXT_IDLE;
+	return -ETIMEDOUT;
+}
+
+SHELL_SUBCMD_ADD((sof), llext_load, NULL,
+		 "Load llext module from host: <name> [lib_id=1]\n"
+		 "Sets up the DMA handshake slot then waits for:\n"
+		 "  dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load\\\n"
+		 "     bs=$(stat -c%s <module.ri>) count=1\n"
+		 "on the host. Prints result when DMA and IPC4 load complete.\n",
+		 cmd_sof_llext_load, 2, 1);
+#endif /* CONFIG_SOF_SHELL_LLEXT_LOAD */
 SHELL_CMD_REGISTER(sof, &sub_sof,
 		   "SOF application commands", NULL);
