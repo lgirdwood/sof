@@ -16,8 +16,7 @@
 #include <sof/compiler_attributes.h>
 #include <sof/ipc/topology.h>
 
-#include <drivers/dma/dma_intel_adsp_hda.h>
-#include <intel_adsp_hda.h>
+#include <zephyr/drivers/dma.h>
 
 #include <rtos/clk.h>
 #include <rtos/sof.h>

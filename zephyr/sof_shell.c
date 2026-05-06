@@ -1238,7 +1238,7 @@ __cold static int cmd_sof_llext_load(const struct shell *sh,
 
 	shell_print(sh, "Slot ready: name=%s  lib_id=%u  timeout=%us",
 		    name, lib_id, SOF_SHELL_LLEXT_TIMEOUT_MSEC / 1000);
-	shell_print(sh, "On host:    cat <module.ri> > /sys/kernel/debug/sof/llext_load");
+	shell_print(sh, "On host:    dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load bs=$(stat -c%%s <module.ri>) count=1");
 
 	/* Poll waiting for the host to finish DMA + library load */
 	while (elapsed < SOF_SHELL_LLEXT_TIMEOUT_MSEC) {
@@ -1371,7 +1371,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD_ARG(llext_load, NULL,
 		  "Load llext module from host: <name> [lib_id=1]\n"
 		  "Sets up the DMA handshake slot then waits for:\n"
-		  "  cat <module.ri> > /sys/kernel/debug/sof/llext_load\n"
+		  "  dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load\\\n"
+		  "     bs=$(stat -c%s <module.ri>) count=1\n"
 		  "on the host. Prints result when DMA and IPC4 load complete.\n",
 		  cmd_sof_llext_load, 2, 1),
 #endif
