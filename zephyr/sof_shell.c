@@ -10,6 +10,8 @@
 #include <sof/audio/module_adapter/module/generic.h>
 #include <sof/audio/component.h>
 #include <sof/audio/component_ext.h>
+#include <sof/audio/buffer.h>
+#include <sof/audio/audio_stream.h>
 #include <sof/audio/pipeline.h>
 #include <sof/ipc/topology.h>
 #include <sof/lib/cpu.h>
@@ -1578,6 +1580,161 @@ static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
+#if CONFIG_SOF_SHELL_BUFFER_INFO
+
+static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
+			       uint32_t src_id, uint32_t sink_id)
+{
+	const struct audio_stream *s = &buf->stream;
+	uint32_t size = audio_stream_get_size(s);
+	uint32_t avail = audio_stream_get_avail(s);
+	uint32_t freeb = audio_stream_get_free(s);
+
+	shell_print(sh,
+		    "  buf 0x%08x  src 0x%08x -> sink 0x%08x"
+		    "  size %u  avail %u  free %u  ch %u  rate %u  fmt %d",
+		    buf_get_id(buf), src_id, sink_id,
+		    size, avail, freeb,
+		    audio_stream_get_channels(s),
+		    audio_stream_get_rate(s),
+		    (int)audio_stream_get_frm_fmt(s));
+}
+
+/*
+ * Walk every component in the IPC topology and visit each downstream
+ * (bsink_list) buffer once. cb() is called for every (buffer, source, sink)
+ * tuple. Returns the number of buffers visited.
+ */
+static int shell_for_each_buffer(struct ipc *ipc,
+				 void (*cb)(const struct shell *sh,
+					    struct comp_buffer *buf,
+					    uint32_t src_id, uint32_t sink_id,
+					    void *ctx),
+				 const struct shell *sh, void *ctx)
+{
+	struct list_item *clist;
+	struct ipc_comp_dev *icd;
+	int count = 0;
+
+	list_for_item(clist, &ipc->comp_list) {
+		struct comp_dev *cd;
+		struct comp_buffer *buf;
+
+		icd = container_of(clist, struct ipc_comp_dev, list);
+		if (icd->type != COMP_TYPE_COMPONENT)
+			continue;
+
+		cd = icd->cd;
+		buf = comp_dev_get_first_data_consumer(cd);
+		while (buf) {
+			struct comp_dev *sink = comp_buffer_get_sink_component(buf);
+
+			cb(sh, buf, cd->ipc_config.id,
+			   sink ? sink->ipc_config.id : 0, ctx);
+			count++;
+			buf = comp_dev_get_next_data_consumer(cd, buf);
+		}
+	}
+
+	return count;
+}
+
+static void buf_list_cb(const struct shell *sh, struct comp_buffer *buf,
+			uint32_t src_id, uint32_t sink_id, void *ctx)
+{
+	ARG_UNUSED(ctx);
+	shell_print_buffer(sh, buf, src_id, sink_id);
+}
+
+__cold static int cmd_sof_buffer_list(const struct shell *sh,
+				      size_t argc, char *argv[])
+{
+	struct ipc *ipc = sof_get()->ipc;
+	int n;
+
+	if (!ipc) {
+		shell_print(sh, "No IPC");
+		return 0;
+	}
+
+	shell_print(sh, "Audio buffers:");
+	n = shell_for_each_buffer(ipc, buf_list_cb, sh, NULL);
+	if (!n)
+		shell_print(sh, "  (none)");
+
+	return 0;
+}
+
+struct buf_find_ctx {
+	uint32_t want_id;
+	struct comp_buffer *found;
+	uint32_t src_id;
+	uint32_t sink_id;
+};
+
+static void buf_find_cb(const struct shell *sh, struct comp_buffer *buf,
+			uint32_t src_id, uint32_t sink_id, void *ctx)
+{
+	struct buf_find_ctx *c = ctx;
+
+	ARG_UNUSED(sh);
+	if (c->found)
+		return;
+	if (buf_get_id(buf) == c->want_id) {
+		c->found = buf;
+		c->src_id = src_id;
+		c->sink_id = sink_id;
+	}
+}
+
+__cold static int cmd_sof_buffer_info(const struct shell *sh,
+				      size_t argc, char *argv[])
+{
+	struct ipc *ipc = sof_get()->ipc;
+	struct buf_find_ctx ctx = {0};
+	const struct audio_stream *s;
+	char *endptr = NULL;
+	long id;
+
+	if (!ipc) {
+		shell_print(sh, "No IPC");
+		return 0;
+	}
+
+	id = strtol(argv[1], &endptr, 0);
+	if (endptr == argv[1]) {
+		shell_error(sh, "buffer_info: invalid id");
+		return -EINVAL;
+	}
+
+	ctx.want_id = (uint32_t)id;
+	shell_for_each_buffer(ipc, buf_find_cb, sh, &ctx);
+
+	if (!ctx.found) {
+		shell_print(sh, "buffer 0x%08x not found", (uint32_t)id);
+		return -ENOENT;
+	}
+
+	s = &ctx.found->stream;
+	shell_print(sh, "Buffer 0x%08x:", buf_get_id(ctx.found));
+	shell_print(sh, "  source comp : 0x%08x", ctx.src_id);
+	shell_print(sh, "  sink   comp : 0x%08x", ctx.sink_id);
+	shell_print(sh, "  core        : %u", ctx.found->core);
+	shell_print(sh, "  flags       : 0x%08x", ctx.found->flags);
+	shell_print(sh, "  size bytes  : %u", audio_stream_get_size(s));
+	shell_print(sh, "  avail bytes : %u", audio_stream_get_avail(s));
+	shell_print(sh, "  free  bytes : %u", audio_stream_get_free(s));
+	shell_print(sh, "  rptr        : %p", audio_stream_get_rptr(s));
+	shell_print(sh, "  wptr        : %p", audio_stream_get_wptr(s));
+	shell_print(sh, "  channels    : %u", audio_stream_get_channels(s));
+	shell_print(sh, "  rate        : %u", audio_stream_get_rate(s));
+	shell_print(sh, "  frame fmt   : %d", (int)audio_stream_get_frm_fmt(s));
+
+	return 0;
+}
+
+#endif /* CONFIG_SOF_SHELL_BUFFER_INFO */
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
@@ -1735,6 +1892,15 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(ipc_last, NULL,
 		  "Print the last received and sent IPC headers\n",
 		  cmd_sof_ipc_last),
+
+#if CONFIG_SOF_SHELL_BUFFER_INFO
+	SHELL_CMD(buffer_list, NULL,
+		  "List all audio buffers (id, source/sink, fill, format)\n",
+		  cmd_sof_buffer_list),
+	SHELL_CMD_ARG(buffer_info, NULL,
+		  "Detailed info for a single buffer: <buffer_id>\n",
+		  cmd_sof_buffer_info, 2, 0),
+#endif
 
 	SHELL_SUBCMD_SET_END
 );
