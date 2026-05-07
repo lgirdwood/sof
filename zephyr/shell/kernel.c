@@ -20,6 +20,8 @@
 #include <sof/schedule/ll_schedule_domain.h>
 #include <sof/lib/cpu.h>
 #include <sof/lib/memory.h>
+#include <string.h>
+#include <sof/ipc/common.h>
 #include <sof/lib/vpage.h>
 #include <sof/lib/vregion.h>
 #include <rtos/clk.h>
@@ -1021,5 +1023,45 @@ SHELL_SUBCMD_ADD((sof), vpage_status, NULL,
 SHELL_SUBCMD_ADD((sof), vregion_status, NULL,
 		 "Print virtual regions status\n",
 		 cmd_sof_vregion_info, 0, 0);
+
+static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc_stats s;
+
+	if (argc > 1 && !strcmp(argv[1], "reset")) {
+		ipc_stats_reset();
+		shell_print(sh, "ipc stats reset");
+		return 0;
+	}
+
+	ipc_stats_get(&s);
+	shell_print(sh, "IPC statistics:");
+	shell_print(sh, "  rx_count        : %u", s.rx_count);
+	shell_print(sh, "  rx_errors       : %u", s.rx_errors);
+	shell_print(sh, "  tx_count        : %u", s.tx_count);
+	shell_print(sh, "  tx_direct_count : %u", s.tx_direct_count);
+	shell_print(sh, "  tx_errors       : %u", s.tx_errors);
+	return 0;
+}
+
+static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc_stats s;
+
+	ipc_stats_get(&s);
+	shell_print(sh, "Last IPC RX: pri=0x%08x ext=0x%08x @ %llu cycles",
+		    s.last_rx_pri, s.last_rx_ext, (unsigned long long)s.last_rx_time);
+	shell_print(sh, "Last IPC TX: pri=0x%08x ext=0x%08x @ %llu cycles",
+		    s.last_tx_pri, s.last_tx_ext, (unsigned long long)s.last_tx_time);
+	return 0;
+}
+
+SHELL_SUBCMD_ADD((sof), ipc_stats, NULL,
+		 "Print IPC RX/TX counters; 'sof ipc_stats reset' clears them\n",
+		 cmd_sof_ipc_stats, 1, 1);
+
+SHELL_SUBCMD_ADD((sof), ipc_last, NULL,
+		 "Print the last received and sent IPC headers\n",
+		 cmd_sof_ipc_last, 0, 0);
 SHELL_CMD_REGISTER(sof, &sub_sof,
 		   "SOF application commands", NULL);
