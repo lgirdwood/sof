@@ -2147,6 +2147,95 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 
 #endif /* CONFIG_SOF_SHELL_DBGWIN_DUMP */
 
+#if CONFIG_SOF_SHELL_PERF_STATUS
+
+#include <sof/debug/telemetry/telemetry.h>
+#include <sof/debug/telemetry/performance_monitor.h>
+#include <ipc4/base_fw.h>
+
+static const char *perf_state_str(enum ipc4_perf_measurements_state_set s)
+{
+	switch (s) {
+	case IPC4_PERF_MEASUREMENTS_DISABLED:	return "disabled";
+	case IPC4_PERF_MEASUREMENTS_STOPPED:	return "stopped";
+	case IPC4_PERF_MEASUREMENTS_STARTED:	return "started";
+	case IPC4_PERF_MEASUREMENTS_PAUSED:	return "paused";
+	default:				return "?";
+	}
+}
+
+__cold static int cmd_sof_perf_status(const struct shell *sh,
+				      size_t argc, char *argv[])
+{
+	struct system_tick_info *systick;
+	int core_id, ret;
+
+	if (argc > 1) {
+		if (!strcmp(argv[1], "reset")) {
+			ret = reset_performance_counters();
+			shell_print(sh, "perf: reset_performance_counters() = %d", ret);
+			return ret;
+		}
+		if (!strcmp(argv[1], "start")) {
+			ret = enable_performance_counters();
+			if (!ret)
+				perf_meas_set_state(IPC4_PERF_MEASUREMENTS_STARTED);
+			shell_print(sh, "perf: enable_performance_counters() = %d", ret);
+			return ret;
+		}
+		if (!strcmp(argv[1], "stop")) {
+			perf_meas_set_state(IPC4_PERF_MEASUREMENTS_STOPPED);
+			shell_print(sh, "perf: stopped");
+			return 0;
+		}
+		if (!strcmp(argv[1], "pause")) {
+			perf_meas_set_state(IPC4_PERF_MEASUREMENTS_PAUSED);
+			shell_print(sh, "perf: paused");
+			return 0;
+		}
+		shell_print(sh, "Usage: sof perf_status [reset|start|stop|pause]");
+		return -EINVAL;
+	}
+
+	shell_print(sh, "Performance measurements: %s",
+		    perf_state_str(perf_meas_get_state()));
+
+#ifdef CONFIG_INTEL_ADSP_DEBUG_SLOT_MANAGER
+	systick = telemetry_get_systick_info_ptr();
+	if (!systick) {
+		shell_print(sh, "telemetry slot not allocated");
+		return 0;
+	}
+#else
+	{
+		struct telemetry_wnd_data *wnd =
+			(struct telemetry_wnd_data *)
+			ADSP_DW->slots[SOF_DW_TELEMETRY_SLOT];
+		systick = (struct system_tick_info *)wnd->system_tick_info;
+	}
+#endif
+
+	shell_print(sh, "Per-core systick (count, last_us_cyc, max_us_cyc, avg_kcps, peak_kcps):");
+	for (core_id = 0; core_id < CONFIG_MAX_CORE_COUNT; core_id++) {
+		if (!(cpu_enabled_cores() & BIT(core_id)))
+			continue;
+		shell_print(sh,
+			    "  core %u: count=%u last=%u max=%u avg_kcps=%u peak_kcps=%u peak4k=%u peak8k=%u",
+			    core_id,
+			    systick[core_id].count,
+			    systick[core_id].last_time_elapsed,
+			    systick[core_id].max_time_elapsed,
+			    systick[core_id].avg_utilization,
+			    systick[core_id].peak_utilization,
+			    systick[core_id].peak_utilization_4k,
+			    systick[core_id].peak_utilization_8k);
+	}
+
+	return 0;
+}
+
+#endif /* CONFIG_SOF_SHELL_PERF_STATUS */
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
@@ -2345,6 +2434,13 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD_ARG(dbgwin_dump, NULL,
 		  "List ADSP debug-window slots, or hex-dump one: [slot] [length]\n",
 		  cmd_sof_dbgwin_dump, 1, 2),
+#endif
+
+#if CONFIG_SOF_SHELL_PERF_STATUS
+	SHELL_CMD_ARG(perf_status, NULL,
+		  "Show telemetry perf state and per-core systick;"
+		  " optional [reset|start|stop|pause]\n",
+		  cmd_sof_perf_status, 1, 1),
 #endif
 
 	SHELL_SUBCMD_SET_END
