@@ -20,6 +20,8 @@
 #include <sof/schedule/ll_schedule_domain.h>
 #include <sof/lib/cpu.h>
 #include <sof/lib/memory.h>
+#include <sof/lib/vpage.h>
+#include <sof/lib/vregion.h>
 #include <rtos/clk.h>
 #include <rtos/alloc.h>
 
@@ -940,5 +942,84 @@ static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 SHELL_SUBCMD_ADD((sof), version, NULL,
 		 "Print the current SOF software version\n",
 		 cmd_sof_version, 0, 0);
+
+#if CONFIG_SOF_VREGIONS
+__cold static void vpage_alloc_print_cb(unsigned int idx, unsigned int vpage,
+					unsigned int pages, void *ctx)
+{
+	const struct shell *sh = ctx;
+
+	shell_fprintf(sh, SHELL_NORMAL, "    [%u] vpage %u, pages %u\n",
+		      idx, vpage, pages);
+}
+
+struct vregion_print_ctx {
+	const struct shell *sh;
+	int count;
+};
+
+__cold static void vregion_print_cb(int idx, const struct vregion_snapshot *s,
+				    void *ctx)
+{
+	struct vregion_print_ctx *c = ctx;
+
+	shell_fprintf(c->sh, SHELL_NORMAL,
+		      "  [%d] Base: 0x%lx, Size: %#zx bytes, Pages: %u\n",
+		      idx, (unsigned long)s->base, s->size, s->pages);
+	shell_fprintf(c->sh, SHELL_NORMAL,
+		      "      Lifetime Used: %#zx bytes, Free Count: %d\n",
+		      s->lifetime_used, s->lifetime_free_count);
+	shell_fprintf(c->sh, SHELL_NORMAL, "      Use Count: %u\n",
+		      s->use_count);
+	c->count++;
+}
+#endif /* CONFIG_SOF_VREGIONS */
+
+__cold static int cmd_sof_vpage_info(const struct shell *sh, size_t argc, char *argv[])
+{
+#if CONFIG_SOF_VREGIONS
+	struct vpage_stats stats;
+
+	vpage_get_stats(&stats);
+
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual Page Allocator Status:\n");
+	shell_fprintf(sh, SHELL_NORMAL,
+		      "  Region Base: %p, Size: %#zx bytes, Total Pages: %u\n",
+		      stats.region_base, stats.region_size, stats.total_pages);
+	shell_fprintf(sh, SHELL_NORMAL, "  Free Pages: %u\n", stats.free_pages);
+	shell_fprintf(sh, SHELL_NORMAL, "  Allocated Elements in use: %u / %u\n",
+		      stats.num_elems_in_use, stats.max_allocs);
+
+	vpage_for_each_alloc(vpage_alloc_print_cb, (void *)sh);
+#else
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual regions not enabled\n");
+#endif
+	return 0;
+}
+
+__cold static int cmd_sof_vregion_info(const struct shell *sh, size_t argc, char *argv[])
+{
+#if CONFIG_SOF_VREGIONS
+	struct vregion_print_ctx ctx = { .sh = sh, .count = 0 };
+
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual Regions Status:\n");
+	vregion_for_each(vregion_print_cb, &ctx);
+	if (ctx.count == 0)
+		shell_fprintf(sh, SHELL_NORMAL,
+			      "  No active virtual regions found.\n");
+#else
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual regions not enabled\n");
+#endif
+	return 0;
+}
+
+
+SHELL_SUBCMD_ADD((sof), vpage_status, NULL,
+		 "Print virtual page allocator status\n",
+		 cmd_sof_vpage_info, 0, 0);
+
+SHELL_SUBCMD_ADD((sof), vregion_status, NULL,
+		 "Print virtual regions status\n",
+		 cmd_sof_vregion_info, 0, 0);
 SHELL_CMD_REGISTER(sof, &sub_sof,
 		   "SOF application commands", NULL);

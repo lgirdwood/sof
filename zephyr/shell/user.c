@@ -728,3 +728,32 @@ SHELL_SUBCMD_ADD((sof), mod_unbind, NULL,
 		 "Unbind two module instances: <src_mod> <src_inst> <dst_mod> <dst_inst> [src_q=0] [dst_q=0]\n",
 		 cmd_sof_mod_unbind, 5, 2);
 #endif /* CONFIG_SOF_SHELL_PIPELINE_OPS */
+
+static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc *ipc = sof_get()->ipc;
+	struct list_item *clist;
+	struct ipc_comp_dev *icd;
+	struct pipeline *p;
+
+	if (!ipc) {
+		shell_print(sh, "No IPC");
+		return 0;
+	}
+
+	shell_print(sh, "ID          Core  Status  Priority  Period");
+	list_for_item(clist, &ipc->comp_list) {
+		icd = container_of(clist, struct ipc_comp_dev, list);
+		if (icd->type != COMP_TYPE_PIPELINE)
+			continue;
+
+		p = icd->pipeline;
+		shell_print(sh, "0x%08x  %d     %d       %d         %d",
+			    p->pipeline_id, p->core, p->status, p->priority, p->period);
+	}
+	return 0;
+}
+
+SHELL_SUBCMD_ADD((sof), pipeline_list, NULL,
+		 "List all active audio pipelines\n",
+		 cmd_sof_pipeline_list, 0, 0);
