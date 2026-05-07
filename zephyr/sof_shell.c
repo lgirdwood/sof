@@ -58,6 +58,8 @@
 #endif
 
 #include <stdlib.h>
+#include <string.h>
+#include <sof/ipc/common.h>
 
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
@@ -1544,6 +1546,38 @@ static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv
 	return 0;
 }
 
+static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc_stats s;
+
+	if (argc > 1 && !strcmp(argv[1], "reset")) {
+		ipc_stats_reset();
+		shell_print(sh, "ipc stats reset");
+		return 0;
+	}
+
+	ipc_stats_get(&s);
+	shell_print(sh, "IPC statistics:");
+	shell_print(sh, "  rx_count        : %u", s.rx_count);
+	shell_print(sh, "  rx_errors       : %u", s.rx_errors);
+	shell_print(sh, "  tx_count        : %u", s.tx_count);
+	shell_print(sh, "  tx_direct_count : %u", s.tx_direct_count);
+	shell_print(sh, "  tx_errors       : %u", s.tx_errors);
+	return 0;
+}
+
+static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc_stats s;
+
+	ipc_stats_get(&s);
+	shell_print(sh, "Last IPC RX: pri=0x%08x ext=0x%08x @ %llu cycles",
+		    s.last_rx_pri, s.last_rx_ext, (unsigned long long)s.last_rx_time);
+	shell_print(sh, "Last IPC TX: pri=0x%08x ext=0x%08x @ %llu cycles",
+		    s.last_tx_pri, s.last_tx_ext, (unsigned long long)s.last_tx_time);
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
@@ -1693,6 +1727,14 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(pipeline_list, NULL,
 		  "List all active audio pipelines\n",
 		  cmd_sof_pipeline_list),
+
+	SHELL_CMD_ARG(ipc_stats, NULL,
+		  "Print IPC RX/TX counters; 'sof ipc_stats reset' clears them\n",
+		  cmd_sof_ipc_stats, 1, 1),
+
+	SHELL_CMD(ipc_last, NULL,
+		  "Print the last received and sent IPC headers\n",
+		  cmd_sof_ipc_last),
 
 	SHELL_SUBCMD_SET_END
 );
