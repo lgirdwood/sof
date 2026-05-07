@@ -62,6 +62,8 @@
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
 #include <sof_versions.h>
+#include <sof/lib/vpage.h>
+#include <sof/lib/vregion.h>
 
 __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 		       size_t argc, char *argv[])
@@ -1497,6 +1499,51 @@ static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
+static int cmd_sof_vpage_info(const struct shell *sh, size_t argc, char *argv[])
+{
+#if CONFIG_SOF_VREGIONS
+	vpage_info(sh);
+#else
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual regions not enabled\n");
+#endif
+	return 0;
+}
+
+static int cmd_sof_vregion_info(const struct shell *sh, size_t argc, char *argv[])
+{
+#if CONFIG_SOF_VREGIONS
+	vregion_info_all(sh);
+#else
+	shell_fprintf(sh, SHELL_NORMAL, "Virtual regions not enabled\n");
+#endif
+	return 0;
+}
+
+static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
+{
+	struct ipc *ipc = sof_get()->ipc;
+	struct list_item *clist;
+	struct ipc_comp_dev *icd;
+	struct pipeline *p;
+
+	if (!ipc) {
+		shell_print(sh, "No IPC");
+		return 0;
+	}
+
+	shell_print(sh, "ID          Core  Status  Priority  Period");
+	list_for_item(clist, &ipc->comp_list) {
+		icd = container_of(clist, struct ipc_comp_dev, list);
+		if (icd->type != COMP_TYPE_PIPELINE)
+			continue;
+
+		p = icd->pipeline;
+		shell_print(sh, "0x%08x  %d     %d       %d         %d",
+			    p->pipeline_id, p->core, p->status, p->priority, p->period);
+	}
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
@@ -1634,6 +1681,18 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(version, NULL,
 		  "Print the current SOF software version\n",
 		  cmd_sof_version),
+
+	SHELL_CMD(vpage_status, NULL,
+		  "Print virtual page allocator status\n",
+		  cmd_sof_vpage_info),
+
+	SHELL_CMD(vregion_status, NULL,
+		  "Print virtual regions status\n",
+		  cmd_sof_vregion_info),
+
+	SHELL_CMD(pipeline_list, NULL,
+		  "List all active audio pipelines\n",
+		  cmd_sof_pipeline_list),
 
 	SHELL_SUBCMD_SET_END
 );
