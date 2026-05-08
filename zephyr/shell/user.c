@@ -731,7 +731,7 @@ SHELL_SUBCMD_ADD((sof), mod_unbind, NULL,
 		 cmd_sof_mod_unbind, 5, 2);
 #endif /* CONFIG_SOF_SHELL_PIPELINE_OPS */
 
-static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc *ipc = sof_get()->ipc;
 	struct list_item *clist;
@@ -762,7 +762,7 @@ SHELL_SUBCMD_ADD((sof), pipeline_list, NULL,
 
 #if CONFIG_SOF_SHELL_BUFFER_INFO
 
-static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
+__cold static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
 			       uint32_t src_id, uint32_t sink_id)
 {
 	const struct audio_stream *s = &buf->stream;
@@ -785,7 +785,7 @@ static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
  * (bsink_list) buffer once. cb() is called for every (buffer, source, sink)
  * tuple. Returns the number of buffers visited.
  */
-static int shell_for_each_buffer(struct ipc *ipc,
+__cold static int shell_for_each_buffer(struct ipc *ipc,
 				 void (*cb)(const struct shell *sh,
 					    struct comp_buffer *buf,
 					    uint32_t src_id, uint32_t sink_id,
@@ -819,7 +819,7 @@ static int shell_for_each_buffer(struct ipc *ipc,
 	return count;
 }
 
-static void buf_list_cb(const struct shell *sh, struct comp_buffer *buf,
+__cold static void buf_list_cb(const struct shell *sh, struct comp_buffer *buf,
 			uint32_t src_id, uint32_t sink_id, void *ctx)
 {
 	ARG_UNUSED(ctx);
@@ -852,7 +852,7 @@ struct buf_find_ctx {
 	uint32_t sink_id;
 };
 
-static void buf_find_cb(const struct shell *sh, struct comp_buffer *buf,
+__cold static void buf_find_cb(const struct shell *sh, struct comp_buffer *buf,
 			uint32_t src_id, uint32_t sink_id, void *ctx)
 {
 	struct buf_find_ctx *c = ctx;
@@ -932,7 +932,7 @@ SHELL_SUBCMD_ADD((sof), buffer_info, NULL,
 
 #if CONFIG_SOF_SHELL_DAI_LIST
 
-static const char *zephyr_dai_type_str(int t)
+__cold static const char *zephyr_dai_type_str(int t)
 {
 	switch (t) {
 	case DAI_LEGACY_I2S:	return "i2s";
@@ -1014,7 +1014,7 @@ __cold static int cmd_sof_dai_list(const struct shell *sh,
 
 #if CONFIG_SOF_SHELL_DMA_STATUS
 
-static const char *dma_dir_str(enum dma_channel_direction d)
+__cold static const char *dma_dir_str(enum dma_channel_direction d)
 {
 	switch (d) {
 	case MEMORY_TO_MEMORY:	return "M2M";
@@ -1027,7 +1027,7 @@ static const char *dma_dir_str(enum dma_channel_direction d)
 	}
 }
 
-static void dma_print_one(const struct shell *sh, struct sof_dma *dma,
+__cold static void dma_print_one(const struct shell *sh, struct sof_dma *dma,
 			  int dma_idx, int chan)
 {
 	struct dma_status st = {0};
@@ -1137,7 +1137,7 @@ SHELL_SUBCMD_ADD((sof), dma_status, NULL,
  * label available in firmware is the UUID name string from the trace
  * context (which carries the same name printed by the LDC tool).
  */
-static const char *kctl_drv_name(const struct comp_dev *cd)
+__cold static const char *kctl_drv_name(const struct comp_dev *cd)
 {
 	if (cd && cd->drv && cd->drv->tctx && cd->drv->tctx->uuid_p &&
 	    cd->drv->tctx->uuid_p->name[0])
@@ -1152,7 +1152,7 @@ static const char *kctl_drv_name(const struct comp_dev *cd)
  * config_id blobs that need IPC4 large_config marshalling, which is
  * intentionally out of scope here (see shell.md).
  */
-static const char *kctl_drv_kind(const char *name)
+__cold static const char *kctl_drv_kind(const char *name)
 {
 	if (!name)
 		return "";

@@ -933,7 +933,7 @@ SHELL_SUBCMD_ADD((sof), core_off, NULL,
 		 cmd_sof_core_off, 2, 0);
 #endif
 
-static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 {
 	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
 		    SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_TAG, SOF_BUILD);
@@ -1025,7 +1025,7 @@ SHELL_SUBCMD_ADD((sof), vregion_status, NULL,
 		 "Print virtual regions status\n",
 		 cmd_sof_vregion_info, 0, 0);
 
-static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc_stats s;
 
@@ -1045,7 +1045,7 @@ static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
-static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc_stats s;
 
@@ -1067,7 +1067,7 @@ SHELL_SUBCMD_ADD((sof), ipc_last, NULL,
 
 #if CONFIG_SOF_SHELL_SCHED_INFO
 
-static const char *sched_type_str(int type)
+__cold static const char *sched_type_str(int type)
 {
 	switch (type) {
 	case SOF_SCHEDULE_EDF:		return "edf";
@@ -1079,7 +1079,7 @@ static const char *sched_type_str(int type)
 	}
 }
 
-static const char *sched_state_str(enum task_state s)
+__cold static const char *sched_state_str(enum task_state s)
 {
 	switch (s) {
 	case SOF_TASK_STATE_INIT:	return "init";
@@ -1105,7 +1105,7 @@ struct sched_walk_ctx {
 	bool show_load;
 };
 
-static void sched_list_cb(struct task *task, void *_ctx)
+__cold static void sched_list_cb(struct task *task, void *_ctx)
 {
 	struct sched_walk_ctx *c = _ctx;
 	uint32_t avg = task->cycles_cnt ? task->cycles_sum / task->cycles_cnt : 0;
@@ -1134,7 +1134,7 @@ static void sched_list_cb(struct task *task, void *_ctx)
 	c->task_count++;
 }
 
-static int sched_walk(const struct shell *sh, bool show_load)
+__cold static int sched_walk(const struct shell *sh, bool show_load)
 {
 	struct schedulers *schedulers = *arch_schedulers_get();
 	struct sched_walk_ctx ctx = { .sh = sh, .show_load = show_load };
@@ -1302,7 +1302,7 @@ SHELL_SUBCMD_ADD((sof), mtrace_dump, NULL,
 
 #if CONFIG_SOF_SHELL_MAILBOX_HEX || CONFIG_SOF_SHELL_DBGWIN_DUMP
 
-static void sof_shell_hex_dump(const struct shell *sh, uintptr_t base,
+__cold static void sof_shell_hex_dump(const struct shell *sh, uintptr_t base,
 			       size_t off, size_t len)
 {
 	const uint8_t *p = (const uint8_t *)(base + off);
@@ -1339,7 +1339,7 @@ struct sof_shell_mb_region {
 	size_t size;
 };
 
-static const struct sof_shell_mb_region sof_shell_mb_regions[] = {
+__cold_rodata static const struct sof_shell_mb_region sof_shell_mb_regions[] = {
 	{ "exception", MAILBOX_EXCEPTION_BASE, MAILBOX_EXCEPTION_SIZE },
 	{ "dspbox",    MAILBOX_DSPBOX_BASE,    MAILBOX_DSPBOX_SIZE    },
 	{ "hostbox",   MAILBOX_HOSTBOX_BASE,   MAILBOX_HOSTBOX_SIZE   },
@@ -1420,7 +1420,7 @@ struct sof_shell_dw {
 #define SOF_SHELL_DW_BASE \
 	(DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(mem_window2), memory)) + WIN2_OFFSET)
 
-static const char *dw_type_name(uint32_t type)
+__cold static const char *dw_type_name(uint32_t type)
 {
 	switch (type & ADSP_DW_SLOT_TYPE_MASK) {
 	case ADSP_DW_SLOT_UNUSED & ADSP_DW_SLOT_TYPE_MASK:
@@ -1515,7 +1515,7 @@ SHELL_SUBCMD_ADD((sof), dbgwin_dump, NULL,
 #include <sof/debug/telemetry/performance_monitor.h>
 #include <ipc4/base_fw.h>
 
-static const char *perf_state_str(enum ipc4_perf_measurements_state_set s)
+__cold static const char *perf_state_str(enum ipc4_perf_measurements_state_set s)
 {
 	switch (s) {
 	case IPC4_PERF_MEASUREMENTS_DISABLED:	return "disabled";
