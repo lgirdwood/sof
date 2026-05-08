@@ -6,14 +6,25 @@
 #define __SOF_LIB_VREGION_H__
 
 #include <stddef.h>
-
-struct shell;
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct vregion;
+
+/**
+ * @brief Per-vregion snapshot returned by vregion_for_each().
+ */
+struct vregion_snapshot {
+	uintptr_t base;
+	size_t size;
+	unsigned int pages;
+	size_t lifetime_used;
+	int lifetime_free_count;
+	unsigned int use_count;
+};
 
 /**
  * @brief Memory types for virtual region allocations.
@@ -128,9 +139,15 @@ void vregion_mem_info(struct vregion *vr, size_t *size, uintptr_t *start);
 /**
  * @brief Dump all virtual regions info
  *
- * @param[in] sh Shell context to print to.
+ * Iterate over every registered virtual region. The global vregion list lock
+ * is held for the duration of the walk; @p cb must not block or call back
+ * into the vregion API.
+ *
+ * @param[in] cb  Callback invoked once per region with a stable snapshot.
+ * @param[in] ctx Opaque context passed through to @p cb.
  */
-void vregion_info_all(const struct shell *sh);
+void vregion_for_each(void (*cb)(int idx, const struct vregion_snapshot *s, void *ctx),
+		      void *ctx);
 
 #else /* CONFIG_SOF_VREGIONS */
 
@@ -185,7 +202,9 @@ static inline void vregion_mem_info(struct vregion *vr, size_t *size, uintptr_t 
 	if (size)
 		*size = 0;
 }
-static inline void vregion_info_all(const struct shell *sh) {}
+static inline void vregion_for_each(void (*cb)(int idx,
+					       const struct vregion_snapshot *s,
+					       void *ctx), void *ctx) {}
 
 #endif /* CONFIG_SOF_VREGIONS */
 

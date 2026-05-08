@@ -9,7 +9,6 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/dlist.h>
-#include <zephyr/shell/shell.h>
 #include <sof/lib/vpage.h>
 #include <sof/lib/vregion.h>
 #include <rtos/alloc.h>
@@ -455,28 +454,32 @@ void vregion_mem_info(struct vregion *vr, size_t *size, uintptr_t *start)
 		*start = (uintptr_t)vr->base;
 }
 
-void vregion_info_all(const struct shell *sh)
+void vregion_for_each(void (*cb)(int idx, const struct vregion_snapshot *s, void *ctx),
+		      void *ctx)
 {
 	struct vregion *vr;
-	int count = 0;
+	int idx = 0;
+
+	if (!cb)
+		return;
 
 	k_mutex_lock(&vregion_list_lock, K_FOREVER);
-	
-	shell_fprintf(sh, SHELL_NORMAL, "Virtual Regions Status:\n");
-	
+
 	SYS_DLIST_FOR_EACH_CONTAINER(&vregion_list, vr, node) {
+		struct vregion_snapshot s;
+
 		k_mutex_lock(&vr->lock, K_FOREVER);
-		shell_fprintf(sh, SHELL_NORMAL, "  [%d] Base: %p, Size: %#zx bytes, Pages: %u\n",
-			      count++, (void *)vr->base, vr->size, vr->pages);
-		shell_fprintf(sh, SHELL_NORMAL, "      Lifetime Used: %#zx bytes, Free Count: %d\n",
-			      vr->lifetime.used, vr->lifetime.free_count);
-		shell_fprintf(sh, SHELL_NORMAL, "      Use Count: %u\n", vr->use_count);
+		s.base = (uintptr_t)vr->base;
+		s.size = vr->size;
+		s.pages = vr->pages;
+		s.lifetime_used = vr->lifetime.used;
+		s.lifetime_free_count = vr->lifetime.free_count;
+		s.use_count = vr->use_count;
 		k_mutex_unlock(&vr->lock);
-	}
-	
-	if (count == 0) {
-		shell_fprintf(sh, SHELL_NORMAL, "  No active virtual regions found.\n");
+
+		cb(idx++, &s, ctx);
 	}
 
 	k_mutex_unlock(&vregion_list_lock);
 }
+EXPORT_SYMBOL(vregion_for_each);
