@@ -1495,7 +1495,7 @@ __cold static int cmd_sof_llext_purge(const struct shell *sh,
 
 #endif /* CONFIG_SOF_SHELL_LLEXT_PURGE */
 
-static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 {
 	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
 		    SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_TAG, SOF_BUILD);
@@ -1504,7 +1504,7 @@ static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
-static int cmd_sof_vpage_info(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_vpage_info(const struct shell *sh, size_t argc, char *argv[])
 {
 #if CONFIG_SOF_VREGIONS
 	vpage_info(sh);
@@ -1514,7 +1514,7 @@ static int cmd_sof_vpage_info(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
-static int cmd_sof_vregion_info(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_vregion_info(const struct shell *sh, size_t argc, char *argv[])
 {
 #if CONFIG_SOF_VREGIONS
 	vregion_info_all(sh);
@@ -1524,7 +1524,7 @@ static int cmd_sof_vregion_info(const struct shell *sh, size_t argc, char *argv[
 	return 0;
 }
 
-static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc *ipc = sof_get()->ipc;
 	struct list_item *clist;
@@ -1549,7 +1549,7 @@ static int cmd_sof_pipeline_list(const struct shell *sh, size_t argc, char *argv
 	return 0;
 }
 
-static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc_stats s;
 
@@ -1569,7 +1569,7 @@ static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *argv[])
 	return 0;
 }
 
-static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
+__cold static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
 {
 	struct ipc_stats s;
 
@@ -1583,7 +1583,7 @@ static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *argv[])
 
 #if CONFIG_SOF_SHELL_BUFFER_INFO
 
-static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
+__cold static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
 			       uint32_t src_id, uint32_t sink_id)
 {
 	const struct audio_stream *s = &buf->stream;
@@ -1606,7 +1606,7 @@ static void shell_print_buffer(const struct shell *sh, struct comp_buffer *buf,
  * (bsink_list) buffer once. cb() is called for every (buffer, source, sink)
  * tuple. Returns the number of buffers visited.
  */
-static int shell_for_each_buffer(struct ipc *ipc,
+__cold static int shell_for_each_buffer(struct ipc *ipc,
 				 void (*cb)(const struct shell *sh,
 					    struct comp_buffer *buf,
 					    uint32_t src_id, uint32_t sink_id,
@@ -1640,7 +1640,7 @@ static int shell_for_each_buffer(struct ipc *ipc,
 	return count;
 }
 
-static void buf_list_cb(const struct shell *sh, struct comp_buffer *buf,
+__cold static void buf_list_cb(const struct shell *sh, struct comp_buffer *buf,
 			uint32_t src_id, uint32_t sink_id, void *ctx)
 {
 	ARG_UNUSED(ctx);
@@ -1673,7 +1673,7 @@ struct buf_find_ctx {
 	uint32_t sink_id;
 };
 
-static void buf_find_cb(const struct shell *sh, struct comp_buffer *buf,
+__cold static void buf_find_cb(const struct shell *sh, struct comp_buffer *buf,
 			uint32_t src_id, uint32_t sink_id, void *ctx)
 {
 	struct buf_find_ctx *c = ctx;
@@ -1738,7 +1738,7 @@ __cold static int cmd_sof_buffer_info(const struct shell *sh,
 
 #if CONFIG_SOF_SHELL_SCHED_INFO
 
-static const char *sched_type_str(int type)
+__cold static const char *sched_type_str(int type)
 {
 	switch (type) {
 	case SOF_SCHEDULE_EDF:		return "edf";
@@ -1750,7 +1750,7 @@ static const char *sched_type_str(int type)
 	}
 }
 
-static const char *sched_state_str(enum task_state s)
+__cold static const char *sched_state_str(enum task_state s)
 {
 	switch (s) {
 	case SOF_TASK_STATE_INIT:	return "init";
@@ -1776,7 +1776,7 @@ struct sched_walk_ctx {
 	bool show_load;
 };
 
-static void sched_list_cb(struct task *task, void *_ctx)
+__cold static void sched_list_cb(struct task *task, void *_ctx)
 {
 	struct sched_walk_ctx *c = _ctx;
 	uint32_t avg = task->cycles_cnt ? task->cycles_sum / task->cycles_cnt : 0;
@@ -1805,7 +1805,7 @@ static void sched_list_cb(struct task *task, void *_ctx)
 	c->task_count++;
 }
 
-static int sched_walk(const struct shell *sh, bool show_load)
+__cold static int sched_walk(const struct shell *sh, bool show_load)
 {
 	struct schedulers *schedulers = *arch_schedulers_get();
 	struct sched_walk_ctx ctx = { .sh = sh, .show_load = show_load };
@@ -1952,7 +1952,7 @@ __cold static int cmd_sof_mtrace_dump(const struct shell *sh,
 
 #if CONFIG_SOF_SHELL_MAILBOX_HEX || CONFIG_SOF_SHELL_DBGWIN_DUMP
 
-static void sof_shell_hex_dump(const struct shell *sh, uintptr_t base,
+__cold static void sof_shell_hex_dump(const struct shell *sh, uintptr_t base,
 			       size_t off, size_t len)
 {
 	const uint8_t *p = (const uint8_t *)(base + off);
@@ -1989,7 +1989,7 @@ struct sof_shell_mb_region {
 	size_t size;
 };
 
-static const struct sof_shell_mb_region sof_shell_mb_regions[] = {
+__cold_rodata static const struct sof_shell_mb_region sof_shell_mb_regions[] = {
 	{ "exception", MAILBOX_EXCEPTION_BASE, MAILBOX_EXCEPTION_SIZE },
 	{ "dspbox",    MAILBOX_DSPBOX_BASE,    MAILBOX_DSPBOX_SIZE    },
 	{ "hostbox",   MAILBOX_HOSTBOX_BASE,   MAILBOX_HOSTBOX_SIZE   },
@@ -2070,7 +2070,7 @@ struct sof_shell_dw {
 #define SOF_SHELL_DW_BASE \
 	(DT_REG_ADDR(DT_PHANDLE(DT_NODELABEL(mem_window2), memory)) + WIN2_OFFSET)
 
-static const char *dw_type_name(uint32_t type)
+__cold static const char *dw_type_name(uint32_t type)
 {
 	switch (type & ADSP_DW_SLOT_TYPE_MASK) {
 	case ADSP_DW_SLOT_UNUSED & ADSP_DW_SLOT_TYPE_MASK:
@@ -2153,7 +2153,7 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 #include <sof/debug/telemetry/performance_monitor.h>
 #include <ipc4/base_fw.h>
 
-static const char *perf_state_str(enum ipc4_perf_measurements_state_set s)
+__cold static const char *perf_state_str(enum ipc4_perf_measurements_state_set s)
 {
 	switch (s) {
 	case IPC4_PERF_MEASUREMENTS_DISABLED:	return "disabled";
@@ -2244,7 +2244,7 @@ __cold static int cmd_sof_perf_status(const struct shell *sh,
 
 #if CONFIG_SOF_SHELL_DAI_LIST
 
-static const char *zephyr_dai_type_str(int t)
+__cold static const char *zephyr_dai_type_str(int t)
 {
 	switch (t) {
 	case DAI_LEGACY_I2S:	return "i2s";
@@ -2326,7 +2326,7 @@ __cold static int cmd_sof_dai_list(const struct shell *sh,
 
 #if CONFIG_SOF_SHELL_DMA_STATUS
 
-static const char *dma_dir_str(enum dma_channel_direction d)
+__cold static const char *dma_dir_str(enum dma_channel_direction d)
 {
 	switch (d) {
 	case MEMORY_TO_MEMORY:	return "M2M";
@@ -2339,7 +2339,7 @@ static const char *dma_dir_str(enum dma_channel_direction d)
 	}
 }
 
-static void dma_print_one(const struct shell *sh, struct sof_dma *dma,
+__cold static void dma_print_one(const struct shell *sh, struct sof_dma *dma,
 			  int dma_idx, int chan)
 {
 	struct dma_status st = {0};
@@ -2435,7 +2435,7 @@ __cold static int cmd_sof_dma_status(const struct shell *sh,
  * label available in firmware is the UUID name string from the trace
  * context (which carries the same name printed by the LDC tool).
  */
-static const char *kctl_drv_name(const struct comp_dev *cd)
+__cold static const char *kctl_drv_name(const struct comp_dev *cd)
 {
 	if (cd && cd->drv && cd->drv->tctx && cd->drv->tctx->uuid_p &&
 	    cd->drv->tctx->uuid_p->name[0])
@@ -2450,7 +2450,7 @@ static const char *kctl_drv_name(const struct comp_dev *cd)
  * config_id blobs that need IPC4 large_config marshalling, which is
  * intentionally out of scope here (see shell.md).
  */
-static const char *kctl_drv_kind(const char *name)
+__cold static const char *kctl_drv_kind(const char *name)
 {
 	if (!name)
 		return "";
