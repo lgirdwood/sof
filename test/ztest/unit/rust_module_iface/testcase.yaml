@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: BSD-3-Clause
+tests:
+  sof.unit.rust_module_iface:
+    platform_allow:
+      - native_sim/native/64
+    harness: ztest
+    tags: unit rust
