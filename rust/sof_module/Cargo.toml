@@ -1,0 +1,16 @@
+[package]
+name = "sof_module"
+version = "0.1.0"
+edition = "2021"
+description = "Rust wrapper around SOF struct module_interface (the SOF audio module client API)"
+license = "BSD-3-Clause"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+# Off by default so simple modules that don't want to drag in the
+# heap (and therefore would not install a global allocator) still
+# build. Enable from leaf crates that call
+# `sof_module::install_global_allocator!()`.
+alloc = []
