@@ -1,0 +1,17 @@
+[package]
+name = "rust_template_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+sof_module = { path = "../../../../rust/sof_module" }
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1

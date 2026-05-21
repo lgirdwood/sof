@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_RUST_TEMPLATE
+	tristate "Rust template example component (llext)"
+	default n
+	depends on LLEXT
+	help
+	  Build a minimal SOF processing module whose entire module_interface
+	  vtable is implemented in Rust via the sof_module crate. Selecting =m
+	  builds it as a dynamically loadable llext for Xtensa targets.
+
+	  Requires a Rust toolchain capable of cross-compiling to
+	  xtensa-intel_ace30_ptl-zephyr-elf (see sof/doc/rust.md).

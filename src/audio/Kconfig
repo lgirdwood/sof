@@ -145,8 +145,39 @@ rsource "smart_amp/Kconfig"
 rsource "sound_dose/Kconfig"
 rsource "src/Kconfig"
 rsource "stft_process/Kconfig"
+config COMP_TDFB_ZTEST
+	bool "TDFB ZTest component"
+	default y
+
+config RUST_HELLO_ZTEST
+	bool "Rust hello-world ZTest"
+	default n
+	help
+	  Build the Rust hello-world ZTest into the SOF firmware ZTest
+	  app. When enabled, a Rust staticlib (rust_hello) is cross-built
+	  with the configured Rust toolchain (default: xtensa-llvm) and
+	  linked into the firmware, together with a small C ZTest suite
+	  that calls into it. Used to validate the Rust toolchain and
+	  cross-compile pipeline on the target.
+
+config RUST_TEMPLATE_ZTEST
+	bool "Rust template module ZTest"
+	default n
+	help
+	  Build a ZTest that exercises the all-Rust SOF audio module
+	  (sof/src/audio/rust_template/rust). The Rust crate is
+	  cross-built as a staticlib and linked into the ZTest firmware;
+	  the test then directly calls the function pointers in the
+	  generated `struct module_interface rust_template_interface`
+	  (init / process / reset / free) to confirm the Rust shim
+	  produced by sof_module's `define_module!()` macro is wired
+	  up correctly. Independent of CONFIG_LLEXT and
+	  CONFIG_COMP_RUST_TEMPLATE — this is the in-firmware static
+	  link of the same crate, used purely as a sanity test.
+
 rsource "tdfb/Kconfig"
 rsource "template/Kconfig"
+rsource "rust_template/Kconfig"
 rsource "tensorflow/Kconfig"
 rsource "tone/Kconfig"
 rsource "up_down_mixer/Kconfig"

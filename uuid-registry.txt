@@ -142,6 +142,7 @@ d7f6712d-131c-45a7-82ed6aa9dc2291ea pm_runtime
 2f0b1901-cac0-4b87-812ff2d5e4f19e4a probe_task
 393608d8-4188-11ee-be560242ac122002 ring_buffer
 5c7ca334-e15d-11eb-ba800242ac130004 rtnr
+abd85981-e7fc-4586-a299a1ed8ce195f9 rust_template
 5276b491-5b64-464e-8984dc228ef9e6a1 sa
 9302adf5-88be-4234-a0a7dca538ef81f4 sai
 3dee06de-f25a-4e10-ae1fabc9573873ea schedule
