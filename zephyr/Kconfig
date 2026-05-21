@@ -255,6 +255,34 @@ config SOF_BOOT_TEST_STANDALONE
 	  with system state. Normal IPC handling of the SOF application
 	  is disabled to allow more complex tests to run.
 
+config SOF_MATH_ZTEST
+	bool "Enable SOF math library ZTests"
+	depends on ZTEST
+	select REQUIRES_FULL_LIBC
+	select REQUIRES_FLOAT_PRINTF
+	select MATH_FIR
+	select MATH_IIR_DF1
+	select MATH_IIR_DF2T
+	select MATH_EXP
+	select CORDIC_FIXED
+	select MATH_COMPLEX
+	select SQRT_FIXED
+	select MATH_LUT_SINE_FIXED
+	select MATH_ATAN2
+	select MATH_DECIBELS
+	select NATURAL_LOGARITHM_FIXED
+	select COMMON_LOGARITHM_FIXED
+	select POWER_FIXED
+	select BINARY_LOGARITHM_FIXED
+	select MATH_WINDOW
+	select MATH_MATRIX
+	select MATH_AUDITORY
+	select MATH_DCT
+	select MATH_A_LAW_CODEC
+	select MATH_MU_LAW_CODEC
+	help
+	  Enable ZTests for the SOF math library.
+
 config SOF_ZEPHYR_NO_SOF_CLOCK
 	bool
 	help

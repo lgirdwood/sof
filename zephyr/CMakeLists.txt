@@ -137,7 +137,7 @@ function(sof_llext_build module)
 			--text-addr=${CONFIG_LIBRARY_BASE_ADDRESS}
 			-c $<TARGET_PROPERTY:bintools,elfconvert_command>
 			-f ${proc_in_file} -o ${proc_out_file}
-			$ENV{ZEPHYR_SDK_INSTALL_DIR}/gnu/${CROSS_COMPILE_TARGET}/bin/${CROSS_COMPILE_TARGET}-gcc --
+			${ZEPHYR_SDK_INSTALL_DIR}/gnu/${CROSS_COMPILE_TARGET}/bin/${CROSS_COMPILE_TARGET}-gcc --
 			-mtext-section-literals ${EXTRA_LINKER_PARAMS} $<TARGET_OBJECTS:${module}_llext_lib> ${EXTRA_LIBS}
 	)
 

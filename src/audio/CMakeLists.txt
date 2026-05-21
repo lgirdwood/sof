@@ -95,6 +95,9 @@ if(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 	if(CONFIG_COMP_TEMPLATE)
 		add_subdirectory(template)
 	endif()
+	if(CONFIG_COMP_RUST_TEMPLATE)
+		add_subdirectory(rust_template)
+	endif()
 	if(CONFIG_COMP_TENSORFLOW)
 		add_subdirectory(tensorflow)
 	endif()
@@ -263,11 +266,22 @@ set(mfcc_sources mfcc/mfcc.c mfcc/mfcc_setup.c mfcc/mfcc_common.c mfcc/mfcc_gene
 set(mux_sources mux/mux.c mux/mux_generic.c)
 
 foreach(audio_module ${sof_audio_modules})
-	# first compile with no optimizations
-	sof_audio_add_module(sof_${audio_module} "" ${${audio_module}_sources})
+	# Only compile if the component is enabled in Kconfig
+	string(TOUPPER ${audio_module} upper_module)
+	# Special case for eq-fir and eq-iir
+	if(upper_module STREQUAL "EQ-FIR")
+		set(upper_module "FIR")
+	elseif(upper_module STREQUAL "EQ-IIR")
+		set(upper_module "IIR")
+	endif()
 
-	# compile for each optimization
-	foreach(opt ${available_optimizations})
-		sof_audio_add_module(sof_${audio_module}_${opt} "${${opt}_flags}" ${${audio_module}_sources})
-	endforeach()
+	if(CONFIG_COMP_${upper_module})
+		# first compile with no optimizations
+		sof_audio_add_module(sof_${audio_module} "" ${${audio_module}_sources})
+
+		# compile for each optimization
+		foreach(opt ${available_optimizations})
+			sof_audio_add_module(sof_${audio_module}_${opt} "${${opt}_flags}" ${${audio_module}_sources})
+		endforeach()
+	endif()
 endforeach()
