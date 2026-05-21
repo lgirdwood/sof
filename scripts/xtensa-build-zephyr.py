@@ -436,6 +436,9 @@ xt-clang or GCC. Specify the LLVM build directory containing bin/clang.
 A wrapper script is auto-generated to handle GCC flag translation,
 external assembler usage, and Xtensa target configuration.
 Example: --llvm-clang /home/user/llvm-project/build""")
+	parser.add_argument("--build-dir-suffix", default="",
+				help="Suffix to append to the build directory name (e.g. '-llvm' or '-gcc').\n"
+				     "This is useful for keeping side-by-side build environments.")
 
 	args = parser.parse_args()
 
@@ -1108,7 +1111,7 @@ def build_platforms():
 			XTENSA_SYSTEM = str(builds_toolchainver / platform_dict["XTENSA_CORE"] / "config")
 			platf_build_environ["XTENSA_SYSTEM"] = XTENSA_SYSTEM
 
-		platform_build_dir_name = f"build-{platform}"
+		platform_build_dir_name = f"build-{platform}{args.build_dir_suffix}"
 
 		PLAT_CONFIG = platform_dict["PLAT_CONFIG"]
 
@@ -1143,14 +1146,22 @@ def build_platforms():
 			# assembler) need an explicit CPU override for HiFi5 support.
 			parts = PLAT_CONFIG.split("/")
 			if len(parts) >= 3:
-				core_id = f"{parts[1]}_{parts[2]}"  # e.g. "ace40_nvl" -> "intel_ace40"
+				core_id = f"{parts[1]}_{parts[2]}"  # e.g. "ace40_nvl" -> "intel_ace40_adsp"
 				# Map board-level names to LLVM processor names
 				core_id_map = {
-					"ace30_ptl": "intel_ace30_ptl",
-					"ace40_nvl": "intel_ace40",
-					"ace40_nvls": "intel_ace40",
+					"ace30_ptl": "intel_ace30_adsp",
+					"ace40_nvl": "intel_ace40_adsp",
+					"ace40_nvls": "intel_ace40_adsp",
 				}
-				platf_build_environ["XTENSA_CORE_ID"] = core_id_map.get(core_id, "intel_ace30_ptl")
+				platf_build_environ["XTENSA_CORE_ID"] = core_id_map.get(core_id, "intel_ace30_adsp")
+
+				# Map board-level names to Zephyr SDK toolchain names
+				sdk_target_map = {
+					"ace30_ptl": "intel_ace30_ptl",
+					"ace40_nvl": "intel_ace30_ptl",
+					"ace40_nvls": "intel_ace30_ptl",
+				}
+				platf_build_environ["XTENSA_TOOLCHAIN_TARGET"] = sdk_target_map.get(core_id, f"intel_{core_id}")
 
 		extra_conf_files = [str(item.resolve(True)) for item in args.overlay]
 		# The '-d' option is a shortcut for '-o path_to_debug_overlay', we are good
@@ -1389,7 +1400,7 @@ def install_lib(platform, sof_output_dir, abs_build_dir, platform_wconfig):
 def install_platform(platform, sof_output_dir, platf_build_environ, platform_wconfig):
 
 	# Keep in sync with caller
-	platform_build_dir_name = f"build-{platform}"
+	platform_build_dir_name = f"build-{platform}{args.build_dir_suffix}"
 
 	# Install to STAGING_DIR
 	abs_build_dir = pathlib.Path(west_top) / platform_build_dir_name / "zephyr"
