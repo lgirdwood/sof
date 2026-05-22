@@ -42,6 +42,33 @@ pub struct ProcessingModuleHandle {
     _private: [u8; 0],
 }
 
+/// Safe handle wrapping a `*mut ProcessingModuleHandle` for the lifetime of
+/// a processing callback. Constructed by the shims emitted by
+/// [`define_module!`]; [`ProcessingModule`] trait methods receive
+/// `&ModuleHandle` instead of a raw pointer.
+pub struct ModuleHandle {
+    pub(crate) ptr: *mut ProcessingModuleHandle,
+}
+
+impl ModuleHandle {
+    /// Internal constructor called from [`define_module!`] shims.
+    /// Not part of the stable public API; subject to change.
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut ProcessingModuleHandle) -> Self {
+        Self { ptr }
+    }
+
+    /// Return the raw `struct processing_module *`.
+    ///
+    /// # Safety
+    /// The pointer is valid only for the duration of the callback that
+    /// provided this `ModuleHandle`. Do not store or copy the pointer past
+    /// the return of the trait method.
+    pub unsafe fn as_ptr(&self) -> *mut ProcessingModuleHandle {
+        self.ptr
+    }
+}
+
 /// Opaque mirror of `struct sof_source`.
 #[repr(C)]
 pub struct SofSource {
@@ -54,10 +81,21 @@ pub struct SofSink {
     _private: [u8; 0],
 }
 
-/// Opaque mirror of `struct bind_info`.
+/// Opaque marker for `struct bind_info`. Only used as `*mut BindInfo`
+/// in C-ABI function pointers; safe Rust code uses [`BindData`] instead.
 #[repr(C)]
 pub struct BindInfo {
     _private: [u8; 0],
+}
+
+/// Which side of the pipeline is being bound: a source (data provider)
+/// or a sink (data consumer). Mirrors `enum bind_type` from
+/// `<sof/audio/component.h>`.
+#[repr(u32)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BindType {
+    Source = 0,
+    Sink   = 1,
 }
 
 // -------------------------------------------------------------------------
@@ -347,8 +385,16 @@ pub mod alloc {
 
     /// Publish a new `processing_module *` to the global allocator,
     /// returning the previous value. Pair with [`leave`] in the same
-    /// callback. Most callers should use the shims emitted by
-    /// [`crate::define_module!`] rather than calling these directly.
+    /// callback. Called exclusively from the shims emitted by
+    /// [`crate::define_module!`]; not part of the public API.
+    ///
+    /// # Single-core assumption
+    /// Accesses a plain pointer slot without atomic operations. Safe
+    /// only because SOF's pipeline model guarantees callbacks for a
+    /// given module never run concurrently on today's single-DSP-core
+    /// hardware. Multi-core support will need a per-CPU slot keyed
+    /// off `arch_proc_id()`.
+    #[doc(hidden)]
     #[inline(always)]
     pub fn enter(new: *mut ProcessingModuleHandle) -> *mut ProcessingModuleHandle {
         // SAFETY: single-DSP-core access to a plain pointer slot; no
@@ -361,7 +407,9 @@ pub mod alloc {
     }
 
     /// Restore the previous `processing_module *` returned by an
-    /// earlier [`enter`] call.
+    /// earlier [`enter`] call. Called exclusively from
+    /// [`crate::define_module!`] shims; not part of the public API.
+    #[doc(hidden)]
     #[inline(always)]
     pub fn leave(prev: *mut ProcessingModuleHandle) {
         // SAFETY: ditto.
@@ -371,9 +419,11 @@ pub mod alloc {
     }
 
     /// Returns the `processing_module *` currently published to the
-    /// global allocator, or null if no callback is active.
+    /// global allocator, or null if no callback is active. Used only
+    /// by [`SofModuleAlloc`]; not part of the public API.
+    #[doc(hidden)]
     #[inline(always)]
-    pub fn current_module() -> *mut ProcessingModuleHandle {
+    pub(crate) fn current_module() -> *mut ProcessingModuleHandle {
         // SAFETY: ditto.
         unsafe { sof_rust_current_module }
     }
@@ -467,6 +517,71 @@ pub mod frame_fmt {
     pub const S24_4LE_MSB: u32 = 5;
     pub const U8:         u32 = 6;
     pub const S16_4LE:    u32 = 7;
+}
+
+unsafe extern "C" {
+    #[link_name = "sof_rust_bind_get_type"]
+    fn bind_get_type(bd: *const BindInfo) -> u32;
+    #[link_name = "sof_rust_bind_get_source"]
+    fn bind_get_source(bd: *const BindInfo) -> *mut SofSource;
+    #[link_name = "sof_rust_bind_get_sink"]
+    fn bind_get_sink(bd: *const BindInfo) -> *mut SofSink;
+}
+
+/// Safe borrow over a SOF `struct bind_info *` for the lifetime of a
+/// `bind` / `unbind` callback. Obtain from the
+/// [`ProcessingModule::bind`] / [`ProcessingModule::unbind`] argument.
+///
+/// Provides safe accessors for the bind type and the associated
+/// source / sink pointer without exposing the C union directly.
+pub struct BindData<'a> {
+    ptr: *mut BindInfo,
+    _marker: core::marker::PhantomData<&'a BindInfo>,
+}
+
+impl<'a> BindData<'a> {
+    /// Internal constructor called from [`define_module!`] shims.
+    /// Not part of the stable public API.
+    #[doc(hidden)]
+    pub fn __from_raw(ptr: *mut BindInfo) -> Self {
+        Self { ptr, _marker: core::marker::PhantomData }
+    }
+
+    /// Whether the binding is for a source (data provider) or a
+    /// sink (data consumer).
+    pub fn bind_type(&self) -> BindType {
+        // SAFETY: ptr is valid for 'a per from_raw contract.
+        match unsafe { bind_get_type(self.ptr) } {
+            0 => BindType::Source,
+            _ => BindType::Sink,
+        }
+    }
+
+    /// Return the [`audio::Source`] being bound, or `None` if the
+    /// bind type is `Sink`.
+    pub fn source(&self) -> Option<audio::Source<'a>> {
+        // SAFETY: bind_get_source returns NULL if type != SOURCE;
+        // non-null pointer is valid for 'a per the SOF module-adapter
+        // contract (the sof_source lives at least as long as the callback).
+        let p = unsafe { bind_get_source(self.ptr) };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { audio::Source::from_raw(p) })
+        }
+    }
+
+    /// Return the [`audio::Sink`] being bound, or `None` if the
+    /// bind type is `Source`.
+    pub fn sink(&self) -> Option<audio::Sink<'a>> {
+        // SAFETY: mirrors source() above.
+        let p = unsafe { bind_get_sink(self.ptr) };
+        if p.is_null() {
+            None
+        } else {
+            Some(unsafe { audio::Sink::from_raw(p) })
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -572,11 +687,10 @@ pub mod audio {
             Self { ptr, _marker: PhantomData }
         }
 
-        /// Escape hatch: hand the raw pointer back out for code that
-        /// still calls the unsafe FFI directly. Prefer the safe
-        /// methods on `Source` when possible.
+        /// Internal raw pointer, used by the `audio::passthrough` /
+        /// `process_stereo_*` helpers inside this crate.
         #[inline]
-        pub fn as_ptr(&mut self) -> *mut SofSource {
+        pub(crate) fn as_ptr(&mut self) -> *mut SofSource {
             self.ptr
         }
 
@@ -621,9 +735,10 @@ pub mod audio {
             Self { ptr, _marker: PhantomData }
         }
 
-        /// Escape hatch: raw `struct sof_sink *`.
+        /// Internal raw pointer, used by the `audio::passthrough` /
+        /// `process_stereo_*` helpers inside this crate.
         #[inline]
-        pub fn as_ptr(&mut self) -> *mut SofSink {
+        pub(crate) fn as_ptr(&mut self) -> *mut SofSink {
             self.ptr
         }
 
@@ -1151,15 +1266,15 @@ pub trait ProcessingModule: 'static + Sync {
     const HAS_TRIGGER: bool = false;
 
     /// Required: module-specific init.
-    fn init(m: *mut ProcessingModuleHandle) -> Result<(), i32>;
+    fn init(handle: &ModuleHandle) -> Result<(), i32>;
 
-    fn prepare(m: *mut ProcessingModuleHandle, ctx: StreamCtx) -> Result<(), i32> {
+    fn prepare(handle: &ModuleHandle, ctx: StreamCtx) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    fn is_ready_to_process(m: *mut ProcessingModuleHandle, ctx: StreamCtx) -> bool {
+    fn is_ready_to_process(handle: &ModuleHandle, ctx: StreamCtx) -> bool {
         true
     }
-    fn process(m: *mut ProcessingModuleHandle, ctx: StreamCtx) -> Result<(), i32> {
+    fn process(handle: &ModuleHandle, ctx: StreamCtx) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
     /// Deprecated: `process_audio_stream` variant. Only override if
@@ -1167,7 +1282,7 @@ pub trait ProcessingModule: 'static + Sync {
     /// `output_stream_buffer` layout where each buffer carries an
     /// `audio_stream *`.
     fn process_audio_stream(
-        m: *mut ProcessingModuleHandle,
+        handle: &ModuleHandle,
         ctx: LegacyStreamCtx,
     ) -> Result<(), i32> {
         Err(err::ENOSYS)
@@ -1176,15 +1291,15 @@ pub trait ProcessingModule: 'static + Sync {
     /// module needs the legacy raw-data layout where each buffer's
     /// `data` field points at a flat raw audio buffer.
     fn process_raw_data(
-        m: *mut ProcessingModuleHandle,
+        handle: &ModuleHandle,
         ctx: LegacyStreamCtx,
     ) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    fn set_config_param(m: *mut ProcessingModuleHandle, param_id_data: u32) -> Result<(), i32> {
+    fn set_config_param(handle: &ModuleHandle, param_id_data: u32) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    fn get_config_param(m: *mut ProcessingModuleHandle, param_id_data: &mut u32) -> Result<(), i32> {
+    fn get_config_param(handle: &ModuleHandle, param_id_data: &mut u32) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
     /// Multi-fragment configuration blob set. Called once per
@@ -1193,7 +1308,7 @@ pub trait ProcessingModule: 'static + Sync {
     /// blob. The host driver guarantees `pos`/`data_offset_size`
     /// semantics described in `interface.h`.
     fn set_configuration(
-        m: *mut ProcessingModuleHandle,
+        handle: &ModuleHandle,
         frag: ConfigFragmentIn<'_>,
     ) -> Result<(), i32> {
         Err(err::ENOSYS)
@@ -1203,7 +1318,7 @@ pub trait ProcessingModule: 'static + Sync {
     /// bytes and updates `*frag.data_offset_size` to report the
     /// total size of the configuration.
     fn get_configuration(
-        m: *mut ProcessingModuleHandle,
+        handle: &ModuleHandle,
         frag: ConfigFragmentOut<'_>,
     ) -> Result<(), i32> {
         Err(err::ENOSYS)
@@ -1212,35 +1327,33 @@ pub trait ProcessingModule: 'static + Sync {
     /// modes. Default returns ENOSYS so the C side leaves the slot
     /// null and the module adapter applies its own fallback.
     fn set_processing_mode(
-        m: *mut ProcessingModuleHandle,
+        handle: &ModuleHandle,
         mode: ModuleProcessingMode,
     ) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
     /// Report the currently-active processing mode. Default returns
     /// `Normal` for modules that don't track the bit themselves.
-    fn get_processing_mode(m: *mut ProcessingModuleHandle) -> ModuleProcessingMode {
+    fn get_processing_mode(handle: &ModuleHandle) -> ModuleProcessingMode {
         ModuleProcessingMode::Normal
     }
-    fn reset(m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn reset(handle: &ModuleHandle) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    fn free(m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn free(handle: &ModuleHandle) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    /// Called when this module is bound to a peer. `bind_data` is
-    /// an opaque `struct bind_info *`; module code that needs to
-    /// inspect it must use the C API on the SOF side. Most
-    /// modules can ignore the contents and just return `Ok(())` to
-    /// acknowledge the bind.
-    fn bind(m: *mut ProcessingModuleHandle, bind_data: *mut BindInfo) -> Result<(), i32> {
+    /// Called when this module is bound to a peer. `data` describes
+    /// which side is being connected (source or sink) and carries the
+    /// associated [`audio::Source`] or [`audio::Sink`] pointer.
+    fn bind(handle: &ModuleHandle, data: &BindData<'_>) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
     /// Called when this module is unbound from a peer.
-    fn unbind(m: *mut ProcessingModuleHandle, unbind_data: *mut BindInfo) -> Result<(), i32> {
+    fn unbind(handle: &ModuleHandle, data: &BindData<'_>) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
-    fn trigger(m: *mut ProcessingModuleHandle, cmd: i32) -> Result<(), i32> {
+    fn trigger(handle: &ModuleHandle, cmd: i32) -> Result<(), i32> {
         Err(err::ENOSYS)
     }
 }
@@ -1269,8 +1382,8 @@ pub fn to_c_int(r: Result<(), i32>) -> i32 {
 /// pub struct MyMod;
 /// impl ProcessingModule for MyMod {
 ///     const HAS_PROCESS: bool = true;
-///     fn init(_m: *mut ProcessingModule) -> Result<(), i32> { Ok(()) }
-///     fn process(_m: *mut ProcessingModule, _c: StreamCtx) -> Result<(), i32> { Ok(()) }
+///     fn init(_handle: &ModuleHandle) -> Result<(), i32> { Ok(()) }
+///     fn process(_handle: &ModuleHandle, _c: StreamCtx) -> Result<(), i32> { Ok(()) }
 /// }
 ///
 /// sof_module::define_module!(MyMod, my_module_interface);
@@ -1290,7 +1403,8 @@ macro_rules! define_module {
 
             unsafe extern "C" fn _init(m: *mut ProcessingModuleHandle) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::init(m));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::init(&__handle));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1300,11 +1414,12 @@ macro_rules! define_module {
                 sinks: *mut *mut SofSink, n_snk: i32,
             ) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let ctx = StreamCtx {
                     sources: core::slice::from_raw_parts_mut(sources, n_src.max(0) as usize),
                     sinks:   core::slice::from_raw_parts_mut(sinks,   n_snk.max(0) as usize),
                 };
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::prepare(m, ctx));
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::prepare(&__handle, ctx));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1314,11 +1429,12 @@ macro_rules! define_module {
                 sinks: *mut *mut SofSink, n_snk: i32,
             ) -> bool {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let ctx = StreamCtx {
                     sources: core::slice::from_raw_parts_mut(sources, n_src.max(0) as usize),
                     sinks:   core::slice::from_raw_parts_mut(sinks,   n_snk.max(0) as usize),
                 };
-                let __sof_ret = <$ty as ProcessingModule>::is_ready_to_process(m, ctx);
+                let __sof_ret = <$ty as ProcessingModule>::is_ready_to_process(&__handle, ctx);
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1328,24 +1444,27 @@ macro_rules! define_module {
                 sinks: *mut *mut SofSink, n_snk: i32,
             ) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let ctx = StreamCtx {
                     sources: core::slice::from_raw_parts_mut(sources, n_src.max(0) as usize),
                     sinks:   core::slice::from_raw_parts_mut(sinks,   n_snk.max(0) as usize),
                 };
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::process(m, ctx));
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::process(&__handle, ctx));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _set_cfg_param(m: *mut ProcessingModuleHandle, p: u32) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::set_config_param(m, p));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::set_config_param(&__handle, p));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _get_cfg_param(m: *mut ProcessingModuleHandle, p: *mut u32) -> i32 {
                 if p.is_null() { return err::EINVAL; }
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::get_config_param(m, &mut *p));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::get_config_param(&__handle, &mut *p));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1377,8 +1496,9 @@ macro_rules! define_module {
                     fragment: frag_slice,
                     response: resp_slice,
                 };
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let __sof_ret =
-                    to_c_int(<$ty as ProcessingModule>::set_configuration(m, frag));
+                    to_c_int(<$ty as ProcessingModule>::set_configuration(&__handle, frag));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1401,8 +1521,9 @@ macro_rules! define_module {
                     data_offset_size: &mut *data_offset_size,
                     fragment: frag_slice,
                 };
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let __sof_ret =
-                    to_c_int(<$ty as ProcessingModule>::get_configuration(m, frag));
+                    to_c_int(<$ty as ProcessingModule>::get_configuration(&__handle, frag));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1411,8 +1532,9 @@ macro_rules! define_module {
                 mode: ModuleProcessingMode,
             ) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let __sof_ret =
-                    to_c_int(<$ty as ProcessingModule>::set_processing_mode(m, mode));
+                    to_c_int(<$ty as ProcessingModule>::set_processing_mode(&__handle, mode));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1420,7 +1542,8 @@ macro_rules! define_module {
                 m: *mut ProcessingModuleHandle,
             ) -> ModuleProcessingMode {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = <$ty as ProcessingModule>::get_processing_mode(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = <$ty as ProcessingModule>::get_processing_mode(&__handle);
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1430,12 +1553,13 @@ macro_rules! define_module {
                 outputs: *mut OutputStreamBuffer, n_out: i32,
             ) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let ctx = LegacyStreamCtx {
                     inputs:  core::slice::from_raw_parts_mut(inputs,  n_in.max(0)  as usize),
                     outputs: core::slice::from_raw_parts_mut(outputs, n_out.max(0) as usize),
                 };
                 let __sof_ret =
-                    to_c_int(<$ty as ProcessingModule>::process_audio_stream(m, ctx));
+                    to_c_int(<$ty as ProcessingModule>::process_audio_stream(&__handle, ctx));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
@@ -1445,46 +1569,56 @@ macro_rules! define_module {
                 outputs: *mut OutputStreamBuffer, n_out: i32,
             ) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
+                let __handle = $crate::ModuleHandle::__from_raw(m);
                 let ctx = LegacyStreamCtx {
                     inputs:  core::slice::from_raw_parts_mut(inputs,  n_in.max(0)  as usize),
                     outputs: core::slice::from_raw_parts_mut(outputs, n_out.max(0) as usize),
                 };
                 let __sof_ret =
-                    to_c_int(<$ty as ProcessingModule>::process_raw_data(m, ctx));
+                    to_c_int(<$ty as ProcessingModule>::process_raw_data(&__handle, ctx));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _reset(m: *mut ProcessingModuleHandle) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::reset(m));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::reset(&__handle));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _free(m: *mut ProcessingModuleHandle) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::free(m));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::free(&__handle));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _bind(
                 m: *mut ProcessingModuleHandle, bd: *mut BindInfo,
             ) -> i32 {
+                if bd.is_null() { return err::EINVAL; }
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::bind(m, bd));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __bind = $crate::BindData::__from_raw(bd);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::bind(&__handle, &__bind));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _unbind(
                 m: *mut ProcessingModuleHandle, bd: *mut BindInfo,
             ) -> i32 {
+                if bd.is_null() { return err::EINVAL; }
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::unbind(m, bd));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __bind = $crate::BindData::__from_raw(bd);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::unbind(&__handle, &__bind));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }
             unsafe extern "C" fn _trigger(m: *mut ProcessingModuleHandle, cmd: i32) -> i32 {
                 let __sof_prev = $crate::alloc::enter(m);
-                let __sof_ret = to_c_int(<$ty as ProcessingModule>::trigger(m, cmd));
+                let __handle = $crate::ModuleHandle::__from_raw(m);
+                let __sof_ret = to_c_int(<$ty as ProcessingModule>::trigger(&__handle, cmd));
                 $crate::alloc::leave(__sof_prev);
                 __sof_ret
             }

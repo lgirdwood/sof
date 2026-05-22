@@ -101,6 +101,9 @@ if(CONFIG_ZTEST)
     # helpers, so the sof_module global allocator (and any Rust code
     # using Box/Vec/String during a callback) resolves cleanly.
     zephyr_library_sources(${_sof_root}/rust/sof_module/c_shim/sof_rust_mod_alloc.c)
+    # Out-of-line accessors for struct bind_info fields, used by
+    # sof_module::BindData<'_> in the bind/unbind callbacks.
+    zephyr_library_sources(${_sof_root}/rust/sof_module/c_shim/sof_rust_bind.c)
     # Zephyr LOG shims so the Rust crate's sof_rust_template_log_*
     # references resolve in the ZTest firmware (the llext build of
     # rust_template.c isn't pulled into the test ELF).

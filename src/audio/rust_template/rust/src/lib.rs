@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use sof_module::{
     audio, define_module, err, frame_fmt, ipc4_control, ConfigFragmentIn, ConfigFragmentOut,
-    ProcessingModule, ProcessingModuleHandle, StreamCtx,
+    ModuleHandle, ProcessingModule, StreamCtx,
 };
 
 // -------------------------------------------------------------------------
@@ -142,7 +142,7 @@ impl ProcessingModule for RustTemplate {
     const HAS_SET_CONFIGURATION: bool = true;
     const HAS_GET_CONFIGURATION: bool = true;
 
-    fn init(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn init(_handle: &ModuleHandle) -> Result<(), i32> {
         // Real modules would allocate per-instance state here via
         // a SOF-provided allocator; this skeleton keeps it stateless.
         log::info(c"rust_template init");
@@ -154,7 +154,7 @@ impl ProcessingModule for RustTemplate {
     /// otherwise straight-copy the source through to the sink. Uses
     /// the helpers in `sof_module::audio` so the FFI to `source_*` /
     /// `sink_*` lives in one place.
-    fn process(_m: *mut ProcessingModuleHandle, mut ctx: StreamCtx) -> Result<(), i32> {
+    fn process(_handle: &ModuleHandle, mut ctx: StreamCtx) -> Result<(), i32> {
         // The SOF module adapter always invokes `process` with at
         // least one source and one sink wired up; missing wiring is
         // a topology bug, not a runtime data condition.
@@ -179,7 +179,7 @@ impl ProcessingModule for RustTemplate {
     /// switch / enum / bytes controls via the `config_id` parameter,
     /// matching the C template's `template_set_config()`.
     fn set_configuration(
-        _m: *mut ProcessingModuleHandle,
+        _handle: &ModuleHandle,
         frag: ConfigFragmentIn<'_>,
     ) -> Result<(), i32> {
         match frag.config_id {
@@ -210,17 +210,17 @@ impl ProcessingModule for RustTemplate {
     /// Companion to [`set_configuration`]: the C template stubs this
     /// out (returns 0 with no fragment data), and we do the same.
     fn get_configuration(
-        _m: *mut ProcessingModuleHandle,
+        _handle: &ModuleHandle,
         _frag: ConfigFragmentOut<'_>,
     ) -> Result<(), i32> {
         Ok(())
     }
 
-    fn reset(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn reset(_handle: &ModuleHandle) -> Result<(), i32> {
         Ok(())
     }
 
-    fn free(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn free(_handle: &ModuleHandle) -> Result<(), i32> {
         Ok(())
     }
 }

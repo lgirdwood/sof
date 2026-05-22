@@ -7,7 +7,7 @@
 #![no_std]
 
 use sof_module::{
-    define_module, err, ProcessingModule, ProcessingModuleHandle, StreamCtx,
+    define_module, err, ModuleHandle, ProcessingModule, StreamCtx,
 };
 
 #[panic_handler]
@@ -26,26 +26,26 @@ impl ProcessingModule for DemoMod {
     const HAS_TRIGGER: bool = true;
     const HAS_SET_CONFIG_PARAM: bool = true;
 
-    fn init(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn init(_handle: &ModuleHandle) -> Result<(), i32> {
         Ok(())
     }
 
     fn process(
-        _m: *mut ProcessingModuleHandle,
+        _handle: &ModuleHandle,
         _ctx: StreamCtx,
     ) -> Result<(), i32> {
         Ok(())
     }
 
-    fn reset(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn reset(_handle: &ModuleHandle) -> Result<(), i32> {
         Ok(())
     }
 
-    fn free(_m: *mut ProcessingModuleHandle) -> Result<(), i32> {
+    fn free(_handle: &ModuleHandle) -> Result<(), i32> {
         Ok(())
     }
 
-    fn trigger(_m: *mut ProcessingModuleHandle, cmd: i32) -> Result<(), i32> {
+    fn trigger(_handle: &ModuleHandle, cmd: i32) -> Result<(), i32> {
         // Echo the command back so the test can verify dispatch carries
         // arguments through.
         if cmd == 0 {
@@ -56,7 +56,7 @@ impl ProcessingModule for DemoMod {
     }
 
     fn set_config_param(
-        _m: *mut ProcessingModuleHandle,
+        _handle: &ModuleHandle,
         param_id_data: u32,
     ) -> Result<(), i32> {
         // Only id == 0xCAFE is accepted; anything else is EINVAL.
