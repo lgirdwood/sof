@@ -11,6 +11,8 @@ manifest:
       url-base: https://github.com/thesofproject
     - name: zephyrproject
       url-base: https://github.com/zephyrproject-rtos
+    - name: lgirdwood
+      url-base: https://github.com/lgirdwood
 
   # When upgrading projects here please run git log --oneline in the
   # project and if not too long then include the output in your commit
@@ -41,10 +43,16 @@ manifest:
       path: sof/tools/rimage/tomlc99
       revision: e3a03f5ec7d8d33be705c5ce8a632d998ce9b4d1
 
+    - name: hal_xtensa
+      repo-path: hal_xtensa
+      path: modules/hal/xtensa
+      revision: 934e18f770860509c37180ba38480fd85c15461c
+      remote: lgirdwood
+
     - name: zephyr
       repo-path: zephyr
-      revision: c162980efd9ad8616d0e2fe886ca917d8d8d240a
-      remote: zephyrproject
+      revision: b3056934ca4c111b3f3e8f2c4e39717022ec35a2
+      remote: lgirdwood
 
       # Import some projects listed in zephyr/west.yml@revision
       #
