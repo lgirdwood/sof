@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+config COMP_HIFI_INTRIN_TEST
+	tristate "HiFi intrinsic test module (LLEXT)"
+	default n
+	depends on IPC_MAJOR_4 && LLEXT
+	help
+	  Build a standalone HiFi intrinsic test module as an LLEXT.
+	  When loaded on HiFi3/HiFi4 targets (e.g. intel_ace15_adsp) it
+	  runs a suite of HiFi intrinsic tests via printk and reports
+	  the number of failures.  Useful for QEMU and hardware bring-up.

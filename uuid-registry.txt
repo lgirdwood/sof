@@ -184,3 +184,4 @@ d944281a-afe9-4695-a043d7f62b89538e waves
 5f1ec3f8-faaf-4099-903ccee98351f169 zephyr_idc
 8fa1d42f-bc6f-464b-867f547af08834da zipc_task
 1547fe68-de0c-11eb-84613158a1294853 zll_sched
+3a9f2f18-b4e2-4d6e-9a1cfbdc47e6a101 hifi_intrin_test

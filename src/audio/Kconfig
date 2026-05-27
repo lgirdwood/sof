@@ -182,6 +182,7 @@ rsource "tensorflow/Kconfig"
 rsource "tone/Kconfig"
 rsource "up_down_mixer/Kconfig"
 rsource "volume/Kconfig"
+rsource "hifi_intrin_test/Kconfig"
 # --- End Kconfig Sources (alphabetical order) ---
 
 rsource "level_multiplier/Kconfig"
