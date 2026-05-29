@@ -44,7 +44,7 @@ bool comp_is_llext(struct comp_dev *comp);
 #define comp_is_llext(comp) false
 #endif
 
-#if CONFIG_LLEXT_EXPERIMENTAL && !CONFIG_ADSP_IMR_CONTEXT_SAVE
+#if CONFIG_LLEXT_EXPERIMENTAL && !CONFIG_ADSP_IMR_CONTEXT_SAVE && CONFIG_LIBRARY_MANAGER
 int llext_manager_store_to_dram(void);
 int llext_manager_restore_from_dram(void);
 #else
