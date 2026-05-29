@@ -18,6 +18,13 @@
 // ---------------------------------------------------------------------------
 #include <zephyr/sys/printk.h>
 #define TEST_PRINTF printk
+#elif defined(SOF_HIFI_INTRIN_BUILTIN)
+// ---------------------------------------------------------------------------
+// Built-in Zephyr firmware build: printk goes to the DSP log.
+// ---------------------------------------------------------------------------
+#include <zephyr/sys/printk.h>
+#include <zephyr/init.h>
+#define TEST_PRINTF printk
 #else
 // ---------------------------------------------------------------------------
 // Bare-metal build: stdout via Xtensa simcall (QEMU/HW semihosting)
@@ -718,6 +725,314 @@ static void test_arith16(void)
 }
 
 // -------------------------------------------------------------------------
+// CLASS: bitwise  (AND64/OR64/XOR64 on ae_int64 — HiFi3 has no AND32/OR32/XOR32)
+// -------------------------------------------------------------------------
+static void test_bitwise(void)
+{
+    ae_int64 a = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x0F0F0F0Fu, 0xAAAAAAAAu));
+    ae_int64 b = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x00FF00FFu, 0x55555555u));
+    ae_int64 ones = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0xFFFFFFFFu, 0xFFFFFFFFu));
+
+    LOG64("bitwise", "AE_AND64",         AE_AND64(a, b));    /* 0x000F000F00000000 */
+    LOG64("bitwise", "AE_OR64",          AE_OR64(a, b));     /* 0x0FFF0FFFFFFFFFFF */
+    LOG64("bitwise", "AE_XOR64",         AE_XOR64(a, b));    /* 0x0FF00FF0FFFFFFFF */
+    LOG64("bitwise", "AE_XOR64(NOT a)",  AE_XOR64(a, ones)); /* 0xF0F0F0F055555555 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: load_store_64  (64-bit loads/stores)
+// -------------------------------------------------------------------------
+static void test_load_store_64(void)
+{
+    ae_int64 buf[4];
+    ae_int64 *p64;
+    ae_int64 v = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0xDEADBEEFu, 0xCAFEBABEu));
+
+    /* AE_S64_I / AE_L64_I  — immediate offset */
+    p64 = buf;
+    AE_S64_I(v, p64, 0);
+    LOG64("load_store_64", "S64_I/L64_I",    AE_L64_I(p64, 0)); /* 0xDEADBEEFCAFEBABE */
+
+    /* AE_S64_IP / AE_L64_IP  — immediate offset with post-increment */
+    p64 = buf;
+    AE_S64_IP(v, p64, 8);   /* store at buf[0], p64 → buf[1] */
+    p64 = buf;
+    ae_int64 rip;
+    AE_L64_IP(rip, p64, 8); /* load from buf[0], p64 → buf[1] */
+    LOG64("load_store_64", "S64_IP/L64_IP",  rip);               /* 0xDEADBEEFCAFEBABE */
+
+    /* AE_L64_XP  — register offset with post-update */
+    p64 = &buf[1];
+    AE_S64_I(v, p64, 0);     /* store v at buf[1] */
+    p64 = &buf[1];
+    ae_int64 rxp;
+    AE_L64_XP(rxp, p64, -8); /* load from buf[1], p64 → buf[0] */
+    LOG64("load_store_64", "L64_XP(ofs=-8)", rxp);               /* 0xDEADBEEFCAFEBABE */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: arith64_ext  (AE_ADD64 non-sat wrap, AE_MAXABS32S)
+// -------------------------------------------------------------------------
+static void test_arith64_ext(void)
+{
+    ae_int64 a = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x00000001u, 0x00000000u)); /* +2^32 */
+    ae_int64 b = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0xFFFFFFFFu, 0xFFFFFFFEu)); /* -2 */
+    ae_int64 max64 = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x7FFFFFFFu, 0xFFFFFFFFu));
+    ae_int64 one   = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x00000000u, 0x00000001u));
+
+    /* AE_ADD64: non-saturating, wraps on overflow (contrast with ADD64S in test_arith64) */
+    LOG64("arith64_ext", "AE_ADD64(a+b)",       AE_ADD64(a, b));       /* 0x00000000FFFFFFFE */
+    LOG64("arith64_ext", "AE_ADD64(MAX64+1)",   AE_ADD64(max64, one)); /* 0x8000000000000000 */
+
+    /* AE_MAXABS32S: max(|a_lane|, |b_lane|) saturating */
+    ae_int32x2 ma = AE_MOVDA32X2(-5, 3);   /* H=-5, L=3  */
+    ae_int32x2 mb = AE_MOVDA32X2(4, -7);   /* H=4,  L=-7 */
+    LOG_AE32X2("arith64_ext", "AE_MAXABS32S",   AE_MAXABS32S(ma, mb)); /* H=5, L=7 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: arith16_ext  (SUB16S, ABS16S — extend arith16 with remaining ops)
+// -------------------------------------------------------------------------
+static void test_arith16_ext(void)
+{
+    /* a: lanes {-10, 5, -3, 8}, b: lanes {2, 3, 1, 2} */
+    ae_int16x4 a = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0xFFF60005u, 0xFFFD0008u));
+    ae_int16x4 b = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00020003u, 0x00010002u));
+
+    /* AE_SUB16S: a - b lane-wise, saturating */
+    ae_int16x4 sub = AE_SUB16S(a, b);
+    LOG_AE32X2("arith16_ext", "AE_SUB16S", (ae_int32x2)sub); /* {-12,2,-4,6}→0xFFF40002_FFFC0006 */
+
+    /* AE_ABS16S: |a| lane-wise, saturating (no |INT16_MIN| overflow) */
+    ae_int16x4 abs16 = AE_ABS16S(a);
+    LOG_AE32X2("arith16_ext", "AE_ABS16S", (ae_int32x2)abs16); /* {10,5,3,8}→0x000A0005_00030008 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: mulsf32_ext  (MULSF32S_LH and MULSF32S_HH — cross-product subtract-MACs)
+// -------------------------------------------------------------------------
+static void test_mulsf32_ext(void)
+{
+    ae_int32x2 a = AE_MOVDA32X2(0x00010000u, 0x00020000u);
+    ae_int32x2 b = AE_MOVDA32X2(0x00030000u, 0x00040000u);
+
+    /* MULSF32S_LH: acc -= frac_sat(L(a) × H(b) × 2) */
+    ae_int64 acc = AE_MUL32_HH(a, b);  /* start: 0x0000000300000000 */
+    AE_MULSF32S_LH(acc, a, b);
+    LOG64("mulsf32_ext", "MULSF32S_LH(HH-LH)", acc);
+
+    /* MULSF32S_HH: acc -= frac_sat(H(a) × H(b) × 2) */
+    acc = AE_MUL32_LL(a, b);           /* start: 0x0000000800000000 */
+    AE_MULSF32S_HH(acc, a, b);
+    LOG64("mulsf32_ext", "MULSF32S_HH(LL-HH)", acc);
+}
+
+// -------------------------------------------------------------------------
+// CLASS: mul32_ext  (MUL32_LH cross-lane, MULA32_HH non-sat acc, MULS32_LL non-sat sub)
+// -------------------------------------------------------------------------
+static void test_mul32_ext(void)
+{
+    ae_int32x2 a = AE_MOVDA32X2(0x00010000u, 0x00020000u);
+    ae_int32x2 b = AE_MOVDA32X2(0x00030000u, 0x00040000u);
+
+    /* AE_MUL32_LH: L(a) × H(b) = 0x00020000 × 0x00030000 */
+    LOG64("mul32_ext", "AE_MUL32_LH(L*H)", AE_MUL32_LH(a, b)); /* 0x0000000600000000 */
+
+    /* AE_MULA32_HH: acc += H(a) × H(b) = 0 + 1×3 ×(2^16)² */
+    ae_int64 acc = AE_ZERO64();
+    AE_MULA32_HH(acc, a, b);
+    LOG64("mul32_ext", "MULA32_HH(0+1*3)", acc); /* 0x0000000300000000 */
+
+    /* AE_MULS32_LL: acc -= L(a) × L(b) = 3×2^32 - 2×4×2^32 = -5×2^32 */
+    AE_MULS32_LL(acc, a, b);
+    LOG64("mul32_ext", "MULS32_LL(3-2*4)", acc); /* 0xFFFFFFFB00000000 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: sat16_conv  (AE_SAT16X4, AE_CLAMPS16)
+// -------------------------------------------------------------------------
+static void test_sat16_convert(void)
+{
+    /* AE_SAT16X4: clip two ae_int32x2 lanes to int16 range and pack */
+    ae_int32x2 hi = AE_MOVDA32X2(0x00010000u, 0xFFFE0000u); /* +65536→+32767, -131072→-32768 */
+    ae_int32x2 lo = AE_MOVDA32(100);                        /* both lanes = 100 */
+    ae_int16x4 sat = AE_SAT16X4(hi, lo);
+    LOG_AE32X2("sat16_conv", "AE_SAT16X4", (ae_int32x2)sat); /* 0x7FFF8000_00640064 */
+
+    /* AE_TRUNC16X4F32: take high 16 bits of each Q31 lane → ae_int16x4 */
+    ae_int32x2 t_hi = AE_MOVDA32X2(0x00010000u, 0x00020000u);
+    ae_int32x2 t_lo = AE_MOVDA32X2(0x00030000u, 0x00040000u);
+    LOG_AE32X2("sat16_conv", "AE_TRUNC16X4F32", (ae_int32x2)AE_TRUNC16X4F32(t_hi, t_lo)); /* 0x00010002_00030004 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: bitwise16  (AND16/OR16/XOR16 and non-saturating ADD16/SUB16)
+// -------------------------------------------------------------------------
+static void test_bitwise16(void)
+{
+    ae_int16x4 a = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x0F0F1234u, 0xAAAA5678u));
+    ae_int16x4 b = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0xF0F05678u, 0x5555AAAAu));
+    LOG_AE32X2("bitwise16", "AE_AND16", (ae_int32x2)AE_AND16(a, b)); /* 0x00001230_00000228 */
+    LOG_AE32X2("bitwise16", "AE_OR16",  (ae_int32x2)AE_OR16(a, b));  /* 0xFFFF567C_FFFFfefa */
+    LOG_AE32X2("bitwise16", "AE_XOR16", (ae_int32x2)AE_XOR16(a, b)); /* 0xFFFF444C_FFFFfcd2 */
+
+    /* Non-saturating: wraps on overflow (contrast with ADD16S/SUB16S) */
+    ae_int16x4 c = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x7FFE8001u, 0x00020003u));
+    ae_int16x4 d = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00020002u, 0x00010001u));
+    LOG_AE32X2("bitwise16", "AE_ADD16", (ae_int32x2)AE_ADD16(c, d)); /* 0x80008003_00030004 */
+    LOG_AE32X2("bitwise16", "AE_SUB16", (ae_int32x2)AE_SUB16(c, d)); /* 0x7FFC7FFF_00010002 */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: fir_remain  (FIR_LH and FIR_LL — complete the 32x16 FIR family)
+// -------------------------------------------------------------------------
+static void test_fir_remain(void)
+{
+    ae_int32x2 d0 = AE_MOVDA32X2(0x00010000u, 0x00020000u);
+    ae_int32x2 d1 = AE_MOVDA32X2(0x00030000u, 0x00040000u);
+    ae_int16x4 c  = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00030004u, 0x00050006u));
+
+    ae_int64 q0 = AE_ZERO64(), q1 = AE_ZERO64();
+    AE_MULAFD32X16X2_FIR_LH(q0, q1, d0, d1, c);
+    LOG64("fir_remain", "FIR_LH q0", q0);
+    LOG64("fir_remain", "FIR_LH q1", q1);
+
+    q0 = AE_ZERO64(); q1 = AE_ZERO64();
+    AE_MULAFD32X16X2_FIR_LL(q0, q1, d0, d1, c);
+    LOG64("fir_remain", "FIR_LL q0", q0);
+    LOG64("fir_remain", "FIR_LL q1", q1);
+}
+
+// -------------------------------------------------------------------------
+// CLASS: circ_buf  (AE_SETCBEGIN0/SETCEND0, AE_L32_XC, AE_S32_L_XC)
+// -------------------------------------------------------------------------
+static void test_circ_buf(void)
+{
+    /* 4-element circular buffer aligned to its own size (16 bytes) */
+    ae_int32 cbuf[4] __attribute__((aligned(16)));
+    int i;
+
+    for (i = 0; i < 4; i++)
+        cbuf[i] = (ae_int32)(0x10000000 * (i + 1));
+    /* cbuf = { 0x10000000, 0x20000000, 0x30000000, 0x40000000 } */
+
+    ae_int32 *p = &cbuf[3];
+    AE_SETCBEGIN0(cbuf);
+    AE_SETCEND0(cbuf + 4);
+
+    ae_int32x2 v0, v1;
+    AE_L32_XC(v0, p, 4); /* load cbuf[3]=0x40000000, wrap → cbuf[0] */
+    AE_L32_XC(v1, p, 4); /* load cbuf[0]=0x10000000, advance → cbuf[1] */
+    LOG_AE32X2("circ_buf", "L32_XC cbuf[3]", v0); /* L=0x40000000 */
+    LOG_AE32X2("circ_buf", "L32_XC cbuf[0]", v1); /* L=0x10000000 */
+
+    /* AE_S32_L_XC: store L-lane at current pos (cbuf[1]), advance */
+    ae_int32x2 sv = AE_MOVDA32X2(0, 0xCAFEBABEu);
+    AE_S32_L_XC(sv, p, 4); /* store 0xCAFEBABE at cbuf[1], → cbuf[2] */
+    ae_int32x2 chk = AE_L32_I((ae_int32 *)cbuf, 4); /* verify cbuf[1] */
+    LOG_AE32X2("circ_buf", "S32_L_XC cbuf[1]", chk); /* L=0xCAFEBABE */
+
+    /* Restore circular buffer regs */
+    AE_SETCBEGIN0((ae_int32 *)0);
+    AE_SETCEND0((ae_int32 *)0);
+}
+
+// -------------------------------------------------------------------------
+// CLASS: circ_64  (AE_L32X2_XC / AE_S32X2_XC — 64-bit circular load/store)
+// Two 32-bit samples per access; typical delay-line inner loop pattern
+// -------------------------------------------------------------------------
+static void test_circ_64(void)
+{
+    ae_int32x2 cbuf[4] __attribute__((aligned(32)));
+    cbuf[0] = AE_MOVDA32X2(0x11111111u, 0x22222222u);
+    cbuf[1] = AE_MOVDA32X2(0x33333333u, 0x44444444u);
+    cbuf[2] = AE_MOVDA32X2(0x55555555u, 0x66666666u);
+    cbuf[3] = AE_MOVDA32X2(0x77777777u, 0x88888888u);
+
+    ae_int32x2 *p = &cbuf[3];
+    AE_SETCBEGIN0((ae_int32 *)cbuf);
+    AE_SETCEND0((ae_int32 *)(cbuf + 4));
+
+    int stride = (int)sizeof(ae_int32x2); /* 8 — must be a register operand */
+    ae_int32x2 v0, v1;
+    AE_L32X2_XC(v0, p, stride); /* load cbuf[3], wrap → cbuf[0] */
+    AE_L32X2_XC(v1, p, stride); /* load cbuf[0], → cbuf[1] */
+    LOG_AE32X2("circ_64", "L32X2_XC cbuf[3]", v0); /* 0x77777777_88888888 */
+    LOG_AE32X2("circ_64", "L32X2_XC cbuf[0]", v1); /* 0x11111111_22222222 */
+
+    ae_int32x2 sv = AE_MOVDA32X2(0xDEADBEEFu, 0xCAFEBABEu);
+    AE_S32X2_XC(sv, p, stride); /* store at cbuf[1], → cbuf[2] */
+    ae_int32x2 chk = AE_L32X2_I(cbuf, 8); /* verify cbuf[1] */
+    LOG_AE32X2("circ_64", "S32X2_XC cbuf[1]", chk); /* 0xDEADBEEF_CAFEBABE */
+
+    AE_SETCBEGIN0((ae_int32 *)0);
+    AE_SETCEND0((ae_int32 *)0);
+}
+
+// -------------------------------------------------------------------------
+// CLASS: circ_16  (AE_L16_XC — 16-bit sample circular load)
+// CB0-backed; 16-bit signed sample loaded and sign-extended to ae_int32x2
+// -------------------------------------------------------------------------
+static void test_circ_16(void)
+{
+    short sbuf[4] __attribute__((aligned(8)));
+    sbuf[0] = 0x1234; sbuf[1] = 0x5678;
+    sbuf[2] = (short)0xABCD; sbuf[3] = (short)0xFFFF;
+
+    ae_int16 *sp = (ae_int16 *)&sbuf[3];
+    AE_SETCBEGIN0(sbuf);
+    AE_SETCEND0(sbuf + 4);
+
+    ae_int32x2 s0, s1;
+    AE_L16_XC(s0, sp, 2); /* load sbuf[3]=0xFFFF=-1, wrap → sbuf[0] */
+    AE_L16_XC(s1, sp, 2); /* load sbuf[0]=0x1234,  → sbuf[1] */
+    LOG_AE32X2("circ_16", "L16_XC sbuf[3]", s0); /* sign-ext -1 */
+    LOG_AE32X2("circ_16", "L16_XC sbuf[0]", s1); /* sign-ext 0x1234 */
+
+    AE_SETCBEGIN0((ae_int32 *)0);
+    AE_SETCEND0((ae_int32 *)0);
+}
+
+// -------------------------------------------------------------------------
+// CLASS: movad16  (AE_MOVAD16_0/1/2/3 — direct 16-bit lane extraction)
+// Faster than the memory-round-trip ae16x4_lane helper
+// -------------------------------------------------------------------------
+static void test_movad16(void)
+{
+    /* lanes: {0=0x0001, 1=0x7FFF, 2=0x8000, 3=0xFFFF} */
+    ae_int16x4 v = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00017FFFu, 0x8000FFFFu));
+    LOG32("movad16", "MOVAD16_0", (unsigned int)AE_MOVAD16_0(v)); /* 0x00000001 */
+    LOG32("movad16", "MOVAD16_1", (unsigned int)AE_MOVAD16_1(v)); /* 0x00007FFF */
+    LOG32("movad16", "MOVAD16_2", (unsigned int)AE_MOVAD16_2(v)); /* 0xFFFF8000 (signed -32768) */
+    LOG32("movad16", "MOVAD16_3", (unsigned int)AE_MOVAD16_3(v)); /* 0xFFFFFFFF (signed -1) */
+}
+
+// -------------------------------------------------------------------------
+// CLASS: mul16x4  (AE_MUL16X4, AE_SLAA64, AE_SRAA32RS)
+// -------------------------------------------------------------------------
+static void test_mul16x4(void)
+{
+    /* AE_MUL16X4: SIMD 16×16→32 multiply, 4 products into 2 ae_int32x2 */
+    ae_int16x4 data  = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00010002u, 0x00030004u));
+    ae_int16x4 gains = AE_MOVINT16X4_FROMINT32X2(AE_MOVDA32X2(0x00050006u, 0x00070008u));
+    /* lanes: data={1,2,3,4}, gains={5,6,7,8} */
+    ae_int32x2 p_hi, p_lo;
+    AE_MUL16X4(p_hi, p_lo, data, gains);
+    LOG_AE32X2("mul16x4", "AE_MUL16X4 hi", p_hi); /* {1*5=5, 2*6=12} 0x00000005_0000000c */
+    LOG_AE32X2("mul16x4", "AE_MUL16X4 lo", p_lo); /* {3*7=21,4*8=32} 0x00000015_00000020 */
+
+    /* AE_SLAA64: non-saturating 64-bit dynamic left shift */
+    ae_int64 v64 = AE_MOVINT64_FROMINT32X2(AE_MOVDA32X2(0x00000001u, 0x00000000u));
+    ae_int32x2 cnt = AE_MOVDA32(4);
+    LOG64("mul16x4", "AE_SLAA64(2^32,4)", AE_SLAA64(v64, cnt)); /* 0x0000001000000000 */
+
+    /* AE_SRAA32RS: dynamic right shift with round + saturation */
+    ae_int32x2 x = AE_MOVDA32X2(0x00000100u, 0xFFFFFF00u); /* +256, -256 */
+    ae_int32x2 sh = AE_MOVDA32(4);
+    LOG_AE32X2("mul16x4", "AE_SRAA32RS(x,4)", AE_SRAA32RS(x, sh)); /* 0x00000010_fffffff0 */
+}
+
+// -------------------------------------------------------------------------
 // Test runner — called from both main() and the LLEXT entry point
 // -------------------------------------------------------------------------
 static void run_all_tests(void)
@@ -741,6 +1056,20 @@ static void run_all_tests(void)
     test_mac_fir();
     test_p24_ops();
     test_arith16();
+    test_bitwise();
+    test_load_store_64();
+    test_arith64_ext();
+    test_arith16_ext();
+    test_mulsf32_ext();
+    test_mul32_ext();
+    test_sat16_convert();
+    test_bitwise16();
+    test_fir_remain();
+    test_circ_buf();
+    test_circ_64();
+    test_circ_16();
+    test_movad16();
+    test_mul16x4();
 
     TEST_PRINTF("=== TOTAL FAILURES: %d ===\n", g_fail);
 }
@@ -780,6 +1109,18 @@ static const struct sof_man_module_manifest mod_manifest __section(".module") __
 				  SOF_REG_UUID(hifi_intrin_test), 1);
 
 SOF_LLEXT_BUILDINFO;
+
+#elif defined(SOF_HIFI_INTRIN_BUILTIN)
+// -------------------------------------------------------------------------
+// Built-in firmware mode — SYS_INIT runs all tests at APPLICATION level
+// -------------------------------------------------------------------------
+static int hifi_intrin_test_builtin_init(void)
+{
+    g_fail = 0;
+    run_all_tests();
+    return 0;
+}
+SYS_INIT(hifi_intrin_test_builtin_init, APPLICATION, 90);
 
 #else
 // -------------------------------------------------------------------------
