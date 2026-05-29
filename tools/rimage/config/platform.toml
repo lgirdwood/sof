@@ -6,4 +6,6 @@
 #include "platform-ptl.toml"
 #elif CONFIG_SOC_ACE40
 #include "platform-nvl.toml"
+#elif CONFIG_TIGERLAKE
+#include "platform-tgl.toml"
 #endif
