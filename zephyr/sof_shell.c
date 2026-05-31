@@ -374,7 +374,7 @@ __cold static int cmd_sof_clock_status(const struct shell *sh,
 #if CONFIG_IPC4_BASE_FW_INTEL
 __cold static void print_manifest_modules(const struct shell *sh,
 					  const struct sof_man_fw_desc *desc,
-					  int lib_id)
+					  int lib_id, bool verbose)
 {
 	const struct sof_man_mod_config *cfg_base;
 	int i;
@@ -405,6 +405,16 @@ __cold static void print_manifest_modules(const struct shell *sh,
 		text_sz = (uint32_t)mod->segment[0].flags.r.length * _SHELL_MOD_PAGE_SZ;
 		bss_sz  = (uint32_t)mod->instance_bss_size * _SHELL_MOD_PAGE_SZ;
 
+		if (!verbose) {
+			shell_print(sh,
+				    "[%d:%d] %-8s  inst:%-3u  cpc:%-8u  text:%-7u  bss:%u",
+				    lib_id, i, name,
+				    mod->instance_max_count,
+				    cfg ? cfg->cpc : 0U,
+				    text_sz, bss_sz);
+			continue;
+		}
+
 		shell_print(sh,
 			    "[%d:%d] %-8s"
 			    "  uuid:%08x-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x",
@@ -434,12 +444,13 @@ __cold static int cmd_sof_module_list(const struct shell *sh,
 {
 #if CONFIG_IPC4_BASE_FW_INTEL
 	const struct sof_man_fw_desc *desc;
+	bool verbose = (argc >= 2 && strcmp(argv[1], "-v") == 0);
 	int total = 0;
 
 	shell_print(sh, "Built-in modules:");
 	desc = basefw_vendor_get_manifest();
 	if (desc) {
-		print_manifest_modules(sh, desc, 0);
+		print_manifest_modules(sh, desc, 0, verbose);
 		total += (int)desc->header.num_module_entries;
 	} else {
 		shell_print(sh, "  (manifest not available)");
@@ -455,7 +466,7 @@ __cold static int cmd_sof_module_list(const struct shell *sh,
 			if (!desc)
 				continue;
 			shell_print(sh, "Library %d modules:", lib_id);
-			print_manifest_modules(sh, desc, lib_id);
+			print_manifest_modules(sh, desc, lib_id, verbose);
 			total += (int)desc->header.num_module_entries;
 		}
 	}
@@ -2061,7 +2072,7 @@ __cold static int cmd_sof_mailbox_hex(const struct shell *sh,
 				    sof_shell_mb_regions[i].name,
 				    (unsigned long)sof_shell_mb_regions[i].base,
 				    sof_shell_mb_regions[i].size);
-		shell_print(sh, "Usage: sof mailbox_hex <region> [offset] [length]");
+		shell_print(sh, "Usage: sof mailbox hex <region> [offset] [length]");
 		return 0;
 	}
 
@@ -2170,7 +2181,7 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 				    dw->descs[i].vma, dw_type_name(dw->descs[i].type),
 				    dw->descs[i].type & ADSP_DW_SLOT_CORE_MASK);
 		}
-		shell_print(sh, "Usage: sof dbgwin_dump <slot> [length]");
+		shell_print(sh, "Usage: sof dbgwin dump <slot> [length]");
 		return 0;
 	}
 
@@ -2243,7 +2254,7 @@ __cold static int cmd_sof_perf_status(const struct shell *sh,
 			shell_print(sh, "perf: paused");
 			return 0;
 		}
-		shell_print(sh, "Usage: sof perf_status [reset|start|stop|pause]");
+		shell_print(sh, "Usage: sof perf status [reset|start|stop|pause]");
 		return -EINVAL;
 	}
 
@@ -2324,6 +2335,7 @@ __cold static int cmd_sof_dai_list(const struct shell *sh,
 {
 	const struct device **list;
 	size_t count = 0;
+	bool verbose = (argc >= 2 && strcmp(argv[1], "-v") == 0);
 	int i;
 
 	list = dai_get_device_list(&count);
@@ -2354,6 +2366,9 @@ __cold static int cmd_sof_dai_list(const struct shell *sh,
 			    i, dev->name ? dev->name : "?",
 			    zephyr_dai_type_str(cfg.type), cfg.dai_index,
 			    cfg.channels, cfg.rate, cfg.format, cfg.word_size);
+
+		if (!verbose)
+			continue;
 
 		props = dai_get_properties(dev, DAI_DIR_TX, 0);
 		if (props)
@@ -2437,7 +2452,7 @@ __cold static int cmd_sof_dma_status(const struct shell *sh,
 					dma->z_dev->name : "?");
 		}
 		shell_print(sh,
-			    "Usage: sof dma_status <dma_idx> [chan]  (omit chan to walk all)");
+			    "Usage: sof dma status <dma_idx> [chan]  (omit chan to walk all)");
 		return 0;
 	}
 
@@ -2572,14 +2587,449 @@ __cold static int cmd_sof_kctl_list(const struct shell *sh,
 	shell_print(sh,
 		    "(set_configuration / get_configuration). Use tinymix /");
 	shell_print(sh,
-		    "sof-ctl on the host, or 'sof module_status' for raw state.");
+		    "sof-ctl on the host, or 'sof module status' for raw state.");
 
 	return 0;
 }
 
 #endif /* CONFIG_SOF_SHELL_KCTL_LIST */
 
+/*
+ * Space-separated aliases for underscore commands.
+ *
+ * Keep legacy underscore names for compatibility while exposing the
+ * preferred tokenized form, e.g. "sof core on" for "sof core_on".
+ */
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test_inject_sched,
+	SHELL_CMD(gap, NULL,
+		  "Inject a gap to audio scheduling\n",
+		  cmd_sof_test_inject_sched_gap),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test_inject,
+	SHELL_CMD(sched, &sof_cmd_test_inject_sched,
+		  "Scheduler injection commands\n", NULL),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test,
+	SHELL_CMD(inject, &sof_cmd_test_inject,
+		  "Injection test commands\n", NULL),
+	SHELL_SUBCMD_SET_END
+);
+
+#if CONFIG_SOF_SHELL_HEAP_USAGE || CONFIG_SOF_SHELL_MODULE_STATUS || CONFIG_SOF_SHELL_MODULE_LIST
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_module_heap,
+#if CONFIG_SOF_SHELL_HEAP_USAGE
+	SHELL_CMD(usage, NULL,
+		  "Print heap memory usage of each module\n",
+		  cmd_sof_module_heap_usage),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_module,
+#if CONFIG_SOF_SHELL_HEAP_USAGE
+	SHELL_CMD(heap, &sof_cmd_module_heap,
+		  "Module heap commands\n", NULL),
+#endif
+#if CONFIG_SOF_SHELL_MODULE_STATUS
+	SHELL_CMD(status, NULL,
+		  "Print status of all active components\n",
+		  cmd_sof_module_status),
+#endif
+#if CONFIG_SOF_SHELL_MODULE_LIST
+	SHELL_CMD_ARG(list, NULL,
+		      "List all available modules (name, inst, cpc, text, bss)\n"
+		      "  [-v]  also show uuid, affinity, cps, ibs, obs\n",
+		      cmd_sof_module_list, 1, 1),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_PIPELINE_STATUS || CONFIG_SOF_SHELL_PIPELINE_OPS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_pipeline,
+#if CONFIG_SOF_SHELL_PIPELINE_STATUS
+	SHELL_CMD(status, NULL,
+		  "Print status of all active pipelines\n",
+		  cmd_sof_pipeline_status),
+#endif
+	SHELL_CMD(list, NULL,
+		  "List all active audio pipelines\n",
+		  cmd_sof_pipeline_list),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_CORE_STATUS || CONFIG_SOF_SHELL_CORE_POWER
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_core,
+#if CONFIG_SOF_SHELL_CORE_STATUS
+	SHELL_CMD(status, NULL,
+		  "Print enabled/active state of each DSP core\n",
+		  cmd_sof_core_status),
+#endif
+#if CONFIG_SOF_SHELL_CORE_POWER
+	SHELL_CMD_ARG(on, NULL,
+		  "Power on a secondary DSP core: <core_id>\n"
+		  "core_id must be 1..CONFIG_CORE_COUNT-1 (core 0 is primary).\n",
+		  cmd_sof_core_on, 2, 0),
+	SHELL_CMD_ARG(off, NULL,
+		  "Power off a secondary DSP core: <core_id>\n"
+		  "core_id must be 1..CONFIG_CORE_COUNT-1 (core 0 is primary).\n",
+		  cmd_sof_core_off, 2, 0),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_SRAM_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_sram,
+	SHELL_CMD(status, NULL,
+		  "Print HPSRAM heap usage statistics\n",
+		  cmd_sof_sram_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_CLOCK_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_clock,
+	SHELL_CMD(status, NULL,
+		  "Print current clock frequency for each DSP core\n",
+		  cmd_sof_clock_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_PIPELINE_OPS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_ppl,
+	SHELL_CMD_ARG(create, NULL,
+		  "Create IPC4 pipeline: <ppl_id> [priority=0] [pages=2] [core=0] [lp=0]\n",
+		  cmd_sof_ppl_create, 2, 4),
+	SHELL_CMD_ARG(delete, NULL,
+		  "Delete IPC4 pipeline: <ppl_id>\n",
+		  cmd_sof_ppl_delete, 2, 0),
+	SHELL_CMD_ARG(state, NULL,
+		  "Set IPC4 pipeline state: <ppl_id> <running|paused|reset>\n",
+		  cmd_sof_ppl_state, 3, 0),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mod,
+	SHELL_CMD_ARG(init, NULL,
+		  "Instantiate module: <mod_id> <inst_id> <ppl_id> [core=0] [dp=0]\n",
+		  cmd_sof_mod_init, 4, 2),
+	SHELL_CMD_ARG(delete, NULL,
+		  "Delete module instance: <mod_id> <inst_id>\n",
+		  cmd_sof_mod_delete, 3, 0),
+	SHELL_CMD_ARG(bind, NULL,
+		  "Bind two module instances: <src_mod> <src_inst> <dst_mod> <dst_inst>"
+		  " [src_q=0] [dst_q=0]\n",
+		  cmd_sof_mod_bind, 5, 2),
+	SHELL_CMD_ARG(unbind, NULL,
+		  "Unbind two module instances: <src_mod> <src_inst> <dst_mod> <dst_inst>"
+		  " [src_q=0] [dst_q=0]\n",
+		  cmd_sof_mod_unbind, 5, 2),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MMU_DBG
+#if CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mmu,
+	SHELL_CMD(status, NULL,
+		  "Print Intel ADSP MTL TLB / virtual memory status\n",
+		  cmd_sof_mmu_status),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_tlb,
+	SHELL_CMD(dump, NULL,
+		  "Dump all active TLB entries (vaddr/paddr/flags)\n",
+		  cmd_sof_tlb_dump),
+	SHELL_CMD_ARG(lookup, NULL,
+		  "Query TLB for a page or range: <vaddr> [end_vaddr]\n",
+		  cmd_sof_tlb_lookup, 2, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+#if CONFIG_XTENSA_MMU
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_page,
+	SHELL_CMD_ARG(info, NULL,
+		  "Probe DTLB for a page or range: <vaddr> [end_vaddr]\n"
+		  "Reports physical address, ring, ASID, R/W/X permissions"
+		  " and cache mode for each page currently in the DTLB.\n",
+		  cmd_sof_page_info, 2, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_llext,
+#if CONFIG_SOF_SHELL_LLEXT_LOAD
+	SHELL_CMD_ARG(load, NULL,
+		  "Load llext module from host: <name> [lib_id=1]\n"
+		  "Sets up the DMA handshake slot then waits for:\n"
+		  "  dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load\\\n"
+		  "     bs=$(stat -c%s <module.ri>) count=1\n"
+		  "on the host. Prints result when DMA and IPC4 load complete.\n",
+		  cmd_sof_llext_load, 2, 1),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_LIST
+	SHELL_CMD(list, NULL,
+		  "List llext libraries stored in IMR/DRAM.\n"
+		  "For each library shows base address, storage size and per-module\n"
+		  "SRAM mapping state (yes/no), use count and dependency count.\n",
+		  cmd_sof_llext_list),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_PURGE
+	SHELL_CMD_ARG(purge, NULL,
+		  "Purge llext library from IMR/DRAM: <lib_id>\n"
+		  "Fails with -EBUSY if any module in the library is still\n"
+		  "mapped in SRAM (i.e. a pipeline using it is still active).\n",
+		  cmd_sof_llext_purge, 2, 0),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_vpage,
+	SHELL_CMD(status, NULL,
+		  "Print virtual page allocator status\n",
+		  cmd_sof_vpage_info),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_vregion,
+	SHELL_CMD(status, NULL,
+		  "Print virtual regions status\n",
+		  cmd_sof_vregion_info),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_ipc,
+	SHELL_CMD_ARG(stats, NULL,
+		  "Print IPC RX/TX counters; 'sof ipc stats reset' clears them\n",
+		  cmd_sof_ipc_stats, 1, 1),
+	SHELL_CMD(last, NULL,
+		  "Print the last received and sent IPC headers\n",
+		  cmd_sof_ipc_last),
+	SHELL_SUBCMD_SET_END
+);
+
+#if CONFIG_SOF_SHELL_BUFFER_INFO
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_buffer,
+	SHELL_CMD(list, NULL,
+		  "List all audio buffers (id, source/sink, fill, format)\n",
+		  cmd_sof_buffer_list),
+	SHELL_CMD_ARG(info, NULL,
+		  "Detailed info for a single buffer: <buffer_id>\n",
+		  cmd_sof_buffer_info, 2, 0),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_SCHED_INFO
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_sched,
+	SHELL_CMD(tasks, NULL,
+		  "List all scheduler tasks (type, core, prio, state)\n",
+		  cmd_sof_sched_tasks),
+	SHELL_CMD(load, NULL,
+		  "Show per-task cycle counters and totals\n",
+		  cmd_sof_sched_load),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_log,
+	SHELL_CMD(status, NULL,
+		  "List Zephyr log backends with state and source count\n",
+		  cmd_sof_log_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MTRACE_DUMP
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mtrace,
+	SHELL_CMD(dump, NULL,
+		  "Snapshot the mtrace SRAM ring buffer (does not advance host_ptr)\n",
+		  cmd_sof_mtrace_dump),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MAILBOX_HEX
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mailbox,
+	SHELL_CMD_ARG(hex, NULL,
+		  "Hex-dump a mailbox region: <region> [offset] [length]\n",
+		  cmd_sof_mailbox_hex, 1, 3),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_DBGWIN_DUMP
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_dbgwin,
+	SHELL_CMD_ARG(dump, NULL,
+		  "List ADSP debug-window slots, or hex-dump one: [slot] [length]\n",
+		  cmd_sof_dbgwin_dump, 1, 2),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_PERF_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_perf,
+	SHELL_CMD_ARG(status, NULL,
+		  "Show telemetry perf state and per-core systick;"
+		  " optional [reset|start|stop|pause]\n",
+		  cmd_sof_perf_status, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_DAI_LIST
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_dai,
+	SHELL_CMD_ARG(list, NULL,
+		      "List all registered DAIs (name, type, channels, rate)\n"
+		      "  [-v]  also show TX/RX fifo address, depth, hs, stream\n",
+		      cmd_sof_dai_list, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_DMA_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_dma,
+	SHELL_CMD_ARG(status, NULL,
+		  "List DMA controllers, or per-channel status: "
+		  "[dma_idx] [chan]\n",
+		  cmd_sof_dma_status, 1, 2),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_KCTL_LIST
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_kctl,
+	SHELL_CMD(list, NULL,
+		  "List components and their decoded module name / kind\n",
+		  cmd_sof_kctl_list),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
+	SHELL_CMD(test, &sof_cmd_test,
+		  "Test commands\n", NULL),
+
+#if CONFIG_SOF_SHELL_HEAP_USAGE || CONFIG_SOF_SHELL_MODULE_STATUS || CONFIG_SOF_SHELL_MODULE_LIST
+	SHELL_CMD(module, &sof_cmd_module,
+		  "Module commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_PIPELINE_STATUS || CONFIG_SOF_SHELL_PIPELINE_OPS
+	SHELL_CMD(pipeline, &sof_cmd_pipeline,
+		  "Pipeline commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_CORE_STATUS || CONFIG_SOF_SHELL_CORE_POWER
+	SHELL_CMD(core, &sof_cmd_core,
+		  "Core commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_SRAM_STATUS
+	SHELL_CMD(sram, &sof_cmd_sram,
+		  "SRAM commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_CLOCK_STATUS
+	SHELL_CMD(clock, &sof_cmd_clock,
+		  "Clock commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_PIPELINE_OPS
+	SHELL_CMD(ppl, &sof_cmd_ppl,
+		  "Pipeline operation commands\n", NULL),
+	SHELL_CMD(mod, &sof_cmd_mod,
+		  "Module operation commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_MMU_DBG
+#if CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
+	SHELL_CMD(mmu, &sof_cmd_mmu,
+		  "MMU status commands\n", NULL),
+	SHELL_CMD(tlb, &sof_cmd_tlb,
+		  "TLB commands\n", NULL),
+#endif
+#if CONFIG_XTENSA_MMU
+	SHELL_CMD(page, &sof_cmd_page,
+		  "Page-table commands\n", NULL),
+#endif
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+	SHELL_CMD(llext, &sof_cmd_llext,
+		  "LLEXT commands\n", NULL),
+#endif
+
+	SHELL_CMD(vpage, &sof_cmd_vpage,
+		  "Virtual page commands\n", NULL),
+	SHELL_CMD(vregion, &sof_cmd_vregion,
+		  "Virtual region commands\n", NULL),
+	SHELL_CMD(ipc, &sof_cmd_ipc,
+		  "IPC commands\n", NULL),
+
+#if CONFIG_SOF_SHELL_BUFFER_INFO
+	SHELL_CMD(buffer, &sof_cmd_buffer,
+		  "Buffer commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_SCHED_INFO
+	SHELL_CMD(sched, &sof_cmd_sched,
+		  "Scheduler commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+	SHELL_CMD(log, &sof_cmd_log,
+		  "Log commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_MTRACE_DUMP
+	SHELL_CMD(mtrace, &sof_cmd_mtrace,
+		  "Mtrace commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_MAILBOX_HEX
+	SHELL_CMD(mailbox, &sof_cmd_mailbox,
+		  "Mailbox commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_DBGWIN_DUMP
+	SHELL_CMD(dbgwin, &sof_cmd_dbgwin,
+		  "Debug-window commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_PERF_STATUS
+	SHELL_CMD(perf, &sof_cmd_perf,
+		  "Performance commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_DAI_LIST
+	SHELL_CMD(dai, &sof_cmd_dai,
+		  "DAI commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_DMA_STATUS
+	SHELL_CMD(dma, &sof_cmd_dma,
+		  "DMA commands\n", NULL),
+#endif
+
+#if CONFIG_SOF_SHELL_KCTL_LIST
+	SHELL_CMD(kctl, &sof_cmd_kctl,
+		  "Kernel-control commands\n", NULL),
+#endif
+
 	SHELL_CMD(test_inject_sched_gap, NULL,
 		  "Inject a gap to audio scheduling\n",
 		  cmd_sof_test_inject_sched_gap),
@@ -2632,9 +3082,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 #endif
 
 #if CONFIG_SOF_SHELL_MODULE_LIST
-	SHELL_CMD(module_list, NULL,
-		  "List all available modules with name, memory, size and RTC info\n",
-		  cmd_sof_module_list),
+	SHELL_CMD_ARG(module_list, NULL,
+		      "List all available modules (name, inst, cpc, text, bss)\n"
+		      "  [-v]  also show uuid, affinity, cps, ibs, obs\n",
+		      cmd_sof_module_list, 1, 1),
 #endif
 
 #if CONFIG_SOF_SHELL_PIPELINE_OPS
@@ -2730,7 +3181,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 		  cmd_sof_pipeline_list),
 
 	SHELL_CMD_ARG(ipc_stats, NULL,
-		  "Print IPC RX/TX counters; 'sof ipc_stats reset' clears them\n",
+		  "Print IPC RX/TX counters; 'sof ipc stats reset' clears them\n",
 		  cmd_sof_ipc_stats, 1, 1),
 
 	SHELL_CMD(ipc_last, NULL,
@@ -2787,10 +3238,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 #endif
 
 #if CONFIG_SOF_SHELL_DAI_LIST
-	SHELL_CMD(dai_list, NULL,
-		  "List all registered DAIs (name, type, channels, rate, "
-		  "fifo, hs)\n",
-		  cmd_sof_dai_list),
+	SHELL_CMD_ARG(dai_list, NULL,
+		      "List all registered DAIs (name, type, channels, rate)\n"
+		      "  [-v]  also show TX/RX fifo address, depth, hs, stream\n",
+		      cmd_sof_dai_list, 1, 1),
 #endif
 
 #if CONFIG_SOF_SHELL_DMA_STATUS
