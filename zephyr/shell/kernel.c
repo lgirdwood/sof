@@ -1058,7 +1058,7 @@ __cold static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *ar
 }
 
 SHELL_SUBCMD_ADD((sof), ipc_stats, NULL,
-		 "Print IPC RX/TX counters; 'sof ipc_stats reset' clears them\n",
+		 "Print IPC RX/TX counters; 'sof ipc stats reset' clears them\n",
 		 cmd_sof_ipc_stats, 1, 1);
 
 SHELL_SUBCMD_ADD((sof), ipc_last, NULL,
@@ -1361,7 +1361,7 @@ __cold static int cmd_sof_mailbox_hex(const struct shell *sh,
 				    sof_shell_mb_regions[i].name,
 				    (unsigned long)sof_shell_mb_regions[i].base,
 				    sof_shell_mb_regions[i].size);
-		shell_print(sh, "Usage: sof mailbox_hex <region> [offset] [length]");
+		shell_print(sh, "Usage: sof mailbox hex <region> [offset] [length]");
 		return 0;
 	}
 
@@ -1470,7 +1470,7 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 				    dw->descs[i].vma, dw_type_name(dw->descs[i].type),
 				    dw->descs[i].type & ADSP_DW_SLOT_CORE_MASK);
 		}
-		shell_print(sh, "Usage: sof dbgwin_dump <slot> [length]");
+		shell_print(sh, "Usage: sof dbgwin dump <slot> [length]");
 		return 0;
 	}
 
@@ -1555,7 +1555,7 @@ __cold static int cmd_sof_perf_status(const struct shell *sh,
 			shell_print(sh, "perf: paused");
 			return 0;
 		}
-		shell_print(sh, "Usage: sof perf_status [reset|start|stop|pause]");
+		shell_print(sh, "Usage: sof perf status [reset|start|stop|pause]");
 		return -EINVAL;
 	}
 
@@ -1603,6 +1603,286 @@ SHELL_SUBCMD_ADD((sof), perf_status, NULL,
 		 "Show telemetry perf state and per-core systick;"
 		 " optional [reset|start|stop|pause]\n",
 		 cmd_sof_perf_status, 1, 1);
+#endif
+
+/*
+ * Space-separated aliases for underscore commands.
+ *
+ * Keep legacy underscore names for compatibility while exposing the
+ * preferred tokenized form, e.g. "sof core on" for "sof core_on".
+ */
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test_inject_sched,
+	SHELL_CMD(gap, NULL,
+		  "Inject a gap to audio scheduling\n",
+		  cmd_sof_test_inject_sched_gap),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test_inject,
+	SHELL_CMD(sched, &sof_cmd_test_inject_sched,
+		  "Scheduler injection commands\n", NULL),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_test,
+	SHELL_CMD(inject, &sof_cmd_test_inject,
+		  "Injection test commands\n", NULL),
+	SHELL_SUBCMD_SET_END
+);
+
+#if CONFIG_SOF_SHELL_CORE_STATUS || CONFIG_SOF_SHELL_CORE_POWER
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_core,
+#if CONFIG_SOF_SHELL_CORE_STATUS
+	SHELL_CMD(status, NULL,
+		  "Print enabled/active state of each DSP core\n",
+		  cmd_sof_core_status),
+#endif
+#if CONFIG_SOF_SHELL_CORE_POWER
+	SHELL_CMD_ARG(on, NULL,
+		  "Power on a secondary DSP core: <core_id>\n"
+		  "core_id must be 1..CONFIG_CORE_COUNT-1 (core 0 is primary).\n",
+		  cmd_sof_core_on, 2, 0),
+	SHELL_CMD_ARG(off, NULL,
+		  "Power off a secondary DSP core: <core_id>\n"
+		  "core_id must be 1..CONFIG_CORE_COUNT-1 (core 0 is primary).\n",
+		  cmd_sof_core_off, 2, 0),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_SRAM_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_sram,
+	SHELL_CMD(status, NULL,
+		  "Print HPSRAM heap usage statistics\n",
+		  cmd_sof_sram_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_CLOCK_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_clock,
+	SHELL_CMD(status, NULL,
+		  "Print current clock frequency for each DSP core\n",
+		  cmd_sof_clock_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MMU_DBG
+#if CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mmu,
+	SHELL_CMD(status, NULL,
+		  "Print Intel ADSP MTL TLB / virtual memory status\n",
+		  cmd_sof_mmu_status),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_tlb,
+	SHELL_CMD(dump, NULL,
+		  "Dump all active TLB entries (vaddr/paddr/flags)\n",
+		  cmd_sof_tlb_dump),
+	SHELL_CMD_ARG(lookup, NULL,
+		  "Query TLB for a page or range: <vaddr> [end_vaddr]\n",
+		  cmd_sof_tlb_lookup, 2, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+#if CONFIG_XTENSA_MMU
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_page,
+	SHELL_CMD_ARG(info, NULL,
+		  "Probe DTLB for a page or range: <vaddr> [end_vaddr]\n"
+		  "Reports physical address, ring, ASID, R/W/X permissions"
+		  " and cache mode for each page currently in the DTLB.\n",
+		  cmd_sof_page_info, 2, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_llext,
+#if CONFIG_SOF_SHELL_LLEXT_LOAD
+	SHELL_CMD_ARG(load, NULL,
+		  "Load llext module from host: <name> [lib_id=1]\n"
+		  "Sets up the DMA handshake slot then waits for:\n"
+		  "  dd if=<module.ri> of=/sys/kernel/debug/sof/llext_load\\\n"
+		  "     bs=$(stat -c%s <module.ri>) count=1\n"
+		  "on the host. Prints result when DMA and IPC4 load complete.\n",
+		  cmd_sof_llext_load, 2, 1),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_LIST
+	SHELL_CMD(list, NULL,
+		  "List llext libraries stored in IMR/DRAM.\n"
+		  "For each library shows base address, storage size and per-module\n"
+		  "SRAM mapping state (yes/no), use count and dependency count.\n",
+		  cmd_sof_llext_list),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_PURGE
+	SHELL_CMD_ARG(purge, NULL,
+		  "Purge llext library from IMR/DRAM: <lib_id>\n"
+		  "Fails with -EBUSY if any module in the library is still\n"
+		  "mapped in SRAM (i.e. a pipeline using it is still active).\n",
+		  cmd_sof_llext_purge, 2, 0),
+#endif
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_vpage,
+	SHELL_CMD(status, NULL,
+		  "Print virtual page allocator status\n",
+		  cmd_sof_vpage_info),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_vregion,
+	SHELL_CMD(status, NULL,
+		  "Print virtual regions status\n",
+		  cmd_sof_vregion_info),
+	SHELL_SUBCMD_SET_END
+);
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_ipc,
+	SHELL_CMD_ARG(stats, NULL,
+		  "Print IPC RX/TX counters; 'sof ipc stats reset' clears them\n",
+		  cmd_sof_ipc_stats, 1, 1),
+	SHELL_CMD(last, NULL,
+		  "Print the last received and sent IPC headers\n",
+		  cmd_sof_ipc_last),
+	SHELL_SUBCMD_SET_END
+);
+
+#if CONFIG_SOF_SHELL_SCHED_INFO
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_sched,
+	SHELL_CMD(tasks, NULL,
+		  "List all scheduler tasks (type, core, prio, state)\n",
+		  cmd_sof_sched_tasks),
+	SHELL_CMD(load, NULL,
+		  "Show per-task cycle counters and totals\n",
+		  cmd_sof_sched_load),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_log,
+	SHELL_CMD(status, NULL,
+		  "List Zephyr log backends with state and source count\n",
+		  cmd_sof_log_status),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MTRACE_DUMP
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mtrace,
+	SHELL_CMD(dump, NULL,
+		  "Snapshot the mtrace SRAM ring buffer (does not advance host_ptr)\n",
+		  cmd_sof_mtrace_dump),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_MAILBOX_HEX
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_mailbox,
+	SHELL_CMD_ARG(hex, NULL,
+		  "Hex-dump a mailbox region: <region> [offset] [length]\n",
+		  cmd_sof_mailbox_hex, 1, 3),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_DBGWIN_DUMP
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_dbgwin,
+	SHELL_CMD_ARG(dump, NULL,
+		  "List ADSP debug-window slots, or hex-dump one: [slot] [length]\n",
+		  cmd_sof_dbgwin_dump, 1, 2),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+#if CONFIG_SOF_SHELL_PERF_STATUS
+SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_perf,
+	SHELL_CMD_ARG(status, NULL,
+		  "Show telemetry perf state and per-core systick;"
+		  " optional [reset|start|stop|pause]\n",
+		  cmd_sof_perf_status, 1, 1),
+	SHELL_SUBCMD_SET_END
+);
+#endif
+
+SHELL_SUBCMD_ADD((sof), test, &sof_cmd_test,
+		 "Test commands\n", NULL, 0, 0);
+
+#if CONFIG_SOF_SHELL_CORE_STATUS || CONFIG_SOF_SHELL_CORE_POWER
+SHELL_SUBCMD_ADD((sof), core, &sof_cmd_core,
+		 "Core commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_SRAM_STATUS
+SHELL_SUBCMD_ADD((sof), sram, &sof_cmd_sram,
+		 "SRAM commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_CLOCK_STATUS
+SHELL_SUBCMD_ADD((sof), clock, &sof_cmd_clock,
+		 "Clock commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_MMU_DBG
+#if CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
+SHELL_SUBCMD_ADD((sof), mmu, &sof_cmd_mmu,
+		 "MMU status commands\n", NULL, 0, 0);
+SHELL_SUBCMD_ADD((sof), tlb, &sof_cmd_tlb,
+		 "TLB commands\n", NULL, 0, 0);
+#endif
+#if CONFIG_XTENSA_MMU
+SHELL_SUBCMD_ADD((sof), page, &sof_cmd_page,
+		 "Page-table commands\n", NULL, 0, 0);
+#endif
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+SHELL_SUBCMD_ADD((sof), llext, &sof_cmd_llext,
+		 "LLEXT commands\n", NULL, 0, 0);
+#endif
+
+SHELL_SUBCMD_ADD((sof), vpage, &sof_cmd_vpage,
+		 "Virtual page commands\n", NULL, 0, 0);
+SHELL_SUBCMD_ADD((sof), vregion, &sof_cmd_vregion,
+		 "Virtual region commands\n", NULL, 0, 0);
+SHELL_SUBCMD_ADD((sof), ipc, &sof_cmd_ipc,
+		 "IPC commands\n", NULL, 0, 0);
+
+#if CONFIG_SOF_SHELL_SCHED_INFO
+SHELL_SUBCMD_ADD((sof), sched, &sof_cmd_sched,
+		 "Scheduler commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+SHELL_SUBCMD_ADD((sof), log, &sof_cmd_log,
+		 "Log commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_MTRACE_DUMP
+SHELL_SUBCMD_ADD((sof), mtrace, &sof_cmd_mtrace,
+		 "Mtrace commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_MAILBOX_HEX
+SHELL_SUBCMD_ADD((sof), mailbox, &sof_cmd_mailbox,
+		 "Mailbox commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_DBGWIN_DUMP
+SHELL_SUBCMD_ADD((sof), dbgwin, &sof_cmd_dbgwin,
+		 "Debug-window commands\n", NULL, 0, 0);
+#endif
+
+#if CONFIG_SOF_SHELL_PERF_STATUS
+SHELL_SUBCMD_ADD((sof), perf, &sof_cmd_perf,
+		 "Performance commands\n", NULL, 0, 0);
 #endif
 SHELL_CMD_REGISTER(sof, &sub_sof,
 		   "SOF application commands", NULL);
