@@ -15,6 +15,7 @@
 #include <ipc/topology.h>
 #include <ipc/compress_params.h>
 #include <sof_versions.h>
+#include <sof/compiler_info.h>
 #include <sof/lib/cpu-clk-manager.h>
 #include <sof/lib/cpu.h>
 #include <sof/platform.h>
@@ -132,7 +133,15 @@ static void base_fw_sof_config(struct sof_tlv **tuple)
 
 __cold static int basefw_config(uint32_t *data_offset, char *data)
 {
-	uint16_t version[4] = {SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_BUILD};
+	struct __packed {
+		uint16_t major;
+		uint16_t minor;
+		uint16_t micro;
+		uint16_t build;
+		uint32_t src_hash;
+		char build_ts[20]; /* __DATE__ " " __TIME__, not null-terminated */
+	} version = {SOF_MAJOR, SOF_MINOR, SOF_MICRO, SOF_BUILD, SOF_SRC_HASH,
+		     __DATE__ " " __TIME__};
 	struct sof_tlv *tuple = (struct sof_tlv *)data;
 	struct ipc4_scheduler_config sche_cfg;
 	uint32_t plat_data_offset = 0;
@@ -140,7 +149,7 @@ __cold static int basefw_config(uint32_t *data_offset, char *data)
 
 	assert_can_be_cold();
 
-	tlv_value_set(tuple, IPC4_FW_VERSION_FW_CFG, sizeof(version), version);
+	tlv_value_set(tuple, IPC4_FW_VERSION_FW_CFG, sizeof(version), &version);
 
 	tuple = tlv_next(tuple);
 	tlv_value_uint32_set(tuple, IPC4_MEMORY_RECLAIMED_FW_CFG, 1);
@@ -207,6 +216,26 @@ __cold static int basefw_config(uint32_t *data_offset, char *data)
 	tuple = tlv_next(tuple);
 	tlv_value_uint32_set(tuple, IPC4_FW_CONTEXT_SAVE,
 			     IS_ENABLED(CONFIG_ADSP_IMR_CONTEXT_SAVE));
+
+	tuple = tlv_next(tuple);
+	tlv_value_set(tuple, IPC4_GIT_TAG_FW_CFG, sizeof(SOF_GIT_TAG) - 1, SOF_GIT_TAG);
+
+	struct {
+		uint16_t major;
+		uint16_t minor;
+		uint16_t micro;
+		uint16_t _pad;
+		char name[8];
+	} cc_ver = {0};
+
+	cc_ver.major = CC_MAJOR;
+	cc_ver.minor = CC_MINOR;
+	cc_ver.micro = CC_MICRO;
+	/* CC_NAME is a short string literal like "XCC"; sizeof includes null */
+	memcpy(cc_ver.name, CC_NAME, sizeof(CC_NAME));
+
+	tuple = tlv_next(tuple);
+	tlv_value_set(tuple, IPC4_CC_VERSION_FW_CFG, sizeof(cc_ver), &cc_ver);
 
 	tuple = tlv_next(tuple);
 

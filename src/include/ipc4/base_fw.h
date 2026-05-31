@@ -377,6 +377,10 @@ enum ipc4_fw_config_params {
 	IPC4_DMI_FORCE_L1_EXIT = 28,
 	/* FW context save on D3 entry */
 	IPC4_FW_CONTEXT_SAVE = 29,
+	/* Git tag/commit string, includes -dirty suffix if built from modified sources */
+	IPC4_GIT_TAG_FW_CFG = 30,
+	/* Compiler name and version used to build the firmware */
+	IPC4_CC_VERSION_FW_CFG = 31,
 	/* Minimum size of host buffer in ms */
 	IPC4_FW_MIN_HOST_BUFFER_PERIODS = 33,
 	/* decoder/encoder codec information */
