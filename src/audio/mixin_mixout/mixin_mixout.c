@@ -311,6 +311,9 @@ static int mixin_process(struct processing_module *mod,
 
 	comp_dbg(dev, "entry");
 
+	if (num_of_sources < 1 || !sources[0] || !sources[0]->audio_stream_params)
+		return 0;
+
 	source_avail_frames = source_get_data_frames_available(sources[0]);
 	sinks_free_frames = INT32_MAX;
 
@@ -345,13 +348,23 @@ static int mixin_process(struct processing_module *mod,
 		/* Skip non-active mixout like it is not connected so it does not
 		 * block other possibly connected mixouts. In addition, non-active
 		 * mixouts might have their sink buffer/interface not yet configured.
+		 * mixout may be NULL if the buffer's sink component is not yet connected.
 		 */
-		if (mixout->state != COMP_STATE_ACTIVE) {
+		if (!mixout || mixout->state != COMP_STATE_ACTIVE) {
 			active_mixouts[i] = NULL;
 			continue;
 		}
 
 		mixout_mod = comp_mod(mixout);
+
+		/* Skip if mixout's downstream sink has not been configured yet
+		 * (audio_stream_params is NULL for unconfigured ring_buffer secondary).
+		 */
+		if (!mixout_mod->sinks[0] || !mixout_mod->sinks[0]->audio_stream_params) {
+			active_mixouts[i] = NULL;
+			continue;
+		}
+
 		active_mixouts[i] = mixout_mod;
 		mixout_sink = mixout_mod->sinks[0];
 
@@ -394,8 +407,27 @@ static int mixin_process(struct processing_module *mod,
 		sinks_free_frames = MIN(sinks_free_frames, free_frames - pending_frames->frames);
 	}
 
-	if (sinks_free_frames == 0 || sinks_free_frames == INT32_MAX)
+	if (sinks_free_frames == 0)
 		return 0;
+
+	if (sinks_free_frames == INT32_MAX) {
+		/* No active mixouts. Discard source data to prevent source buffer
+		 * from filling up and triggering a pipeline XRUN. This can happen
+		 * transiently when the upstream pipeline (mixin) starts before the
+		 * downstream pipeline (mixout) becomes active.
+		 */
+		if (source_avail_frames > 0) {
+			const void *dummy_ptr, *buf_start;
+			size_t buf_size;
+			size_t discard_frames = MIN(dev->frames, source_avail_frames);
+			size_t discard_bytes = discard_frames * source_get_frame_bytes(sources[0]);
+
+			source_get_data(sources[0], discard_bytes, &dummy_ptr, &buf_start,
+					&buf_size);
+			source_release_data(sources[0], discard_bytes);
+		}
+		return 0;
+	}
 
 #if CONFIG_XRUN_NOTIFICATIONS_ENABLE
 	frame_bytes = source_get_frame_bytes(sources[0]);
@@ -516,6 +548,9 @@ static int mixout_process(struct processing_module *mod,
 	int i;
 
 	comp_dbg(dev, "entry");
+
+	if (num_of_sinks < 1 || !sinks[0] || !sinks[0]->audio_stream_params)
+		return 0;
 
 	md = module_get_private_data(mod);
 
