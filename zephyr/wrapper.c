@@ -23,6 +23,7 @@
 #include <rtos/clk.h>
 #if CONFIG_IPC_MAJOR_4
 #include <ipc4/notification.h>
+#include <sof/lib/mailbox.h>
 #endif
 
 /* Zephyr includes */
@@ -38,6 +39,13 @@
 #include <zephyr/logging/log.h>
 
 LOG_MODULE_REGISTER(zephyr, CONFIG_SOF_LOG_LEVEL);
+
+/* Heap corruption diagnostic: set by sys_heap_free before k_panic when a
+ * buffer-overflow is detected.  Read by k_sys_fatal_error_handler to report
+ * the corrupted allocation address via the mailbox LAST_ERROR_CODE field.
+ */
+volatile uintptr_t _sof_heap_corrupt_addr;
+volatile uint32_t _sof_heap_corrupt_csz;
 
 extern K_KERNEL_STACK_ARRAY_DEFINE(z_interrupt_stacks, CONFIG_MP_MAX_NUM_CPUS,
 				   CONFIG_ISR_STACK_SIZE);
@@ -338,6 +346,25 @@ void k_sys_fatal_error_handler(unsigned int reason,
 	ipc_send_panic_notification();
 #endif
 
+#if CONFIG_IPC_MAJOR_4
+	/* Signal halt state to host so IPC timeout dmesg shows "not running"
+	 * and "error: kernel exception" instead of the default "running" /
+	 * "status code: 0x0". The host reads FSR and LEC on every IPC timeout.
+	 */
+	mailbox_sw_reg_write(SRAM_REG_FW_STATUS,
+			     mailbox_sw_reg_read(SRAM_REG_FW_STATUS) | BIT(31));
+	/* If a heap corruption was detected, report the corrupted chunk address
+	 * instead of the generic 0xCAFE0000 sentinel so we can identify the
+	 * allocation that was overflowed.
+	 */
+	if (_sof_heap_corrupt_addr)
+		mailbox_sw_reg_write(SRAM_REG_LAST_ERROR_CODE,
+				     (uint32_t)_sof_heap_corrupt_addr);
+	else
+		mailbox_sw_reg_write(SRAM_REG_LAST_ERROR_CODE, 0xCAFE0000U);
+	/* Write chunk size (bytes) to LNEC so we can see the allocation size */
+	mailbox_sw_reg_write(SRAM_REG_LNEC, _sof_heap_corrupt_csz);
+#endif
 #if defined(CONFIG_ARCH_POSIX) || defined(CONFIG_ZEPHYR_POSIX)
 	LOG_ERR("Halting emulation");
 
