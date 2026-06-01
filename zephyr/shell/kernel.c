@@ -23,6 +23,9 @@
 #include <sof/schedule/schedule.h>
 #include <string.h>
 #include <sof/ipc/common.h>
+#if CONFIG_SOF_SHELL_PROBE_MIRROR
+#include <sof/probe/probe.h>
+#endif
 #include <sof/lib/vpage.h>
 #include <sof/lib/vregion.h>
 #include <rtos/clk.h>
@@ -54,6 +57,7 @@
 #endif
 
 #include <stdlib.h>
+#include <stdarg.h>
 
 /*
  * Root "sof" command set. The set is created here and shared with shell/user.c
@@ -66,6 +70,40 @@ SHELL_SUBCMD_SET_CREATE(sub_sof, (sof));
 #define SOF_TEST_INJECT_SCHED_GAP_USEC 1500
 
 #include <sof_versions.h>
+
+#if CONFIG_SOF_SHELL_PROBE_MIRROR
+static void sof_shell_mirror_output(const char *text, size_t len)
+{
+	if (!len)
+		return;
+
+	probe_shell_output((const uint8_t *)text, len);
+}
+
+static void sof_shell_fprintf_mirror(const struct shell *sh,
+				     enum shell_vt100_color color,
+				     const char *fmt, ...)
+{
+	char out[512];
+	va_list ap;
+	int n;
+	size_t len;
+
+	va_start(ap, fmt);
+	n = vsnprintk(out, sizeof(out), fmt, ap);
+	va_end(ap);
+
+	if (n < 0)
+		return;
+
+	len = MIN((size_t)n, sizeof(out) - 1);
+
+	shell_fprintf(sh, color, "%s", out);
+	sof_shell_mirror_output(out, len);
+}
+
+#define shell_fprintf sof_shell_fprintf_mirror
+#endif
 
 __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 						size_t argc, char *argv[])
