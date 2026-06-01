@@ -653,6 +653,16 @@ config SOF_SHELL_KCTL_LIST
 	  module_status' to identify which comp_id carries which control
 	  before going through the host path.
 
+config SOF_SHELL_PROBE_MIRROR
+	bool "Mirror shell output to probes extraction stream"
+	default n
+	depends on SHELL && PROBE
+	help
+	  Mirrors shell text output to the probe extraction stream while keeping the
+	  selected shell backend (e.g. UART) active. This lets host tools capture
+	  verbose shell output via compressed PCM probes without losing interactivity
+	  on a slow TTY console.
+
 endmenu # SOF shell commands
 
 config SOF_VREGIONS
