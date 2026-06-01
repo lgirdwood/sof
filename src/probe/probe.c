@@ -539,7 +539,7 @@ int probe_dma_add(uint32_t count, const struct probe_dma *probe_dma)
 		err = probe_dma_init(&_probe->inject_dma[first_free],
 				     SOF_DMA_DIR_HMEM_TO_LMEM);
 		if (err < 0) {
-			tr_err(&pr_tr, "probe_dma_init() failed");
+				tr_err(&pr_tr, "probe_dma_init() failed");
 			_probe->inject_dma[first_free].stream_tag =
 				PROBE_DMA_INVALID;
 			return err;
