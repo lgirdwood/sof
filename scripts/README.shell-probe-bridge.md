@@ -76,3 +76,25 @@ framed shell/probe transport.
 
 It uses the same command-pass/fail style as `sof-shell-validate.py` and checks
 that chunking plus credit-based flow control work while running shell commands.
+
+## UART + probe mirror workflow
+
+With `CONFIG_SOF_SHELL_PROBE_MIRROR=y`, shell output is mirrored to probe
+extraction packets while UART shell interaction stays active.
+
+Typical usage:
+
+1. Terminal A (interactive shell on UART):
+
+```bash
+picocom /dev/ttysof0
+```
+
+2. Terminal B (capture and decode mirrored shell output from probes):
+
+```bash
+<probe-capture-command> | ./sof/scripts/sof-shell-probe-packet-decode.py
+```
+
+`<probe-capture-command>` is any command that reads bytes from the probe
+compressed capture endpoint and writes them to stdout.
