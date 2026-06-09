@@ -14,6 +14,18 @@
 /* Buffer id used in probe extraction packets for mirrored shell text output. */
 #define PROBE_SHELL_BUFFER_ID 0x01000001
 
+struct probe_shell_stats {
+	uint32_t calls;
+	uint32_t write_ok;
+	uint32_t dropped_no_probe;
+	uint32_t dropped_no_probe_ctx;
+	uint32_t dropped_no_stream;
+	uint32_t dropped_no_space;
+	uint32_t errors;
+	uint64_t bytes_requested;
+	uint64_t bytes_written;
+};
+
 /**
  * A buffer of logging data is available for processing.
  */
@@ -45,6 +57,24 @@ void probe_logging_init(probe_logging_hook_t hook);
  *         near full), 0 when probes are inactive, negative errno on error.
  */
 ssize_t probe_shell_output(const uint8_t *buffer, size_t length);
+
+/**
+ * @brief Get current mirrored-shell probe counters.
+ */
+void probe_shell_stats_get(struct probe_shell_stats *stats);
+
+/**
+ * @brief Reset mirrored-shell probe counters.
+ */
+void probe_shell_stats_reset(void);
+
+/**
+ * @brief Get current shell mirror transport state.
+ *
+ * @param has_probe_ctx Set to 1 when probe context exists, else 0.
+ * @param stream_tag Current extraction stream tag, or 0xFFFFFFFF if unavailable.
+ */
+void probe_shell_state_get(uint32_t *has_probe_ctx, uint32_t *stream_tag);
 
 /*
  * \brief Initialize probes subsystem

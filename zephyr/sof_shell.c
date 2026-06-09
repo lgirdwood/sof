@@ -105,7 +105,49 @@ static void sof_shell_fprintf_mirror(const struct shell *sh,
 	sof_shell_mirror_output(out, len);
 }
 
+static void sof_shell_print_mirror(const struct shell *sh, const char *fmt, ...)
+{
+	char out[512];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintk(out, sizeof(out), fmt, ap);
+	va_end(ap);
+
+	if (n < 0)
+		return;
+
+	sof_shell_fprintf_mirror(sh, SHELL_NORMAL, "%s\n", out);
+}
+
 #define shell_fprintf sof_shell_fprintf_mirror
+#define shell_print sof_shell_print_mirror
+
+__cold static int cmd_sof_probe_mirror_stats(const struct shell *sh,
+				      size_t argc, char *argv[])
+{
+	struct probe_shell_stats stats;
+	uint32_t has_probe_ctx;
+	uint32_t stream_tag;
+	bool do_reset = argc > 1 && !strcmp(argv[1], "reset");
+
+	probe_shell_stats_get(&stats);
+	probe_shell_state_get(&has_probe_ctx, &stream_tag);
+	shell_print(sh,
+		    "probe_mirror calls=%u ok=%u drop_no_probe=%u drop_no_probe_ctx=%u drop_no_stream=%u drop_no_space=%u err=%u has_probe_ctx=%u stream_tag=0x%x",
+		    stats.calls, stats.write_ok, stats.dropped_no_probe,
+		    stats.dropped_no_probe_ctx, stats.dropped_no_stream,
+		    stats.dropped_no_space, stats.errors,
+		    has_probe_ctx, stream_tag);
+
+	if (do_reset) {
+		probe_shell_stats_reset();
+		shell_print(sh, "probe_mirror stats reset");
+	}
+
+	return 0;
+}
 #endif
 
 __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
@@ -3248,6 +3290,12 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 	SHELL_CMD(log_status, NULL,
 		  "List Zephyr log backends with state and source count\n",
 		  cmd_sof_log_status),
+#endif
+
+#if CONFIG_SOF_SHELL_PROBE_MIRROR
+	SHELL_CMD_ARG(probe_mirror_stats, NULL,
+		      "Print probe mirror counters; optional [reset]\n",
+		      cmd_sof_probe_mirror_stats, 1, 1),
 #endif
 
 #if CONFIG_SOF_SHELL_MTRACE_DUMP

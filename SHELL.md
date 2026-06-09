@@ -245,7 +245,7 @@ debug or testing. Items get ticked off as commands land on `topic/shell`.
   - Otherwise: directly indexes
     `ADSP_DW->slots[ADSP_DW_SLOT_NUM_MTRACE]`.
   - The slot layout (`{host_ptr, dsp_ptr, data[]}`) mirrors the one in
-    [zephyr/subsys/logging/backends/log_backend_adsp_mtrace.c](../../zephyr/subsys/logging/backends/log_backend_adsp_mtrace.c).
+    [zephyr/subsys/logging/backends/log_backend_adsp_mtrace.c](../zephyr/subsys/logging/backends/log_backend_adsp_mtrace.c).
   - We read from `host_ptr` to `dsp_ptr` byte-by-byte and write to the
     shell, but never store back to `host_ptr`, so the host-side
     consumer keeps seeing the same bytes.
@@ -285,7 +285,7 @@ debug or testing. Items get ticked off as commands land on `topic/shell`.
 - `dbgwin_dump` re-derives the window 2 base from the device tree
   (`mem_window2`) plus `WIN2_OFFSET`, mirrors
   `struct adsp_debug_window` from
-  [zephyr/soc/intel/intel_adsp/common/debug_window.c](../../zephyr/soc/intel/intel_adsp/common/debug_window.c)
+  [zephyr/soc/intel/intel_adsp/common/debug_window.c](../zephyr/soc/intel/intel_adsp/common/debug_window.c)
   and reads through an uncached pointer so we always see the
   slot-manager state (works whether or not
   `CONFIG_INTEL_ADSP_DEBUG_SLOT_MANAGER=y`).

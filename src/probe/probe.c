@@ -86,6 +86,8 @@ struct probe_pdata {
 	struct probe_data_packet header;			  /**< data packet header */
 };
 
+static struct probe_shell_stats probe_shell_stats;
+
 /**
  * \brief Allocate and initialize probe buffer with correct alignment.
  * \param[out] buffer return value.
@@ -870,32 +872,64 @@ static ssize_t probe_write_payload(uint32_t buffer_id, const uint8_t *buffer,
 {
 	struct probe_pdata *_probe = probe_get();
 	const size_t overhead = sizeof(struct probe_data_packet) + sizeof(uint64_t);
+	bool shell_payload = buffer_id == PROBE_SHELL_BUFFER_ID;
 	uint64_t checksum;
 	size_t free_space;
 	int ret;
+	size_t requested = length;
 
-	if (!_probe || _probe->ext_dma.stream_tag == PROBE_DMA_INVALID || !buffer || !length)
+	if (shell_payload) {
+		probe_shell_stats.calls++;
+		probe_shell_stats.bytes_requested += requested;
+	}
+
+	if (!_probe || _probe->ext_dma.stream_tag == PROBE_DMA_INVALID || !buffer || !length) {
+		if (shell_payload) {
+			probe_shell_stats.dropped_no_probe++;
+			if (!_probe)
+				probe_shell_stats.dropped_no_probe_ctx++;
+			else if (_probe->ext_dma.stream_tag == PROBE_DMA_INVALID)
+				probe_shell_stats.dropped_no_stream++;
+		}
 		return 0;
+	}
 
 	free_space = _probe->ext_dma.dmapb.size - _probe->ext_dma.dmapb.avail;
-	if (free_space <= overhead)
+	if (free_space <= overhead) {
+		if (shell_payload)
+			probe_shell_stats.dropped_no_space++;
 		return 0;
+	}
 
 	length = MIN(length, free_space - overhead);
 
 	ret = probe_gen_header(buffer_id, length, 0, &checksum);
-	if (ret < 0)
+	if (ret < 0) {
+		if (shell_payload)
+			probe_shell_stats.errors++;
 		return ret;
+	}
 
 	ret = copy_to_pbuffer(&_probe->ext_dma.dmapb, (void *)buffer, length);
-	if (ret < 0)
+	if (ret < 0) {
+		if (shell_payload)
+			probe_shell_stats.errors++;
 		return ret;
+	}
 
 	ret = copy_to_pbuffer(&_probe->ext_dma.dmapb, &checksum, sizeof(checksum));
-	if (ret < 0)
+	if (ret < 0) {
+		if (shell_payload)
+			probe_shell_stats.errors++;
 		return ret;
+	}
 
 	kick_probe_task(_probe);
+
+	if (shell_payload) {
+		probe_shell_stats.write_ok++;
+		probe_shell_stats.bytes_written += length;
+	}
 
 	return length;
 }
@@ -903,6 +937,30 @@ static ssize_t probe_write_payload(uint32_t buffer_id, const uint8_t *buffer,
 ssize_t probe_shell_output(const uint8_t *buffer, size_t length)
 {
 	return probe_write_payload(PROBE_SHELL_BUFFER_ID, buffer, length);
+}
+
+void probe_shell_stats_get(struct probe_shell_stats *stats)
+{
+	if (!stats)
+		return;
+
+	*stats = probe_shell_stats;
+}
+
+void probe_shell_stats_reset(void)
+{
+	bzero(&probe_shell_stats, sizeof(probe_shell_stats));
+}
+
+void probe_shell_state_get(uint32_t *has_probe_ctx, uint32_t *stream_tag)
+{
+	struct probe_pdata *_probe = probe_get();
+
+	if (has_probe_ctx)
+		*has_probe_ctx = _probe ? 1 : 0;
+
+	if (stream_tag)
+		*stream_tag = _probe ? _probe->ext_dma.stream_tag : PROBE_DMA_INVALID;
 }
 
 #if CONFIG_LOG_BACKEND_SOF_PROBE
