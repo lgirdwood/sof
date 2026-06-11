@@ -53,6 +53,20 @@
 #include <zephyr/llext/llext.h>
 #endif
 
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+#include <zephyr/llext/llext.h>
+#include <sof/lib_manager.h>
+#include <sof/llext_manager.h>
+#include <ipc4/module.h>
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+#include <zephyr/llext/llext.h>
+#include <zephyr/llext/buf_loader.h>
+#include <sof/lib_manager.h>
+#include <sof/llext_manager.h>
+#endif
+
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/shell/shell.h>
@@ -1586,6 +1600,232 @@ __cold static int cmd_sof_llext_purge(const struct shell *sh,
 
 #endif /* CONFIG_SOF_SHELL_LLEXT_PURGE */
 
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT
+
+/*
+ * sof llext ctor <lib_id>
+ * sof llext dtor <lib_id>
+ */
+__cold static int cmd_sof_llext_ctor_dtor(const struct shell *sh,
+					  size_t argc, char *argv[],
+					  bool is_ctor)
+{
+#if CONFIG_LIBRARY_MANAGER
+	struct ext_library *ext_lib = ext_lib_get();
+	const char *cmd = is_ctor ? "llext_ctor" : "llext_dtor";
+	long lib_id;
+	unsigned int i;
+	int ret = 0;
+
+	ARG_UNUSED(argc);
+
+	if (parse_long(sh, argv[1], &lib_id, 1, LIB_MANAGER_MAX_LIBS - 1) < 0)
+		return -EINVAL;
+
+	{
+		struct lib_manager_mod_ctx *ctx = ext_lib->desc[(uint32_t)lib_id];
+
+		if (!ctx || !ctx->base_addr || !ctx->mod) {
+			shell_error(sh, "%s: lib %ld not loaded", cmd, lib_id);
+			return -ENOENT;
+		}
+
+		for (i = 0; i < ctx->n_mod; i++) {
+			struct lib_manager_module *m = &ctx->mod[i];
+			uint32_t module_id = ((uint32_t)lib_id << LIB_MANAGER_LIB_ID_SHIFT) |
+					     m->start_idx;
+			const char *name = "?";
+
+			if (is_ctor) {
+				struct comp_ipc_config fake_ipc = { .id = module_id };
+				uintptr_t entry = llext_manager_allocate_module(&fake_ipc, NULL);
+
+				if (!entry) {
+					shell_error(sh, "%s: lib %ld mod %u: allocate failed",
+						    cmd, lib_id, i);
+					return -ENOMEM;
+				}
+
+				if (!m->llext) {
+					shell_error(sh, "%s: lib %ld mod %u: no llext handle",
+						    cmd, lib_id, i);
+					return -ENODEV;
+				}
+
+				if (m->llext->name[0])
+					name = m->llext->name;
+
+				ret = llext_bringup(m->llext);
+			} else {
+				if (!m->llext) {
+					shell_error(sh, "%s: lib %ld mod %u: not allocated",
+						    cmd, lib_id, i);
+					return -ENODEV;
+				}
+
+				if (m->llext->name[0])
+					name = m->llext->name;
+
+				ret = llext_teardown(m->llext);
+				if (ret < 0) {
+					shell_error(sh, "%s: lib %ld mod %u (%s): teardown failed %d",
+						    cmd, lib_id, i, name, ret);
+					return ret;
+				}
+
+				ret = llext_manager_free_module(module_id);
+			}
+
+			if (ret < 0) {
+				shell_error(sh, "%s: lib %ld mod %u (%s): failed %d",
+					    cmd, lib_id, i, name, ret);
+				return ret;
+			}
+
+			shell_print(sh, "%s: lib %ld mod %u (%s): OK", cmd, lib_id, i, name);
+		}
+	}
+
+	return ret;
+#else
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	ARG_UNUSED(is_ctor);
+	shell_print(sh, "Library manager not enabled.");
+	return -ENOSYS;
+#endif /* CONFIG_LIBRARY_MANAGER */
+}
+
+__cold static int cmd_sof_llext_ctor(const struct shell *sh,
+				     size_t argc, char *argv[])
+{
+	return cmd_sof_llext_ctor_dtor(sh, argc, argv, true);
+}
+
+__cold static int cmd_sof_llext_dtor(const struct shell *sh,
+				     size_t argc, char *argv[])
+{
+	return cmd_sof_llext_ctor_dtor(sh, argc, argv, false);
+}
+
+#endif /* CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT */
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT
+
+/*
+ * sof llext call <lib_id> <sym_name>
+ *
+ * Find a global symbol by name in any module belonging to the given library
+ * and invoke it as a void (*)(void) function.
+ */
+__cold static int cmd_sof_llext_call(const struct shell *sh,
+				     size_t argc, char *argv[])
+{
+#if CONFIG_LIBRARY_MANAGER
+	struct ext_library *ext_lib = ext_lib_get();
+	const char *sym_name = argv[2];
+	long lib_id;
+	unsigned int i;
+	int found = 0;
+
+	ARG_UNUSED(argc);
+
+	if (parse_long(sh, argv[1], &lib_id, 1, LIB_MANAGER_MAX_LIBS - 1) < 0)
+		return -EINVAL;
+
+	{
+		struct lib_manager_mod_ctx *ctx = ext_lib->desc[(uint32_t)lib_id];
+
+		if (!ctx || !ctx->base_addr || !ctx->mod) {
+			shell_error(sh, "llext_call: lib %ld not loaded", lib_id);
+			return -ENOENT;
+		}
+
+		for (i = 0; i < ctx->n_mod; i++) {
+			struct lib_manager_module *m = &ctx->mod[i];
+			const char *name = m->llext && m->llext->name[0] ? m->llext->name : "?";
+			const void *fn_addr = NULL;
+
+			if (!m->llext) {
+				shell_print(sh,
+					    "llext_call: lib %ld mod %u: not allocated - run 'sof llext ctor %ld' first",
+					    lib_id, i, lib_id);
+				continue;
+			}
+
+			fn_addr = llext_find_sym(&m->llext->sym_tab, sym_name);
+			if (!fn_addr)
+				fn_addr = llext_find_sym(&m->llext->exp_tab, sym_name);
+
+			/*
+			 * Fallback to the raw ELF symbol table in the persistent DRAM buffer.
+			 * This covers cases where sym_tab was freed or exp_tab metadata is
+			 * insufficient for the symbol we want to call directly.
+			 */
+			if (!fn_addr && m->ebl) {
+				const struct llext_loader *raw_ldr = &m->ebl->loader;
+				const elf_shdr_t *symtab_hdr = &raw_ldr->sects[LLEXT_MEM_SYMTAB];
+				const elf_shdr_t *strtab_hdr = &raw_ldr->sects[LLEXT_MEM_STRTAB];
+
+				if (symtab_hdr->sh_size && strtab_hdr->sh_size) {
+					const elf_sym_t *syms = (const elf_sym_t *)
+						(m->ebl->buf + symtab_hdr->sh_offset);
+					const char *strs = (const char *)
+						(m->ebl->buf + strtab_hdr->sh_offset);
+					uint32_t sym_cnt =
+						symtab_hdr->sh_size / sizeof(elf_sym_t);
+
+					for (uint32_t k = 0; k < sym_cnt; k++) {
+						uint16_t shndx;
+						const elf_shdr_t *sect;
+
+						if (ELF_ST_TYPE(syms[k].st_info) != STT_FUNC)
+							continue;
+						if (strcmp(strs + syms[k].st_name, sym_name) != 0)
+							continue;
+
+						shndx = syms[k].st_shndx;
+						if (shndx >= m->llext->sect_cnt)
+							break;
+
+						sect = m->llext->sect_hdrs + shndx;
+						fn_addr = (const void *)(m->ebl->buf + sect->sh_offset +
+								 syms[k].st_value);
+						break;
+					}
+				}
+			}
+
+			if (!fn_addr) {
+				shell_print(sh,
+					    "llext_call: lib %ld mod %u (%s): symbol '%s' not found",
+					    lib_id, i, name, sym_name);
+				continue;
+			}
+
+			shell_print(sh,
+				    "llext_call: lib %ld mod %u (%s) sym %s @ %p: calling...",
+				    lib_id, i, name, sym_name, fn_addr);
+
+			((void (*)(void))fn_addr)();
+
+			found++;
+			shell_print(sh, "llext_call: lib %ld mod %u (%s) sym %s: done",
+				    lib_id, i, name, sym_name);
+		}
+	}
+
+	return found ? 0 : -ENOENT;
+#else
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	shell_print(sh, "Library manager not enabled.");
+	return -ENOSYS;
+#endif /* CONFIG_LIBRARY_MANAGER */
+}
+
+#endif /* CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT */
+
 __cold static int cmd_sof_version(const struct shell *sh, size_t argc, char *argv[])
 {
 	shell_print(sh, "SOF Version: %d.%d.%d-%s (Build %d)",
@@ -2847,7 +3087,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_page,
 #endif
 #endif
 
-#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE || CONFIG_SOF_SHELL_LLEXT_CTOR || CONFIG_SOF_SHELL_LLEXT_CALL
 SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_llext,
 #if CONFIG_SOF_SHELL_LLEXT_LOAD
 	SHELL_CMD_ARG(load, NULL,
@@ -2871,6 +3111,19 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_cmd_llext,
 		  "Fails with -EBUSY if any module in the library is still\n"
 		  "mapped in SRAM (i.e. a pipeline using it is still active).\n",
 		  cmd_sof_llext_purge, 2, 0),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT
+	SHELL_CMD_ARG(ctor, NULL,
+		  "Call constructors for all modules in a library: <lib_id>\n",
+		  cmd_sof_llext_ctor, 2, 0),
+	SHELL_CMD_ARG(dtor, NULL,
+		  "Call destructors for all modules in a library: <lib_id>\n",
+		  cmd_sof_llext_dtor, 2, 0),
+#endif
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT
+	SHELL_CMD_ARG(call, NULL,
+		  "Call a named symbol in all modules of a library: <lib_id> <sym_name>\n",
+		  cmd_sof_llext_call, 3, 0),
 #endif
 	SHELL_SUBCMD_SET_END
 );
@@ -3048,7 +3301,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 #endif
 #endif
 
-#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE
+#if CONFIG_SOF_SHELL_LLEXT_LOAD || CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE || CONFIG_SOF_SHELL_LLEXT_CTOR || CONFIG_SOF_SHELL_LLEXT_CALL
 	SHELL_CMD(llext, &sof_cmd_llext,
 		  "LLEXT commands\n", NULL),
 #endif
@@ -3242,6 +3495,21 @@ SHELL_STATIC_SUBCMD_SET_CREATE(sof_commands,
 		  "Fails with -EBUSY if any module in the library is still\n"
 		  "mapped in SRAM (i.e. a pipeline using it is still active).\n",
 		  cmd_sof_llext_purge, 2, 0),
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT
+	SHELL_CMD_ARG(llext_ctor, NULL,
+		  "Call constructors for all modules in a library: <lib_id>\n",
+		  cmd_sof_llext_ctor, 2, 0),
+	SHELL_CMD_ARG(llext_dtor, NULL,
+		  "Call destructors for all modules in a library: <lib_id>\n",
+		  cmd_sof_llext_dtor, 2, 0),
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT
+	SHELL_CMD_ARG(llext_call, NULL,
+		  "Call a named symbol in all modules of a library: <lib_id> <sym_name>\n",
+		  cmd_sof_llext_call, 3, 0),
 #endif
 
 	SHELL_CMD(version, NULL,
