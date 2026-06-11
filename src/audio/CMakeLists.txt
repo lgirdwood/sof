@@ -8,6 +8,7 @@ set(base_files
 	sink_source_utils.c
 	audio_stream.c
 	channel_map.c
+	format_test.c
 )
 
 ### Common actions for Zephyr/XTOS ###
@@ -43,6 +44,9 @@ if(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 	endif()
 	if(CONFIG_COMP_FIR)
 		add_subdirectory(eq_fir)
+	endif()
+	if(CONFIG_COMP_HIFI_INTRIN_TEST)
+		add_subdirectory(hifi_intrin_test)
 	endif()
 	if(CONFIG_COMP_IGO_NR)
 		add_subdirectory(igo_nr)
@@ -128,9 +132,6 @@ if(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 	endif()
 	if(CONFIG_COMP_TONE)
 		add_subdirectory(tone)
-	endif()
-	if(CONFIG_COMP_HIFI_INTRIN_TEST)
-		add_subdirectory(hifi_intrin_test)
 	endif()
 	if(CONFIG_ZEPHYR_NATIVE_DRIVERS)
 		list(APPEND base_files host-zephyr.c)

@@ -25,3 +25,8 @@ endif()
 if(CONFIG_COMP_DRC)
 	add_subdirectory(drc)
 endif()
+
+# Format intrinsics test
+cmocka_test(format_intrinsics_test
+	format_intrinsics_test.c
+)

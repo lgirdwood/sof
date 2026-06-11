@@ -8,6 +8,7 @@
 #include <sof/audio/buffer.h>
 #include <sof/audio/component_ext.h>
 #include <sof/audio/pipeline.h>
+#include <sof/audio/format_test.h>
 #include <sof/lib/dai.h>
 #include <rtos/wait.h>
 #include <sof/list.h>
@@ -623,6 +624,23 @@ int pipeline_trigger_run(struct pipeline *p, struct comp_dev *host, int cmd)
 
 		if (pipeline_is_timer_driven(p))
 			return ret;
+	}
+
+	/* Run format intrinsic tests when pipeline stops on 1ms pipelines only. */
+	if (cmd == COMP_TRIGGER_STOP && ret == 0) {
+		const char *host_name = (host && host->tctx.uuid_p && host->tctx.uuid_p->name[0]) ?
+			host->tctx.uuid_p->name : "unknown";
+
+		if (p->period == 1000) {
+			pipe_info(p,
+				  "Running format intrinsic tests at stream stop: host=%s comp_id=%u period=%u",
+				  host_name, host ? dev_comp_id(host) : 0, p->period);
+			format_intrinsic_test_run();
+		} else {
+			pipe_info(p,
+				  "Skipping format intrinsic tests: host=%s comp_id=%u period=%u (require 1000)",
+				  host_name, host ? dev_comp_id(host) : 0, p->period);
+		}
 	}
 
 out:

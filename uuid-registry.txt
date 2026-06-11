@@ -84,6 +84,7 @@ bf0e1bbc-dc6a-45fe-bc902554cb137ab4 google_ctc_audio_processing
 c3c74249-058e-414f-82404da5f3fc2389 google_hotword
 b780a0a6-269f-466f-b47723dfa05af758 google_rtc_audio_processing
 8b9d100c-6d78-418f-90a3e0e805d0852b host
+3a9f2f18-b4e2-4d6e-9a1cfbdc47e6a101 hifi_intrin_test
 8f00c3bb-e835-4767-9a34b8ec1041e56b hsdai
 379a60ae-cedb-4777-aaf25659b0a85735 idc
 a5dacb0e-88dc-415c-a1b53e8df77f1976 idc_cmd_task
@@ -184,4 +185,3 @@ d944281a-afe9-4695-a043d7f62b89538e waves
 5f1ec3f8-faaf-4099-903ccee98351f169 zephyr_idc
 8fa1d42f-bc6f-464b-867f547af08834da zipc_task
 1547fe68-de0c-11eb-84613158a1294853 zll_sched
-3a9f2f18-b4e2-4d6e-9a1cfbdc47e6a101 hifi_intrin_test
