@@ -479,6 +479,39 @@ config SOF_SHELL_LLEXT_PURGE
 	  into SRAM (i.e. an active pipeline is using it) and returns -EBUSY.
 	  Tear down all pipelines that reference the library before purging.
 
+config SOF_SHELL_LLEXT_CTOR
+	bool "llext constructor/destructor call commands"
+	default y
+	depends on SHELL && LLEXT && LIBRARY_MANAGER
+	help
+	  Enables the 'sof llext ctor <lib_id>' and 'sof llext dtor <lib_id>'
+	  shell commands.
+
+	  'ctor' calls constructors and __attribute__((constructor)) functions
+	  for every module in the specified library by invoking
+	  llext_bringup() on each module's llext handle.
+
+	  'dtor' calls destructors and __attribute__((destructor)) functions
+	  via llext_teardown(), then unmaps each module from SRAM.
+
+	  These are developer/test commands intended to exercise module
+	  initialisation without instantiating a full pipeline.
+
+config SOF_SHELL_LLEXT_CALL
+	bool "llext explicit symbol-call command"
+	default y
+	depends on SHELL && LLEXT && LIBRARY_MANAGER
+	help
+	  Enables the 'sof llext call <lib_id> <sym_name>' shell command.
+
+	  The command looks up <sym_name> in sym_tab and exp_tab for every
+	  module in the specified library, then calls the first match as a
+	  void (*)(void) function.
+
+	  This is useful for test modules that export a run function but do
+	  not register it as a constructor. The module must be mapped to SRAM
+	  first with 'sof llext ctor <lib_id>'.
+
 config SOF_SHELL_BUFFER_INFO
 	bool "Audio buffer list/info commands"
 	default y

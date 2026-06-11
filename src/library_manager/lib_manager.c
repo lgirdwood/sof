@@ -983,13 +983,15 @@ static int lib_manager_store_library(struct lib_manager_dma_ext *dma_ext,
 	tr_dbg(&lib_manager_tr, "pointer: %p", (__sparse_force void *)library_base_address);
 
 #if CONFIG_LIBRARY_AUTH_SUPPORT
-	/* AUTH_PHASE_FIRST - checks library manifest only. */
-	ret = lib_manager_auth_proc((__sparse_force const void *)man_buffer,
-				    MAN_MAX_SIZE_V1_8, AUTH_PHASE_FIRST, auth_ctx);
-	if (ret < 0) {
-		rfree((__sparse_force void *)library_base_address);
-		return ret;
-	}
+        if (auth_ctx) {
+                /* AUTH_PHASE_FIRST - checks library manifest only. */
+                ret = lib_manager_auth_proc((__sparse_force const void *)man_buffer,
+                                            MAN_MAX_SIZE_V1_8, AUTH_PHASE_FIRST, auth_ctx);
+                if (ret < 0) {
+                        rfree((__sparse_force void *)library_base_address);
+                        return ret;
+                }
+        }
 #endif /* CONFIG_LIBRARY_AUTH_SUPPORT */
 
 	/* Copy data from temp_mft_buf to destination memory (pointed by library_base_address) */
@@ -1009,13 +1011,15 @@ static int lib_manager_store_library(struct lib_manager_dma_ext *dma_ext,
 	dcache_writeback_region((__sparse_force void *)library_base_address, preload_size);
 
 #if CONFIG_LIBRARY_AUTH_SUPPORT
-	/* AUTH_PHASE_LAST - do final library authentication checks */
-	ret = lib_manager_auth_proc((__sparse_force void *)library_base_address,
-				    preload_size - MAN_MAX_SIZE_V1_8, AUTH_PHASE_LAST, auth_ctx);
-	if (ret < 0) {
-		rfree((__sparse_force void *)library_base_address);
-		return ret;
-	}
+        if (auth_ctx) {
+                /* AUTH_PHASE_LAST - do final library authentication checks */
+                ret = lib_manager_auth_proc((__sparse_force void *)library_base_address,
+                                            preload_size - MAN_MAX_SIZE_V1_8, AUTH_PHASE_LAST, auth_ctx);
+                if (ret < 0) {
+                        rfree((__sparse_force void *)library_base_address);
+                        return ret;
+                }
+        }
 #endif /* CONFIG_LIBRARY_AUTH_SUPPORT */
 
 	/* Now update sof context with new library */
@@ -1113,7 +1117,6 @@ int lib_manager_load_library(uint32_t dma_id, uint32_t lib_id, uint32_t type)
 	}
 
 	lib_manager_init();
-	LOG_ERR("CANARY lib_id=%u type=%u", lib_id, type);
 
 	_ext_lib = ext_lib_get();
 
@@ -1145,18 +1148,26 @@ int lib_manager_load_library(uint32_t dma_id, uint32_t lib_id, uint32_t type)
 
 #if CONFIG_LIBRARY_AUTH_SUPPORT
 	struct auth_api_ctx auth_ctx;
-	void *auth_buffer;
+        void *auth_buffer = NULL;
+        struct auth_api_ctx *auth_ctx_ptr = NULL;
 
-	/* Initialize authentication support */
-	ret = lib_manager_auth_init(&auth_ctx, &auth_buffer);
-	if (ret < 0)
-		goto stop_dma;
+        if (!IS_ENABLED(CONFIG_LIBRARY_ALLOW_UNSIGNED_MODULES)) {
+                /* Initialize authentication support */
+                ret = lib_manager_auth_init(&auth_ctx, &auth_buffer);
+                if (ret < 0)
+                        goto stop_dma;
+                auth_ctx_ptr = &auth_ctx;
+        } else {
+                tr_warn(&lib_manager_tr,
+                        "Loading module without authentication (unsigned modules allowed)");
+        }
 
-	ret = lib_manager_store_library(dma_ext, man_tmp_buffer, lib_id, &auth_ctx);
+        ret = lib_manager_store_library(dma_ext, man_tmp_buffer, lib_id, auth_ctx_ptr);
 
-	lib_manager_auth_deinit(&auth_ctx, auth_buffer);
+        if (auth_ctx_ptr)
+                lib_manager_auth_deinit(&auth_ctx, auth_buffer);
 #else
-	ret = lib_manager_store_library(dma_ext, man_tmp_buffer, lib_id, NULL);
+        ret = lib_manager_store_library(dma_ext, man_tmp_buffer, lib_id, NULL);
 #endif /* CONFIG_LIBRARY_AUTH_SUPPORT */
 
 stop_dma:
