@@ -26,7 +26,6 @@
 #include <stdio.h>
 #include <zephyr/ztest.h>
 #include <sof/audio/format.h>
-#include <sof/audio/format_generic.h>
 #include <sof/math/trig.h>
 #include <sof/math/cordic.h>
 #include <sof/math/lut_trig.h>

@@ -16,6 +16,8 @@
 #include <user/trace.h>
 #include <stdint.h>
 
+LOG_MODULE_REGISTER(math_power, CONFIG_SOF_LOG_LEVEL);
+
 SOF_DEFINE_REG_UUID(math_power);
 
 DECLARE_TR_CTX(math_power_tr, SOF_UUID(math_power_uuid), LOG_LEVEL_INFO);
