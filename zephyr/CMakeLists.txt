@@ -615,7 +615,8 @@ zephyr_library_sources_ifdef(CONFIG_SOF_BOOT_TEST
 )
 
 zephyr_library_sources_ifdef(CONFIG_SHELL
-       sof_shell.c
+       shell/kernel.c
+       shell/user.c
 )
 
 zephyr_syscall_header(${SOF_SRC_PATH}/include/sof/audio/module_adapter/module/generic.h)
