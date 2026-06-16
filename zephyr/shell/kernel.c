@@ -63,6 +63,14 @@
 #include <ipc4/module.h>
 #endif
 
+#ifndef _SHELL_MOD_PAGE_SZ
+#ifdef CONFIG_MM_DRV_PAGE_SIZE
+#define _SHELL_MOD_PAGE_SZ CONFIG_MM_DRV_PAGE_SIZE
+#else
+#define _SHELL_MOD_PAGE_SZ 4096
+#endif
+#endif
+
 #if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
 #include <zephyr/llext/llext.h>
 #include <zephyr/llext/buf_loader.h>
@@ -1639,10 +1647,14 @@ struct sof_shell_mb_region {
 };
 
 __cold_rodata static const struct sof_shell_mb_region sof_shell_mb_regions[] = {
+#ifdef MAILBOX_EXCEPTION_BASE
 	{ "exception", MAILBOX_EXCEPTION_BASE, MAILBOX_EXCEPTION_SIZE },
+#endif
 	{ "dspbox",    MAILBOX_DSPBOX_BASE,    MAILBOX_DSPBOX_SIZE    },
 	{ "hostbox",   MAILBOX_HOSTBOX_BASE,   MAILBOX_HOSTBOX_SIZE   },
+#ifdef MAILBOX_DEBUG_BASE
 	{ "debug",     MAILBOX_DEBUG_BASE,     MAILBOX_DEBUG_SIZE     },
+#endif
 };
 
 __cold static int cmd_sof_mailbox_hex(const struct shell *sh,
@@ -1767,7 +1779,7 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 				    "  %3d   0x%08x  0x%08x 0x%08x  %s (core %u)",
 				    i, dw->descs[i].resource_id, dw->descs[i].type,
 				    dw->descs[i].vma, dw_type_name(dw->descs[i].type),
-				    dw->descs[i].type & ADSP_DW_SLOT_CORE_MASK);
+				    (unsigned int)(dw->descs[i].type & ADSP_DW_SLOT_CORE_MASK));
 		}
 		shell_print(sh, "Usage: sof dbgwin dump <slot> [length]");
 		return 0;
@@ -1788,7 +1800,7 @@ __cold static int cmd_sof_dbgwin_dump(const struct shell *sh,
 
 	shell_print(sh, "Slot %d type=0x%08x (%s, core %u) vma=0x%08x; %zu bytes:",
 		    slot, dw->descs[slot].type, dw_type_name(dw->descs[slot].type),
-		    dw->descs[slot].type & ADSP_DW_SLOT_CORE_MASK,
+		    (unsigned int)(dw->descs[slot].type & ADSP_DW_SLOT_CORE_MASK),
 		    dw->descs[slot].vma, len);
 	sof_shell_hex_dump(sh, (uintptr_t)dw->slots[slot], 0, len);
 	return 0;

@@ -32,6 +32,10 @@
 #include <stdint.h>
 #include <adsp_debug_window.h>  /* ADSP_DW_SLOT_LLEXT_LOAD */
 
+#ifndef ADSP_DW_SLOT_LLEXT_LOAD
+#define ADSP_DW_SLOT_LLEXT_LOAD         0x4C454C44U /* 'LELD' */
+#endif
+
 /**
  * Magic placed in ->magic to indicate the DSP has initialized the slot.
  * Reuses the slot-type value so a single constant identifies both.
