@@ -249,40 +249,31 @@ SHELL_SUBCMD_ADD((sof), clock_status, NULL,
 #if CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
 
 /*
- * Lightweight wrappers around the Intel ADSP MTL TLB MMIO table.
- * Mirrors mm_drv_intel_adsp.h without pulling in the driver-internal header.
+ * The privileged TLB MMIO reads and the memory-region query are performed by
+ * the sof_shell_tlb_*() system calls (see zephyr/shell/syscall.c). The shell
+ * only decodes the snapshot returned by those calls, so it works unchanged
+ * when the shell thread runs in user mode.
  */
-#define _SHELL_TLB_NODE       DT_NODELABEL(tlb)
-#define _SHELL_TLB_BASE       ((volatile uint16_t *)(uintptr_t)DT_REG_ADDR(_SHELL_TLB_NODE))
-#define _SHELL_PADDR_SIZE     DT_PROP(_SHELL_TLB_NODE, paddr_size)
-#define _SHELL_TLB_ENTRY_NUM  BIT(_SHELL_PADDR_SIZE)
-#define _SHELL_PADDR_MASK     (_SHELL_TLB_ENTRY_NUM - 1)
-#define _SHELL_ENABLE_BIT     ((uint16_t)BIT(_SHELL_PADDR_SIZE))
-#define _SHELL_EXEC_BIT       ((uint16_t)BIT(DT_PROP(_SHELL_TLB_NODE, exec_bit_idx)))
-#define _SHELL_WRITE_BIT      ((uint16_t)BIT(DT_PROP(_SHELL_TLB_NODE, write_bit_idx)))
 
-/*
- * Base physical address for the HPSRAM region (mirrors TLB_PHYS_BASE in the
- * driver).  Physical pages whose index fits in paddr_size bits are located
- * starting here.
- */
-#define _SHELL_PHYS_BASE \
-	(((CONFIG_KERNEL_VM_BASE / CONFIG_MM_DRV_PAGE_SIZE) & ~_SHELL_PADDR_MASK) * \
-	 CONFIG_MM_DRV_PAGE_SIZE)
-
-/* Convert virtual-address index → physical address */
-__cold static uintptr_t shell_tlb_idx_to_pa(uint32_t idx, uint16_t entry)
+/* Convert virtual-address index → physical address using snapshot metadata */
+__cold static uintptr_t shell_tlb_idx_to_pa(const struct sof_shell_tlb_meta *m,
+					    uint16_t entry)
 {
-	return _SHELL_PHYS_BASE +
-	       ((uintptr_t)(entry & _SHELL_PADDR_MASK) * CONFIG_MM_DRV_PAGE_SIZE);
+	uint32_t paddr_mask = (1u << m->paddr_size) - 1;
+
+	return m->phys_base + ((uintptr_t)(entry & paddr_mask) * m->page_size);
 }
 
 /* Decode 16-bit TLB entry permission bits into a short string */
-__cold static void shell_tlb_flags_str(uint16_t entry, char *buf)
+__cold static void shell_tlb_flags_str(const struct sof_shell_tlb_meta *m,
+				       uint16_t entry, char *buf)
 {
+	uint16_t write_bit = (uint16_t)(1u << m->write_bit_idx);
+	uint16_t exec_bit = (uint16_t)(1u << m->exec_bit_idx);
+
 	buf[0] = 'R';
-	buf[1] = (entry & _SHELL_WRITE_BIT) ? 'W' : '-';
-	buf[2] = (entry & _SHELL_EXEC_BIT)  ? 'X' : '-';
+	buf[1] = (entry & write_bit) ? 'W' : '-';
+	buf[2] = (entry & exec_bit)  ? 'X' : '-';
 	buf[3] = '\0';
 }
 
@@ -290,51 +281,39 @@ __cold static void shell_tlb_flags_str(uint16_t entry, char *buf)
 __cold static int cmd_sof_mmu_status(const struct shell *sh,
 				     size_t argc, char *argv[])
 {
-	const struct sys_mm_drv_region *regions, *r;
-	volatile uint16_t *tlb = _SHELL_TLB_BASE;
-	uint32_t total = _SHELL_TLB_ENTRY_NUM;
-	uint32_t enabled = 0;
+	struct sof_shell_tlb_meta meta;
 	uint32_t i;
 
-	/* Count active TLB entries */
-	for (i = 0; i < total; i++) {
-		if (tlb[i] & _SHELL_ENABLE_BIT)
-			enabled++;
-	}
+	sof_shell_tlb_meta_get(&meta);
 
 	shell_print(sh, "Intel ADSP MTL TLB / Virtual Memory Status");
-	shell_print(sh, "  VM base:       0x%08x", CONFIG_KERNEL_VM_BASE);
+	shell_print(sh, "  VM base:       0x%08x", meta.vm_base);
 	shell_print(sh, "  VM size:       0x%08x (%u KB)",
-		    (uint32_t)(total * CONFIG_MM_DRV_PAGE_SIZE),
-		    (uint32_t)(total * CONFIG_MM_DRV_PAGE_SIZE / 1024));
-	shell_print(sh, "  page size:     %u B", CONFIG_MM_DRV_PAGE_SIZE);
-	shell_print(sh, "  total entries: %u", total);
+		    meta.total_entries * meta.page_size,
+		    meta.total_entries * meta.page_size / 1024);
+	shell_print(sh, "  page size:     %u B", meta.page_size);
+	shell_print(sh, "  total entries: %u", meta.total_entries);
 	shell_print(sh, "  mapped pages:  %u (%u KB)",
-		    enabled, enabled * CONFIG_MM_DRV_PAGE_SIZE / 1024);
+		    meta.enabled_entries, meta.enabled_entries * meta.page_size / 1024);
 	shell_print(sh, "  free pages:    %u (%u KB)",
-		    total - enabled,
-		    (total - enabled) * CONFIG_MM_DRV_PAGE_SIZE / 1024);
-	shell_print(sh, "  TLB MMIO base: 0x%08x",
-		    (uint32_t)(uintptr_t)_SHELL_TLB_BASE);
+		    meta.total_entries - meta.enabled_entries,
+		    (meta.total_entries - meta.enabled_entries) * meta.page_size / 1024);
+	shell_print(sh, "  TLB MMIO base: 0x%08x", meta.tlb_mmio_base);
 	shell_print(sh, "  paddr_size:    %u  enable_bit:%u  exec_bit:%u  write_bit:%u",
-		    _SHELL_PADDR_SIZE,
-		    _SHELL_PADDR_SIZE,
-		    DT_PROP(_SHELL_TLB_NODE, exec_bit_idx),
-		    DT_PROP(_SHELL_TLB_NODE, write_bit_idx));
+		    meta.paddr_size, meta.paddr_size,
+		    meta.exec_bit_idx, meta.write_bit_idx);
 
 	shell_print(sh, "");
 	shell_print(sh, "Mapped memory regions (sys_mm_drv):");
 	shell_print(sh, "  %-10s  %-10s  %s", "address", "size", "attr");
 
-	regions = sys_mm_drv_query_memory_regions();
-	if (regions) {
-		SYS_MM_DRV_MEMORY_REGION_FOREACH(regions, r) {
+	if (meta.region_count) {
+		for (i = 0; i < meta.region_count; i++)
 			shell_print(sh, "  0x%08x  0x%08x  0x%08x",
-				    (uint32_t)(uintptr_t)r->addr,
-				    (uint32_t)r->size,
-				    (uint32_t)r->attr);
-		}
-		sys_mm_drv_query_memory_regions_free(regions);
+				    meta.regions[i].addr, meta.regions[i].size,
+				    meta.regions[i].attr);
+		if (meta.regions_truncated)
+			shell_print(sh, "  ... (truncated)");
 	} else {
 		shell_print(sh, "  (not available)");
 	}
@@ -345,32 +324,44 @@ __cold static int cmd_sof_mmu_status(const struct shell *sh,
 __cold static int cmd_sof_tlb_dump(const struct shell *sh,
 				   size_t argc, char *argv[])
 {
-	volatile uint16_t *tlb = _SHELL_TLB_BASE;
-	uint32_t total = _SHELL_TLB_ENTRY_NUM;
+	struct sof_shell_tlb_meta meta;
+	uint16_t buf[128];
+	uint32_t enable_bit;
 	uint32_t count = 0;
-	uint32_t i;
+	uint32_t base;
+
+	sof_shell_tlb_meta_get(&meta);
+	enable_bit = 1u << meta.paddr_size;
 
 	shell_print(sh, "  idx   vaddr       paddr       flags  entry");
 
-	for (i = 0; i < total; i++) {
-		uint16_t entry = tlb[i];
+	for (base = 0; base < meta.total_entries; base += ARRAY_SIZE(buf)) {
+		uint32_t got = sof_shell_tlb_entries_get(base, ARRAY_SIZE(buf), buf);
+		uint32_t j;
 
-		if (!(entry & _SHELL_ENABLE_BIT))
-			continue;
+		if (!got)
+			break;
 
-		uintptr_t vaddr = CONFIG_KERNEL_VM_BASE +
-				  (uintptr_t)i * CONFIG_MM_DRV_PAGE_SIZE;
-		uintptr_t paddr = shell_tlb_idx_to_pa(i, entry);
-		char flags[4];
+		for (j = 0; j < got; j++) {
+			uint16_t entry = buf[j];
+			uint32_t idx = base + j;
+			uintptr_t vaddr, paddr;
+			char flags[4];
 
-		shell_tlb_flags_str(entry, flags);
-		shell_print(sh, "  %-5u 0x%08x  0x%08x  %s    0x%04x",
-			    i, (uint32_t)vaddr, (uint32_t)paddr,
-			    flags, (uint32_t)entry);
-		count++;
+			if (!(entry & enable_bit))
+				continue;
+
+			vaddr = meta.vm_base + (uintptr_t)idx * meta.page_size;
+			paddr = shell_tlb_idx_to_pa(&meta, entry);
+			shell_tlb_flags_str(&meta, entry, flags);
+			shell_print(sh, "  %-5u 0x%08x  0x%08x  %s    0x%04x",
+				    idx, (uint32_t)vaddr, (uint32_t)paddr,
+				    flags, (uint32_t)entry);
+			count++;
+		}
 	}
 
-	shell_print(sh, "Total: %u/%u entries active", count, total);
+	shell_print(sh, "Total: %u/%u entries active", count, meta.total_entries);
 	return 0;
 }
 
@@ -378,8 +369,13 @@ __cold static int cmd_sof_tlb_dump(const struct shell *sh,
 __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 				     size_t argc, char *argv[])
 {
-	volatile uint16_t *tlb = _SHELL_TLB_BASE;
-	uintptr_t vstart, vend;
+	struct sof_shell_tlb_meta meta;
+	uintptr_t vstart, vend, vm_base, vm_end;
+	uint32_t enable_bit, page_mask;
+
+	sof_shell_tlb_meta_get(&meta);
+	enable_bit = 1u << meta.paddr_size;
+	page_mask = meta.page_size - 1;
 
 	/* Parse start address */
 	{
@@ -390,7 +386,7 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 			shell_print(sh, "error: invalid address '%s'", argv[1]);
 			return -EINVAL;
 		}
-		vstart = (uintptr_t)v & ~(CONFIG_MM_DRV_PAGE_SIZE - 1);
+		vstart = (uintptr_t)v & ~(uintptr_t)page_mask;
 	}
 
 	if (argc > 2) {
@@ -401,7 +397,7 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 			shell_print(sh, "error: invalid address '%s'", argv[2]);
 			return -EINVAL;
 		}
-		vend = (uintptr_t)v & ~(CONFIG_MM_DRV_PAGE_SIZE - 1);
+		vend = (uintptr_t)v & ~(uintptr_t)page_mask;
 	} else {
 		vend = vstart;
 	}
@@ -409,13 +405,17 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 	if (vend < vstart)
 		vend = vstart;
 
+	vm_base = meta.vm_base;
+	vm_end  = vm_base + (uintptr_t)meta.total_entries * meta.page_size - 1;
+
 	shell_print(sh, "  vaddr       paddr       mapped  flags  bank  entry");
 
-	for (uintptr_t va = vstart; va <= vend; va += CONFIG_MM_DRV_PAGE_SIZE) {
-		uintptr_t vm_base = CONFIG_KERNEL_VM_BASE;
-		uintptr_t vm_end  = vm_base +
-				    (uintptr_t)_SHELL_TLB_ENTRY_NUM *
-				    CONFIG_MM_DRV_PAGE_SIZE - 1;
+	for (uintptr_t va = vstart; va <= vend; va += meta.page_size) {
+		uint16_t entry;
+		uint32_t idx;
+		uintptr_t pa;
+		uint32_t bank;
+		char flags[4];
 
 		if (va < vm_base || va > vm_end) {
 			shell_print(sh, "  0x%08x  (outside VM range)",
@@ -423,23 +423,18 @@ __cold static int cmd_sof_tlb_lookup(const struct shell *sh,
 			continue;
 		}
 
-		uint32_t idx = (uint32_t)((va - vm_base) /
-					  CONFIG_MM_DRV_PAGE_SIZE);
-		uint16_t entry = tlb[idx];
-		bool mapped = (entry & _SHELL_ENABLE_BIT) != 0;
+		idx = (uint32_t)((va - vm_base) / meta.page_size);
+		sof_shell_tlb_entries_get(idx, 1, &entry);
 
-		if (!mapped) {
+		if (!(entry & enable_bit)) {
 			shell_print(sh, "  0x%08x  (not mapped)",
 				    (uint32_t)va);
 			continue;
 		}
 
-		uintptr_t pa = shell_tlb_idx_to_pa(idx, entry);
-		uint32_t bank = (uint32_t)((pa - _SHELL_PHYS_BASE) /
-					   (128 * 1024));
-		char flags[4];
-
-		shell_tlb_flags_str(entry, flags);
+		pa = shell_tlb_idx_to_pa(&meta, entry);
+		bank = (uint32_t)((pa - meta.phys_base) / (128 * 1024));
+		shell_tlb_flags_str(&meta, entry, flags);
 		shell_print(sh, "  0x%08x  0x%08x  yes     %s    %-4u  0x%04x",
 			    (uint32_t)va, (uint32_t)pa,
 			    flags, bank, (uint32_t)entry);
