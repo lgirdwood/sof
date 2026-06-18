@@ -161,15 +161,18 @@ SHELL_SUBCMD_ADD((sof), test_inject_sched_gap, NULL,
 __cold static int cmd_sof_core_status(const struct shell *sh,
 				      size_t argc, char *argv[])
 {
-	int i;
+	struct sof_shell_core_status cs;
+	unsigned int i;
+
+	sof_shell_core_status_get(&cs);
 
 	shell_print(sh, "%-6s %-8s %s", "core", "enabled", "current");
 
-	for (i = 0; i < CONFIG_CORE_COUNT; i++) {
-		shell_print(sh, "%-6d %-8s %s",
+	for (i = 0; i < cs.core_count; i++) {
+		shell_print(sh, "%-6u %-8s %s",
 			    i,
-			    cpu_is_core_enabled(i) ? "yes" : "no",
-			    (i == cpu_get_id()) ? "<--" : "");
+			    cs.enabled[i] ? "yes" : "no",
+			    (i == cs.current) ? "<--" : "");
 	}
 
 	return 0;
@@ -213,20 +216,22 @@ SHELL_SUBCMD_ADD((sof), sram_status, NULL,
 __cold static int cmd_sof_clock_status(const struct shell *sh,
 				       size_t argc, char *argv[])
 {
-	struct clock_info *clocks = clocks_get();
-	int i;
+	struct sof_shell_clock_status cl;
+	unsigned int i;
 
-	if (!clocks) {
+	sof_shell_clock_status_get(&cl);
+
+	if (!cl.valid) {
 		shell_print(sh, "Clock info not available");
 		return 0;
 	}
 
 	shell_print(sh, "%-6s %-12s %s", "clock", "freq_hz", "freq_mhz");
 
-	for (i = 0; i < NUM_CLOCKS; i++) {
-		uint32_t freq = clocks[i].freqs[clocks[i].current_freq_idx].freq;
+	for (i = 0; i < cl.num_clocks; i++) {
+		uint32_t freq = cl.freq_hz[i];
 
-		shell_print(sh, "%-6d %-12u %.1f",
+		shell_print(sh, "%-6u %-12u %.1f",
 			    i, freq, (double)freq / 1000000.0);
 	}
 
