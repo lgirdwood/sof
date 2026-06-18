@@ -13,6 +13,9 @@
 #include <sof/ipc/common.h>
 #include <sof/lib/cpu.h>
 #include <rtos/clk.h>
+#include <rtos/sof.h>
+#include <sof/schedule/ll_schedule_domain.h>
+#include <zephyr/kernel.h>
 #include <sof/sof_shell_syscall.h>
 
 #if CONFIG_SOF_SHELL_SCHED_INFO
@@ -229,6 +232,32 @@ uint32_t z_impl_sof_shell_tlb_entries_get(uint32_t start, uint32_t count,
 }
 #endif /* CONFIG_SOF_SHELL_MMU_DBG && CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB */
 
+#if CONFIG_SOF_SHELL_CORE_POWER
+int z_impl_sof_shell_core_is_enabled(uint32_t id)
+{
+	return cpu_is_core_enabled((int)id) ? 1 : 0;
+}
+
+int z_impl_sof_shell_core_enable(uint32_t id)
+{
+	return cpu_enable_core((int)id);
+}
+
+void z_impl_sof_shell_core_disable(uint32_t id)
+{
+	cpu_disable_core((int)id);
+}
+#endif /* CONFIG_SOF_SHELL_CORE_POWER */
+
+void z_impl_sof_shell_inject_sched_gap(uint32_t block_time_us)
+{
+	struct ll_schedule_domain *domain = sof_get()->platform_timer_domain;
+
+	domain_block(domain);
+	k_busy_wait(block_time_us);
+	domain_unblock(domain);
+}
+
 #ifdef CONFIG_USERSPACE
 #include <zephyr/internal/syscall_handler.h>
 
@@ -293,4 +322,35 @@ uint32_t z_vrfy_sof_shell_tlb_entries_get(uint32_t start, uint32_t count,
 }
 #include <zephyr/syscalls/sof_shell_tlb_entries_get_mrsh.c>
 #endif /* CONFIG_SOF_SHELL_MMU_DBG && CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB */
+
+#if CONFIG_SOF_SHELL_CORE_POWER
+int z_vrfy_sof_shell_core_is_enabled(uint32_t id)
+{
+	K_OOPS(K_SYSCALL_VERIFY_MSG(id < CONFIG_CORE_COUNT, "invalid core id"));
+	return z_impl_sof_shell_core_is_enabled(id);
+}
+#include <zephyr/syscalls/sof_shell_core_is_enabled_mrsh.c>
+
+int z_vrfy_sof_shell_core_enable(uint32_t id)
+{
+	K_OOPS(K_SYSCALL_VERIFY_MSG(id >= 1 && id < CONFIG_CORE_COUNT,
+				   "invalid core id"));
+	return z_impl_sof_shell_core_enable(id);
+}
+#include <zephyr/syscalls/sof_shell_core_enable_mrsh.c>
+
+void z_vrfy_sof_shell_core_disable(uint32_t id)
+{
+	K_OOPS(K_SYSCALL_VERIFY_MSG(id >= 1 && id < CONFIG_CORE_COUNT,
+				   "invalid core id"));
+	z_impl_sof_shell_core_disable(id);
+}
+#include <zephyr/syscalls/sof_shell_core_disable_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_CORE_POWER */
+
+void z_vrfy_sof_shell_inject_sched_gap(uint32_t block_time_us)
+{
+	z_impl_sof_shell_inject_sched_gap(block_time_us);
+}
+#include <zephyr/syscalls/sof_shell_inject_sched_gap_mrsh.c>
 #endif /* CONFIG_USERSPACE */

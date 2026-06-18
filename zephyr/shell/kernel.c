@@ -138,17 +138,13 @@ __cold static int cmd_sof_test_inject_sched_gap(const struct shell *sh,
 	shell_fprintf(sh, SHELL_NORMAL, "Domain blocking not supported, not reliable on SMP\n");
 #endif
 
-	domain_block(sof_get()->platform_timer_domain);
-
 	if (argc > 1) {
 		block_time = strtol(argv[1], &endptr, 0);
 		if (endptr == argv[1])
 			return -EINVAL;
 	}
 
-	k_busy_wait(block_time);
-
-	domain_unblock(sof_get()->platform_timer_domain);
+	sof_shell_inject_sched_gap(block_time);
 
 	return 0;
 }
@@ -1186,12 +1182,12 @@ __cold static int cmd_sof_core_on(const struct shell *sh,
 		return -EINVAL;
 	}
 
-	if (cpu_is_core_enabled((int)id)) {
+	if (sof_shell_core_is_enabled((uint32_t)id)) {
 		shell_print(sh, "core %ld already active", id);
 		return 0;
 	}
 
-	ret = cpu_enable_core((int)id);
+	ret = sof_shell_core_enable((uint32_t)id);
 	if (ret)
 		shell_error(sh, "core_on: failed to enable core %ld: %d", id, ret);
 	else
@@ -1212,14 +1208,14 @@ __cold static int cmd_sof_core_off(const struct shell *sh,
 		return -EINVAL;
 	}
 
-	if (!cpu_is_core_enabled((int)id)) {
+	if (!sof_shell_core_is_enabled((uint32_t)id)) {
 		shell_print(sh, "core %ld already inactive", id);
 		return 0;
 	}
 
-	cpu_disable_core((int)id);
+	sof_shell_core_disable((uint32_t)id);
 
-	if (cpu_is_core_enabled((int)id)) {
+	if (sof_shell_core_is_enabled((uint32_t)id)) {
 		shell_error(sh, "core_off: core %ld did not power down", id);
 		return -EIO;
 	}

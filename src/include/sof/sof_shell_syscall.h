@@ -145,6 +145,18 @@ __syscall void sof_shell_tlb_meta_get(struct sof_shell_tlb_meta *out);
 __syscall uint32_t sof_shell_tlb_entries_get(uint32_t start, uint32_t count,
 					     uint16_t *out);
 
+/** \brief Report whether secondary DSP core \p id is currently enabled. */
+__syscall int sof_shell_core_is_enabled(uint32_t id);
+
+/** \brief Power on secondary DSP core \p id. \return 0 on success. */
+__syscall int sof_shell_core_enable(uint32_t id);
+
+/** \brief Power off secondary DSP core \p id. */
+__syscall void sof_shell_core_disable(uint32_t id);
+
+/** \brief Block audio scheduling for \p block_time_us microseconds. */
+__syscall void sof_shell_inject_sched_gap(uint32_t block_time_us);
+
 #else /* !__ZEPHYR__ || !CONFIG_SOF_FULL_ZEPHYR_APPLICATION */
 
 struct sof_shell_core_status;
@@ -162,6 +174,10 @@ void z_impl_sof_shell_log_status_get(struct sof_shell_log_status *out);
 void z_impl_sof_shell_tlb_meta_get(struct sof_shell_tlb_meta *out);
 uint32_t z_impl_sof_shell_tlb_entries_get(uint32_t start, uint32_t count,
 					  uint16_t *out);
+int z_impl_sof_shell_core_is_enabled(uint32_t id);
+int z_impl_sof_shell_core_enable(uint32_t id);
+void z_impl_sof_shell_core_disable(uint32_t id);
+void z_impl_sof_shell_inject_sched_gap(uint32_t block_time_us);
 #define sof_shell_ipc_stats_get z_impl_sof_shell_ipc_stats_get
 #define sof_shell_ipc_stats_reset z_impl_sof_shell_ipc_stats_reset
 #define sof_shell_core_status_get z_impl_sof_shell_core_status_get
@@ -170,6 +186,10 @@ uint32_t z_impl_sof_shell_tlb_entries_get(uint32_t start, uint32_t count,
 #define sof_shell_log_status_get z_impl_sof_shell_log_status_get
 #define sof_shell_tlb_meta_get z_impl_sof_shell_tlb_meta_get
 #define sof_shell_tlb_entries_get z_impl_sof_shell_tlb_entries_get
+#define sof_shell_core_is_enabled z_impl_sof_shell_core_is_enabled
+#define sof_shell_core_enable z_impl_sof_shell_core_enable
+#define sof_shell_core_disable z_impl_sof_shell_core_disable
+#define sof_shell_inject_sched_gap z_impl_sof_shell_inject_sched_gap
 
 #endif
 
