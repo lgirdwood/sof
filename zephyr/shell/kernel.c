@@ -1409,62 +1409,58 @@ __cold static const char *sched_state_str(enum task_state s)
 }
 
 struct sched_walk_ctx {
-	const struct shell *sh;
-	int sch_type;
 	uint32_t total_sum;
 	uint32_t total_cnt;
 	uint32_t total_max;
 	int task_count;
-	bool show_load;
 };
-
-__cold static void sched_list_cb(struct task *task, void *_ctx)
-{
-	struct sched_walk_ctx *c = _ctx;
-	uint32_t avg = task->cycles_cnt ? task->cycles_sum / task->cycles_cnt : 0;
-
-	if (c->show_load) {
-		shell_print(c->sh,
-			    "  %-9s core %u  prio %3u  state %-7s"
-			    "  count %u  avg %u  max %u  sum %u cyc",
-			    sched_type_str(c->sch_type), task->core,
-			    task->priority, sched_state_str(task->state),
-			    task->cycles_cnt, avg, task->cycles_max,
-			    task->cycles_sum);
-	} else {
-		shell_print(c->sh,
-			    "  %-9s core %u  prio %3u  state %-7s"
-			    "  flags 0x%04x  uid %p  data %p",
-			    sched_type_str(c->sch_type), task->core,
-			    task->priority, sched_state_str(task->state),
-			    task->flags, (const void *)task->uid, task->data);
-	}
-
-	c->total_sum += task->cycles_sum;
-	c->total_cnt += task->cycles_cnt;
-	if (task->cycles_max > c->total_max)
-		c->total_max = task->cycles_max;
-	c->task_count++;
-}
 
 __cold static int sched_walk(const struct shell *sh, bool show_load)
 {
-	struct schedulers *schedulers = *arch_schedulers_get();
-	struct sched_walk_ctx ctx = { .sh = sh, .show_load = show_load };
-	struct schedule_data *sch;
-	struct list_item *slist;
+	/*
+	 * The snapshot is too large for the 2 KB shell stack, so use a
+	 * file-scope-lifetime buffer. Shell commands run serialized on the
+	 * single shell thread, so there is no reentrancy, and the buffer
+	 * lives in the shell module's (user-accessible) memory.
+	 */
+	static struct sof_shell_sched_snapshot snap;
+	struct sched_walk_ctx ctx = { 0 };
+	uint32_t i;
 
-	if (!schedulers) {
+	sof_shell_sched_snapshot_get(&snap);
+
+	if (snap.no_schedulers) {
 		shell_print(sh, "No schedulers registered");
 		return 0;
 	}
 
-	list_for_item(slist, &schedulers->list) {
-		sch = container_of(slist, struct schedule_data, list);
-		if (!sch->ops->scheduler_dump_tasks)
-			continue;
-		ctx.sch_type = sch->type;
-		sch->ops->scheduler_dump_tasks(sch->data, sched_list_cb, &ctx);
+	for (i = 0; i < snap.count; i++) {
+		const struct sof_shell_sched_task *t = &snap.tasks[i];
+		uint32_t avg = t->cycles_cnt ? t->cycles_sum / t->cycles_cnt : 0;
+
+		if (show_load) {
+			shell_print(sh,
+				    "  %-9s core %u  prio %3u  state %-7s"
+				    "  count %u  avg %u  max %u  sum %u cyc",
+				    sched_type_str(t->sch_type), t->core,
+				    t->priority, sched_state_str(t->state),
+				    t->cycles_cnt, avg, t->cycles_max,
+				    t->cycles_sum);
+		} else {
+			shell_print(sh,
+				    "  %-9s core %u  prio %3u  state %-7s"
+				    "  flags 0x%04x  uid 0x%lx  data 0x%lx",
+				    sched_type_str(t->sch_type), t->core,
+				    t->priority, sched_state_str(t->state),
+				    t->flags, (unsigned long)t->uid,
+				    (unsigned long)t->data);
+		}
+
+		ctx.total_sum += t->cycles_sum;
+		ctx.total_cnt += t->cycles_cnt;
+		if (t->cycles_max > ctx.total_max)
+			ctx.total_max = t->cycles_max;
+		ctx.task_count++;
 	}
 
 	if (!ctx.task_count)
@@ -1508,28 +1504,25 @@ SHELL_SUBCMD_ADD((sof), sched_load, NULL,
 
 #if CONFIG_SOF_SHELL_LOG_INFO
 
-#include <zephyr/logging/log_backend.h>
-#include <zephyr/logging/log_ctrl.h>
-
 __cold static int cmd_sof_log_status(const struct shell *sh,
 				     size_t argc, char *argv[])
 {
-	int n = log_backend_count_get();
-	int i;
+	struct sof_shell_log_status ls;
+	uint32_t i;
 
-	shell_print(sh, "Log backends: %d, sources: %u",
-		    n, log_src_cnt_get(Z_LOG_LOCAL_DOMAIN_ID));
+	sof_shell_log_status_get(&ls);
+
+	shell_print(sh, "Log backends: %u, sources: %u",
+		    ls.backend_count, ls.source_count);
 	shell_print(sh, "  idx  id  active  name");
 
-	for (i = 0; i < n; i++) {
-		const struct log_backend *be = log_backend_get(i);
+	for (i = 0; i < ls.filled; i++) {
+		const struct sof_shell_log_backend *be = &ls.backends[i];
 
-		if (!be)
-			continue;
-		shell_print(sh, "  %3d  %3u   %-3s    %s",
-			    i, log_backend_id_get(be),
-			    log_backend_is_active(be) ? "yes" : "no",
-			    be->name ? be->name : "?");
+		shell_print(sh, "  %3u  %3u   %-3s    %s",
+			    i, be->id,
+			    be->active ? "yes" : "no",
+			    be->name);
 	}
 
 	return 0;

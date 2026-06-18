@@ -15,6 +15,19 @@
 #include <rtos/clk.h>
 #include <sof/sof_shell_syscall.h>
 
+#if CONFIG_SOF_SHELL_SCHED_INFO
+#include <sof/schedule/schedule.h>
+#include <rtos/task.h>
+#include <sof/list.h>
+#endif
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+#include <zephyr/logging/log_backend.h>
+#include <zephyr/logging/log_ctrl.h>
+#include <zephyr/logging/log_core.h>
+#include <string.h>
+#endif
+
 void z_impl_sof_shell_ipc_stats_get(struct ipc_stats *out)
 {
 	ipc_stats_get(out);
@@ -52,6 +65,79 @@ void z_impl_sof_shell_clock_status_get(struct sof_shell_clock_status *out)
 		out->freq_hz[i] = clocks[i].freqs[clocks[i].current_freq_idx].freq;
 }
 
+#if CONFIG_SOF_SHELL_SCHED_INFO
+static void sof_shell_sched_cb(struct task *task, void *_ctx)
+{
+	struct sof_shell_sched_snapshot *out = _ctx;
+	struct sof_shell_sched_task *e;
+
+	if (out->count >= SOF_SHELL_SCHED_MAX_TASKS)
+		return;
+
+	e = &out->tasks[out->count++];
+	e->sch_type = task->sch ? task->sch->type : 0;
+	e->core = task->core;
+	e->priority = task->priority;
+	e->state = task->state;
+	e->flags = task->flags;
+	e->cycles_cnt = task->cycles_cnt;
+	e->cycles_sum = task->cycles_sum;
+	e->cycles_max = task->cycles_max;
+	e->uid = (uintptr_t)task->uid;
+	e->data = (uintptr_t)task->data;
+}
+
+void z_impl_sof_shell_sched_snapshot_get(struct sof_shell_sched_snapshot *out)
+{
+	struct schedulers *schedulers = *arch_schedulers_get();
+	struct schedule_data *sch;
+	struct list_item *slist;
+
+	out->count = 0;
+	out->no_schedulers = 0;
+
+	if (!schedulers) {
+		out->no_schedulers = 1;
+		return;
+	}
+
+	list_for_item(slist, &schedulers->list) {
+		sch = container_of(slist, struct schedule_data, list);
+		if (!sch->ops->scheduler_dump_tasks)
+			continue;
+		sch->ops->scheduler_dump_tasks(sch->data, sof_shell_sched_cb, out);
+	}
+}
+#endif /* CONFIG_SOF_SHELL_SCHED_INFO */
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+void z_impl_sof_shell_log_status_get(struct sof_shell_log_status *out)
+{
+	int n = log_backend_count_get();
+	int i;
+
+	out->backend_count = n;
+	out->source_count = log_src_cnt_get(Z_LOG_LOCAL_DOMAIN_ID);
+	out->filled = 0;
+
+	for (i = 0; i < n && out->filled < SOF_SHELL_LOG_MAX_BACKENDS; i++) {
+		const struct log_backend *be = log_backend_get(i);
+		struct sof_shell_log_backend *e;
+		const char *name;
+
+		if (!be)
+			continue;
+
+		e = &out->backends[out->filled++];
+		e->id = log_backend_id_get(be);
+		e->active = log_backend_is_active(be) ? 1 : 0;
+		name = be->name ? be->name : "?";
+		strncpy(e->name, name, SOF_SHELL_LOG_NAME_MAX - 1);
+		e->name[SOF_SHELL_LOG_NAME_MAX - 1] = '\0';
+	}
+}
+#endif /* CONFIG_SOF_SHELL_LOG_INFO */
+
 #ifdef CONFIG_USERSPACE
 #include <zephyr/internal/syscall_handler.h>
 
@@ -81,4 +167,22 @@ void z_vrfy_sof_shell_clock_status_get(struct sof_shell_clock_status *out)
 	z_impl_sof_shell_clock_status_get(out);
 }
 #include <zephyr/syscalls/sof_shell_clock_status_get_mrsh.c>
+
+#if CONFIG_SOF_SHELL_SCHED_INFO
+void z_vrfy_sof_shell_sched_snapshot_get(struct sof_shell_sched_snapshot *out)
+{
+	K_OOPS(K_SYSCALL_MEMORY_WRITE(out, sizeof(*out)));
+	z_impl_sof_shell_sched_snapshot_get(out);
+}
+#include <zephyr/syscalls/sof_shell_sched_snapshot_get_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_SCHED_INFO */
+
+#if CONFIG_SOF_SHELL_LOG_INFO
+void z_vrfy_sof_shell_log_status_get(struct sof_shell_log_status *out)
+{
+	K_OOPS(K_SYSCALL_MEMORY_WRITE(out, sizeof(*out)));
+	z_impl_sof_shell_log_status_get(out);
+}
+#include <zephyr/syscalls/sof_shell_log_status_get_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_LOG_INFO */
 #endif /* CONFIG_USERSPACE */
