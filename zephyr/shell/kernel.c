@@ -778,69 +778,38 @@ __cold static int cmd_sof_llext_list(const struct shell *sh,
 	ARG_UNUSED(argv);
 
 #if CONFIG_LIBRARY_MANAGER
-	struct ext_library *ext_lib = ext_lib_get();
-	int found = 0;
-	int lib_id;
+	static struct sof_shell_llext_list list;
+	uint32_t l;
+
+	sof_shell_llext_list_get(&list);
 
 	shell_print(sh, "llext libs in IMR/DRAM:");
 
-	for (lib_id = 1; lib_id < LIB_MANAGER_MAX_LIBS; lib_id++) {
-		const struct lib_manager_mod_ctx *ctx = ext_lib->desc[lib_id];
-		const struct sof_man_fw_desc *desc;
-		uint32_t store_bytes;
-
-		if (!ctx || !ctx->base_addr)
-			continue;
-
-		desc = (const struct sof_man_fw_desc *)
-			((const uint8_t *)ctx->base_addr + SOF_MAN_ELF_TEXT_OFFSET);
-		store_bytes = desc->header.preload_page_count *
-			      (uint32_t)_SHELL_MOD_PAGE_SZ;
-
-		shell_print(sh, "[%d] base=%p  size=%u B  manifest_mods=%u  elf_files=%u",
-			    lib_id, ctx->base_addr, store_bytes,
-			    desc->header.num_module_entries,
-			    ctx->n_mod);
-
-#if CONFIG_LLEXT
-		if (ctx->mod) {
-			unsigned int i;
-
-			for (i = 0; i < ctx->n_mod; i++) {
-				const struct lib_manager_module *m = ctx->mod + i;
-				int use = m->llext ? (int)m->llext->use_count : 0;
-				char name[SOF_MAN_MOD_NAME_LEN + 1];
-				const uint8_t *nm;
-
-				if (m->mod_manifest) {
-					nm = m->mod_manifest->module.name;
-				} else {
-					const struct sof_man_module *mm =
-						(const struct sof_man_module *)
-						((const uint8_t *)desc +
-						 SOF_MAN_MODULE_OFFSET(m->start_idx));
-					nm = mm->name;
-				}
-				memcpy(name, nm, SOF_MAN_MOD_NAME_LEN);
-				name[SOF_MAN_MOD_NAME_LEN] = '\0';
-
-				shell_print(sh,
-					    "    [%d:%u] %-8s"
-					    "  DRAM=yes  SRAM=%-3s"
-					    "  use=%-2d  dep=%u",
-					    lib_id, i, name,
-					    m->mapped ? "yes" : "no",
-					    use,
-					    m->n_dependent);
-			}
-		}
-#endif /* CONFIG_LLEXT */
-
-		found++;
+	if (!list.count) {
+		shell_print(sh, "  (none)");
+		return 0;
 	}
 
-	if (!found)
-		shell_print(sh, "  (none)");
+	for (l = 0; l < list.count; l++) {
+		const struct sof_shell_llext_lib *lib = &list.libs[l];
+		uint32_t i;
+
+		shell_print(sh, "[%u] base=0x%08x  size=%u B  manifest_mods=%u  elf_files=%u",
+			    lib->lib_id, lib->base_addr, lib->store_bytes,
+			    lib->manifest_mods, lib->elf_files);
+
+		for (i = 0; i < lib->mod_count; i++) {
+			const struct sof_shell_llext_mod *m = &lib->mods[i];
+
+			shell_print(sh,
+				    "    [%u:%u] %-8s"
+				    "  DRAM=yes  SRAM=%-3s"
+				    "  use=%-2d  dep=%u",
+				    lib->lib_id, i, m->name,
+				    m->mapped ? "yes" : "no",
+				    m->use, m->dep);
+		}
+	}
 #else
 	shell_print(sh, "Library manager not enabled.");
 #endif /* CONFIG_LIBRARY_MANAGER */
@@ -876,7 +845,7 @@ __cold static int cmd_sof_llext_purge(const struct shell *sh,
 		return -EINVAL;
 	}
 
-	ret = lib_manager_purge_library((uint32_t)lib_id);
+	ret = sof_shell_llext_purge((uint32_t)lib_id);
 	switch (ret) {
 	case 0:
 		shell_print(sh, "llext_purge: lib %ld freed OK", lib_id);
@@ -930,79 +899,34 @@ __cold static int cmd_sof_llext_ctor_dtor(const struct shell *sh,
 					  bool is_ctor)
 {
 #if CONFIG_LIBRARY_MANAGER
-	struct ext_library *ext_lib = ext_lib_get();
+	static struct sof_shell_llext_op_result res;
 	const char *cmd = is_ctor ? "llext_ctor" : "llext_dtor";
 	long lib_id;
-	unsigned int i;
-	int ret = 0;
+	uint32_t i;
+	int ret;
 
 	ARG_UNUSED(argc);
 
 	if (parse_long(sh, argv[1], &lib_id, 1, LIB_MANAGER_MAX_LIBS - 1) < 0)
 		return -EINVAL;
 
-	{
-		struct lib_manager_mod_ctx *ctx = ext_lib->desc[(uint32_t)lib_id];
+	ret = sof_shell_llext_ctor_dtor((uint32_t)lib_id, is_ctor ? 1 : 0, &res);
 
-		if (!ctx || !ctx->base_addr || !ctx->mod) {
-			shell_error(sh, "%s: lib %ld not loaded", cmd, lib_id);
-			return -ENOENT;
-		}
+	if (res.status == -ENOENT && res.count == 0) {
+		shell_error(sh, "%s: lib %ld not loaded", cmd, lib_id);
+		return -ENOENT;
+	}
 
-		for (i = 0; i < ctx->n_mod; i++) {
-			struct lib_manager_module *m = &ctx->mod[i];
-			uint32_t module_id = ((uint32_t)lib_id << LIB_MANAGER_LIB_ID_SHIFT) |
-					     m->start_idx;
-			const char *name = "?";
+	for (i = 0; i < res.count; i++) {
+		const struct sof_shell_llext_op_mod *m = &res.mods[i];
+		const char *name = m->name[0] ? m->name : "?";
 
-			if (is_ctor) {
-				struct comp_ipc_config fake_ipc = { .id = module_id };
-				uintptr_t entry = llext_manager_allocate_module(&fake_ipc, NULL);
-
-				if (!entry) {
-					shell_error(sh, "%s: lib %ld mod %u: allocate failed",
-						    cmd, lib_id, i);
-					return -ENOMEM;
-				}
-
-				if (!m->llext) {
-					shell_error(sh, "%s: lib %ld mod %u: no llext handle",
-						    cmd, lib_id, i);
-					return -ENODEV;
-				}
-
-				if (m->llext->name[0])
-					name = m->llext->name;
-
-				ret = llext_bringup(m->llext);
-			} else {
-				if (!m->llext) {
-					shell_error(sh, "%s: lib %ld mod %u: not allocated",
-						    cmd, lib_id, i);
-					return -ENODEV;
-				}
-
-				if (m->llext->name[0])
-					name = m->llext->name;
-
-				ret = llext_teardown(m->llext);
-				if (ret < 0) {
-					shell_error(sh, "%s: lib %ld mod %u (%s): teardown failed %d",
-						    cmd, lib_id, i, name, ret);
-					return ret;
-				}
-
-				ret = llext_manager_free_module(module_id);
-			}
-
-			if (ret < 0) {
-				shell_error(sh, "%s: lib %ld mod %u (%s): failed %d",
-					    cmd, lib_id, i, name, ret);
-				return ret;
-			}
-
-			shell_print(sh, "%s: lib %ld mod %u (%s): OK", cmd, lib_id, i, name);
-		}
+		if (m->ret < 0)
+			shell_error(sh, "%s: lib %ld mod %u (%s): failed %d",
+				    cmd, lib_id, i, name, m->ret);
+		else
+			shell_print(sh, "%s: lib %ld mod %u (%s): OK",
+				    cmd, lib_id, i, name);
 	}
 
 	return ret;
@@ -1041,100 +965,44 @@ __cold static int cmd_sof_llext_call(const struct shell *sh,
 				     size_t argc, char *argv[])
 {
 #if CONFIG_LIBRARY_MANAGER
-	struct ext_library *ext_lib = ext_lib_get();
+	static struct sof_shell_llext_op_result res;
 	const char *sym_name = argv[2];
 	long lib_id;
-	unsigned int i;
-	int found = 0;
+	uint32_t i;
+	int ret;
 
 	ARG_UNUSED(argc);
 
 	if (parse_long(sh, argv[1], &lib_id, 1, LIB_MANAGER_MAX_LIBS - 1) < 0)
 		return -EINVAL;
 
-	{
-		struct lib_manager_mod_ctx *ctx = ext_lib->desc[(uint32_t)lib_id];
+	ret = sof_shell_llext_call((uint32_t)lib_id, sym_name, &res);
 
-		if (!ctx || !ctx->base_addr || !ctx->mod) {
-			shell_error(sh, "llext_call: lib %ld not loaded", lib_id);
-			return -ENOENT;
-		}
+	if (res.status == -ENOENT && res.count == 0) {
+		shell_error(sh, "llext_call: lib %ld not loaded", lib_id);
+		return -ENOENT;
+	}
 
-		for (i = 0; i < ctx->n_mod; i++) {
-			struct lib_manager_module *m = &ctx->mod[i];
-			const char *name = m->llext && m->llext->name[0] ? m->llext->name : "?";
-			const void *fn_addr = NULL;
+	for (i = 0; i < res.count; i++) {
+		const struct sof_shell_llext_op_mod *m = &res.mods[i];
+		const char *name = m->name[0] ? m->name : "?";
 
-			if (!m->llext) {
-				shell_print(sh,
-					    "llext_call: lib %ld mod %u: not allocated - run 'sof llext ctor %ld' first",
-					    lib_id, i, lib_id);
-				continue;
-			}
-
-			fn_addr = llext_find_sym(&m->llext->sym_tab, sym_name);
-			if (!fn_addr)
-				fn_addr = llext_find_sym(&m->llext->exp_tab, sym_name);
-
-			/*
-			 * Fallback to the raw ELF symbol table in the persistent DRAM buffer.
-			 * This covers cases where sym_tab was freed or exp_tab metadata is
-			 * insufficient for the symbol we want to call directly.
-			 */
-			if (!fn_addr && m->ebl) {
-				const struct llext_loader *raw_ldr = &m->ebl->loader;
-				const elf_shdr_t *symtab_hdr = &raw_ldr->sects[LLEXT_MEM_SYMTAB];
-				const elf_shdr_t *strtab_hdr = &raw_ldr->sects[LLEXT_MEM_STRTAB];
-
-				if (symtab_hdr->sh_size && strtab_hdr->sh_size) {
-					const elf_sym_t *syms = (const elf_sym_t *)
-						(m->ebl->buf + symtab_hdr->sh_offset);
-					const char *strs = (const char *)
-						(m->ebl->buf + strtab_hdr->sh_offset);
-					uint32_t sym_cnt =
-						symtab_hdr->sh_size / sizeof(elf_sym_t);
-
-					for (uint32_t k = 0; k < sym_cnt; k++) {
-						uint16_t shndx;
-						const elf_shdr_t *sect;
-
-						if (ELF_ST_TYPE(syms[k].st_info) != STT_FUNC)
-							continue;
-						if (strcmp(strs + syms[k].st_name, sym_name) != 0)
-							continue;
-
-						shndx = syms[k].st_shndx;
-						if (shndx >= m->llext->sect_cnt)
-							break;
-
-						sect = m->llext->sect_hdrs + shndx;
-						fn_addr = (const void *)(m->ebl->buf + sect->sh_offset +
-								 syms[k].st_value);
-						break;
-					}
-				}
-			}
-
-			if (!fn_addr) {
-				shell_print(sh,
-					    "llext_call: lib %ld mod %u (%s): symbol '%s' not found",
-					    lib_id, i, name, sym_name);
-				continue;
-			}
-
+		if (m->ret == -ENODEV) {
 			shell_print(sh,
-				    "llext_call: lib %ld mod %u (%s) sym %s @ %p: calling...",
-				    lib_id, i, name, sym_name, fn_addr);
-
-			((void (*)(void))fn_addr)();
-
-			found++;
-			shell_print(sh, "llext_call: lib %ld mod %u (%s) sym %s: done",
+				    "llext_call: lib %ld mod %u: not allocated - run 'sof llext ctor %ld' first",
+				    lib_id, i, lib_id);
+		} else if (m->flag) {
+			shell_print(sh,
+				    "llext_call: lib %ld mod %u (%s) sym %s @ 0x%lx: done",
+				    lib_id, i, name, sym_name, m->addr);
+		} else {
+			shell_print(sh,
+				    "llext_call: lib %ld mod %u (%s): symbol '%s' not found",
 				    lib_id, i, name, sym_name);
 		}
 	}
 
-	return found ? 0 : -ENOENT;
+	return ret;
 #else
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);

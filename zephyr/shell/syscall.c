@@ -31,6 +31,31 @@
 #include <string.h>
 #endif
 
+#if (CONFIG_SOF_SHELL_LLEXT_LIST || CONFIG_SOF_SHELL_LLEXT_PURGE || \
+     CONFIG_SOF_SHELL_LLEXT_CTOR || CONFIG_SOF_SHELL_LLEXT_CALL) && \
+    CONFIG_LIBRARY_MANAGER
+#include <sof/lib_manager.h>
+#include <sof/audio/component.h>
+#include <string.h>
+#ifndef _SHELL_MOD_PAGE_SZ
+#ifdef CONFIG_MM_DRV_PAGE_SIZE
+#define _SHELL_MOD_PAGE_SZ CONFIG_MM_DRV_PAGE_SIZE
+#else
+#define _SHELL_MOD_PAGE_SZ 4096
+#endif
+#endif
+#endif
+
+#if (CONFIG_SOF_SHELL_LLEXT_CTOR || CONFIG_SOF_SHELL_LLEXT_CALL) && \
+    CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+#include <zephyr/llext/llext.h>
+#include <sof/llext_manager.h>
+#endif
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+#include <zephyr/llext/buf_loader.h>
+#endif
+
 #if CONFIG_SOF_SHELL_MMU_DBG && CONFIG_MM_DRV_INTEL_ADSP_MTL_TLB
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel/mm.h>
@@ -258,6 +283,257 @@ void z_impl_sof_shell_inject_sched_gap(uint32_t block_time_us)
 	domain_unblock(domain);
 }
 
+#if CONFIG_SOF_SHELL_LLEXT_LIST && CONFIG_LIBRARY_MANAGER
+void z_impl_sof_shell_llext_list_get(struct sof_shell_llext_list *out)
+{
+	struct ext_library *ext_lib = ext_lib_get();
+	int lib_id;
+
+	out->enabled = 1;
+	out->count = 0;
+
+	for (lib_id = 1; lib_id < LIB_MANAGER_MAX_LIBS &&
+	     out->count < SOF_SHELL_LLEXT_MAX_LIBS; lib_id++) {
+		const struct lib_manager_mod_ctx *ctx = ext_lib->desc[lib_id];
+		const struct sof_man_fw_desc *desc;
+		struct sof_shell_llext_lib *lib;
+
+		if (!ctx || !ctx->base_addr)
+			continue;
+
+		desc = (const struct sof_man_fw_desc *)
+			((const uint8_t *)ctx->base_addr + SOF_MAN_ELF_TEXT_OFFSET);
+
+		lib = &out->libs[out->count++];
+		lib->lib_id = lib_id;
+		lib->base_addr = (uint32_t)(uintptr_t)ctx->base_addr;
+		lib->store_bytes = desc->header.preload_page_count *
+				   (uint32_t)_SHELL_MOD_PAGE_SZ;
+		lib->manifest_mods = desc->header.num_module_entries;
+		lib->elf_files = ctx->n_mod;
+		lib->mod_count = 0;
+
+#if CONFIG_LLEXT
+		if (ctx->mod) {
+			unsigned int i;
+
+			for (i = 0; i < ctx->n_mod &&
+			     lib->mod_count < SOF_SHELL_LLEXT_MAX_MODS; i++) {
+				const struct lib_manager_module *m = ctx->mod + i;
+				struct sof_shell_llext_mod *me =
+					&lib->mods[lib->mod_count++];
+				const uint8_t *nm;
+
+				me->mapped = m->mapped ? 1 : 0;
+				me->use = m->llext ? (int)m->llext->use_count : 0;
+				me->dep = m->n_dependent;
+
+				if (m->mod_manifest) {
+					nm = m->mod_manifest->module.name;
+				} else {
+					const struct sof_man_module *mm =
+						(const struct sof_man_module *)
+						((const uint8_t *)desc +
+						 SOF_MAN_MODULE_OFFSET(m->start_idx));
+					nm = mm->name;
+				}
+				memcpy(me->name, nm, SOF_MAN_MOD_NAME_LEN);
+				me->name[SOF_MAN_MOD_NAME_LEN] = '\0';
+			}
+		}
+#endif /* CONFIG_LLEXT */
+	}
+}
+#endif /* CONFIG_SOF_SHELL_LLEXT_LIST && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_PURGE && CONFIG_LIBRARY_MANAGER
+int z_impl_sof_shell_llext_purge(uint32_t lib_id)
+{
+	return lib_manager_purge_library(lib_id);
+}
+#endif /* CONFIG_SOF_SHELL_LLEXT_PURGE && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+int z_impl_sof_shell_llext_ctor_dtor(uint32_t lib_id, uint32_t is_ctor,
+				     struct sof_shell_llext_op_result *out)
+{
+	struct ext_library *ext_lib = ext_lib_get();
+	struct lib_manager_mod_ctx *ctx = ext_lib->desc[lib_id];
+	unsigned int i;
+	int ret = 0;
+
+	out->status = 0;
+	out->count = 0;
+
+	if (!ctx || !ctx->base_addr || !ctx->mod) {
+		out->status = -ENOENT;
+		return -ENOENT;
+	}
+
+	for (i = 0; i < ctx->n_mod && out->count < SOF_SHELL_LLEXT_MAX_MODS; i++) {
+		struct lib_manager_module *m = &ctx->mod[i];
+		uint32_t module_id = (lib_id << LIB_MANAGER_LIB_ID_SHIFT) | m->start_idx;
+		struct sof_shell_llext_op_mod *me = &out->mods[out->count++];
+
+		me->flag = 0;
+		me->addr = 0;
+		me->name[0] = '\0';
+
+		if (is_ctor) {
+			struct comp_ipc_config fake_ipc = { .id = module_id };
+			uintptr_t entry = llext_manager_allocate_module(&fake_ipc, NULL);
+
+			if (!entry) {
+				me->ret = -ENOMEM;
+				out->status = -ENOMEM;
+				return -ENOMEM;
+			}
+
+			if (!m->llext) {
+				me->ret = -ENODEV;
+				out->status = -ENODEV;
+				return -ENODEV;
+			}
+
+			if (m->llext->name[0]) {
+				strncpy(me->name, m->llext->name,
+					SOF_SHELL_LLEXT_NAME_MAX - 1);
+				me->name[SOF_SHELL_LLEXT_NAME_MAX - 1] = '\0';
+			}
+
+			ret = llext_bringup(m->llext);
+		} else {
+			if (!m->llext) {
+				me->ret = -ENODEV;
+				out->status = -ENODEV;
+				return -ENODEV;
+			}
+
+			if (m->llext->name[0]) {
+				strncpy(me->name, m->llext->name,
+					SOF_SHELL_LLEXT_NAME_MAX - 1);
+				me->name[SOF_SHELL_LLEXT_NAME_MAX - 1] = '\0';
+			}
+
+			ret = llext_teardown(m->llext);
+			if (ret < 0) {
+				me->ret = ret;
+				out->status = ret;
+				return ret;
+			}
+
+			ret = llext_manager_free_module(module_id);
+		}
+
+		me->ret = ret;
+		if (ret < 0) {
+			out->status = ret;
+			return ret;
+		}
+	}
+
+	return ret;
+}
+#endif /* CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+int z_impl_sof_shell_llext_call(uint32_t lib_id, const char *sym_name,
+				struct sof_shell_llext_op_result *out)
+{
+	struct ext_library *ext_lib = ext_lib_get();
+	struct lib_manager_mod_ctx *ctx = ext_lib->desc[lib_id];
+	unsigned int i;
+	int found = 0;
+
+	out->status = 0;
+	out->count = 0;
+
+	if (!ctx || !ctx->base_addr || !ctx->mod) {
+		out->status = -ENOENT;
+		return -ENOENT;
+	}
+
+	for (i = 0; i < ctx->n_mod && out->count < SOF_SHELL_LLEXT_MAX_MODS; i++) {
+		struct lib_manager_module *m = &ctx->mod[i];
+		struct sof_shell_llext_op_mod *me = &out->mods[out->count++];
+		const void *fn_addr = NULL;
+
+		me->ret = 0;
+		me->flag = 0;
+		me->addr = 0;
+		me->name[0] = '\0';
+
+		if (!m->llext) {
+			me->ret = -ENODEV;
+			continue;
+		}
+
+		if (m->llext->name[0]) {
+			strncpy(me->name, m->llext->name, SOF_SHELL_LLEXT_NAME_MAX - 1);
+			me->name[SOF_SHELL_LLEXT_NAME_MAX - 1] = '\0';
+		}
+
+		fn_addr = llext_find_sym(&m->llext->sym_tab, sym_name);
+		if (!fn_addr)
+			fn_addr = llext_find_sym(&m->llext->exp_tab, sym_name);
+
+		/*
+		 * Fallback to the raw ELF symbol table in the persistent DRAM
+		 * buffer (covers cases where sym_tab was freed or exp_tab
+		 * metadata is insufficient).
+		 */
+		if (!fn_addr && m->ebl) {
+			const struct llext_loader *raw_ldr = &m->ebl->loader;
+			const elf_shdr_t *symtab_hdr = &raw_ldr->sects[LLEXT_MEM_SYMTAB];
+			const elf_shdr_t *strtab_hdr = &raw_ldr->sects[LLEXT_MEM_STRTAB];
+
+			if (symtab_hdr->sh_size && strtab_hdr->sh_size) {
+				const elf_sym_t *syms = (const elf_sym_t *)
+					(m->ebl->buf + symtab_hdr->sh_offset);
+				const char *strs = (const char *)
+					(m->ebl->buf + strtab_hdr->sh_offset);
+				uint32_t sym_cnt = symtab_hdr->sh_size / sizeof(elf_sym_t);
+				uint32_t k;
+
+				for (k = 0; k < sym_cnt; k++) {
+					uint16_t shndx;
+					const elf_shdr_t *sect;
+
+					if (ELF_ST_TYPE(syms[k].st_info) != STT_FUNC)
+						continue;
+					if (strcmp(strs + syms[k].st_name, sym_name) != 0)
+						continue;
+
+					shndx = syms[k].st_shndx;
+					if (shndx >= m->llext->sect_cnt)
+						break;
+
+					sect = m->llext->sect_hdrs + shndx;
+					fn_addr = (const void *)(m->ebl->buf +
+						sect->sh_offset + syms[k].st_value);
+					break;
+				}
+			}
+		}
+
+		if (!fn_addr) {
+			me->ret = -ENOENT;
+			continue;
+		}
+
+		me->flag = 1;
+		me->addr = (uintptr_t)fn_addr;
+
+		((void (*)(void))fn_addr)();
+
+		found++;
+	}
+
+	out->status = found ? 0 : -ENOENT;
+	return out->status;
+}
+#endif /* CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER */
+
 #ifdef CONFIG_USERSPACE
 #include <zephyr/internal/syscall_handler.h>
 
@@ -353,4 +629,54 @@ void z_vrfy_sof_shell_inject_sched_gap(uint32_t block_time_us)
 	z_impl_sof_shell_inject_sched_gap(block_time_us);
 }
 #include <zephyr/syscalls/sof_shell_inject_sched_gap_mrsh.c>
+
+#if CONFIG_SOF_SHELL_LLEXT_LIST && CONFIG_LIBRARY_MANAGER
+void z_vrfy_sof_shell_llext_list_get(struct sof_shell_llext_list *out)
+{
+	K_OOPS(K_SYSCALL_MEMORY_WRITE(out, sizeof(*out)));
+	z_impl_sof_shell_llext_list_get(out);
+}
+#include <zephyr/syscalls/sof_shell_llext_list_get_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_LLEXT_LIST && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_PURGE && CONFIG_LIBRARY_MANAGER
+int z_vrfy_sof_shell_llext_purge(uint32_t lib_id)
+{
+	K_OOPS(K_SYSCALL_VERIFY_MSG(lib_id >= 1 && lib_id < LIB_MANAGER_MAX_LIBS,
+				   "invalid lib_id"));
+	return z_impl_sof_shell_llext_purge(lib_id);
+}
+#include <zephyr/syscalls/sof_shell_llext_purge_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_LLEXT_PURGE && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+int z_vrfy_sof_shell_llext_ctor_dtor(uint32_t lib_id, uint32_t is_ctor,
+				     struct sof_shell_llext_op_result *out)
+{
+	K_OOPS(K_SYSCALL_VERIFY_MSG(lib_id >= 1 && lib_id < LIB_MANAGER_MAX_LIBS,
+				   "invalid lib_id"));
+	K_OOPS(K_SYSCALL_MEMORY_WRITE(out, sizeof(*out)));
+	return z_impl_sof_shell_llext_ctor_dtor(lib_id, is_ctor, out);
+}
+#include <zephyr/syscalls/sof_shell_llext_ctor_dtor_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_LLEXT_CTOR && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER */
+
+#if CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER
+int z_vrfy_sof_shell_llext_call(uint32_t lib_id, const char *sym_name,
+				struct sof_shell_llext_op_result *out)
+{
+	char kname[SOF_SHELL_LLEXT_SYM_MAX];
+	int len;
+
+	K_OOPS(K_SYSCALL_VERIFY_MSG(lib_id >= 1 && lib_id < LIB_MANAGER_MAX_LIBS,
+				   "invalid lib_id"));
+	K_OOPS(K_SYSCALL_MEMORY_WRITE(out, sizeof(*out)));
+
+	len = k_usermode_string_copy(kname, (char *)sym_name, sizeof(kname));
+	K_OOPS(K_SYSCALL_VERIFY_MSG(len == 0, "symbol name too long or invalid"));
+
+	return z_impl_sof_shell_llext_call(lib_id, kname, out);
+}
+#include <zephyr/syscalls/sof_shell_llext_call_mrsh.c>
+#endif /* CONFIG_SOF_SHELL_LLEXT_CALL && CONFIG_LLEXT && CONFIG_LIBRARY_MANAGER */
 #endif /* CONFIG_USERSPACE */

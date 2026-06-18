@@ -114,6 +114,56 @@ struct sof_shell_tlb_meta {
 	struct sof_shell_mm_region regions[SOF_SHELL_TLB_MAX_REGIONS];
 };
 
+/** \brief Maximum llext libraries captured in one snapshot. */
+#define SOF_SHELL_LLEXT_MAX_LIBS 16
+/** \brief Maximum module files captured per library. */
+#define SOF_SHELL_LLEXT_MAX_MODS 8
+/** \brief Maximum stored length (including NUL) of a module name. */
+#define SOF_SHELL_LLEXT_NAME_MAX 32
+/** \brief Maximum length (including NUL) of a symbol name passed to llext_call. */
+#define SOF_SHELL_LLEXT_SYM_MAX 64
+
+/** \brief Per-module-file entry for "sof llext_list". */
+struct sof_shell_llext_mod {
+	uint32_t mapped;		/* 1 if mapped in SRAM */
+	int32_t  use;			/* llext use count */
+	uint32_t dep;			/* number of dependents */
+	char name[SOF_SHELL_LLEXT_NAME_MAX];
+};
+
+/** \brief Per-library entry for "sof llext_list". */
+struct sof_shell_llext_lib {
+	uint32_t lib_id;
+	uint32_t base_addr;
+	uint32_t store_bytes;
+	uint32_t manifest_mods;		/* num_module_entries from the manifest */
+	uint32_t elf_files;		/* n_mod */
+	uint32_t mod_count;		/* valid entries in mods[] */
+	struct sof_shell_llext_mod mods[SOF_SHELL_LLEXT_MAX_MODS];
+};
+
+/** \brief Snapshot of the llext libraries held in IMR/DRAM. */
+struct sof_shell_llext_list {
+	uint32_t enabled;		/* 1 if the library manager is available */
+	uint32_t count;			/* valid entries in libs[] */
+	struct sof_shell_llext_lib libs[SOF_SHELL_LLEXT_MAX_LIBS];
+};
+
+/** \brief Per-module result of a ctor/dtor/call operation. */
+struct sof_shell_llext_op_mod {
+	int32_t  ret;			/* per-module result code */
+	uint32_t flag;			/* op-specific: ctor/dtor unused; call: symbol found */
+	uintptr_t addr;			/* op-specific: call: resolved symbol address */
+	char name[SOF_SHELL_LLEXT_NAME_MAX];
+};
+
+/** \brief Result of "sof llext_ctor/dtor" or "sof llext_call". */
+struct sof_shell_llext_op_result {
+	int32_t  status;		/* overall status: 0, -ENOENT, -ENOSYS, or first error */
+	uint32_t count;			/* valid entries in mods[] */
+	struct sof_shell_llext_op_mod mods[SOF_SHELL_LLEXT_MAX_MODS];
+};
+
 /** \brief Copy the current IPC statistics snapshot (wraps ipc_stats_get()). */
 __syscall void sof_shell_ipc_stats_get(struct ipc_stats *out);
 
@@ -157,6 +207,26 @@ __syscall void sof_shell_core_disable(uint32_t id);
 /** \brief Block audio scheduling for \p block_time_us microseconds. */
 __syscall void sof_shell_inject_sched_gap(uint32_t block_time_us);
 
+/** \brief Copy a snapshot of the llext libraries held in IMR/DRAM. */
+__syscall void sof_shell_llext_list_get(struct sof_shell_llext_list *out);
+
+/** \brief Purge an llext library from IMR/DRAM. \return 0 on success. */
+__syscall int sof_shell_llext_purge(uint32_t lib_id);
+
+/**
+ * \brief Run constructors (is_ctor=1) or destructors (is_ctor=0) for every
+ *        module in a library, capturing per-module results.
+ */
+__syscall int sof_shell_llext_ctor_dtor(uint32_t lib_id, uint32_t is_ctor,
+					struct sof_shell_llext_op_result *out);
+
+/**
+ * \brief Find a named symbol in every module of a library and invoke it as a
+ *        void(*)(void), capturing per-module results.
+ */
+__syscall int sof_shell_llext_call(uint32_t lib_id, const char *sym_name,
+				   struct sof_shell_llext_op_result *out);
+
 #else /* !__ZEPHYR__ || !CONFIG_SOF_FULL_ZEPHYR_APPLICATION */
 
 struct sof_shell_core_status;
@@ -178,6 +248,14 @@ int z_impl_sof_shell_core_is_enabled(uint32_t id);
 int z_impl_sof_shell_core_enable(uint32_t id);
 void z_impl_sof_shell_core_disable(uint32_t id);
 void z_impl_sof_shell_inject_sched_gap(uint32_t block_time_us);
+struct sof_shell_llext_list;
+struct sof_shell_llext_op_result;
+void z_impl_sof_shell_llext_list_get(struct sof_shell_llext_list *out);
+int z_impl_sof_shell_llext_purge(uint32_t lib_id);
+int z_impl_sof_shell_llext_ctor_dtor(uint32_t lib_id, uint32_t is_ctor,
+				     struct sof_shell_llext_op_result *out);
+int z_impl_sof_shell_llext_call(uint32_t lib_id, const char *sym_name,
+				struct sof_shell_llext_op_result *out);
 #define sof_shell_ipc_stats_get z_impl_sof_shell_ipc_stats_get
 #define sof_shell_ipc_stats_reset z_impl_sof_shell_ipc_stats_reset
 #define sof_shell_core_status_get z_impl_sof_shell_core_status_get
@@ -190,6 +268,10 @@ void z_impl_sof_shell_inject_sched_gap(uint32_t block_time_us);
 #define sof_shell_core_enable z_impl_sof_shell_core_enable
 #define sof_shell_core_disable z_impl_sof_shell_core_disable
 #define sof_shell_inject_sched_gap z_impl_sof_shell_inject_sched_gap
+#define sof_shell_llext_list_get z_impl_sof_shell_llext_list_get
+#define sof_shell_llext_purge z_impl_sof_shell_llext_purge
+#define sof_shell_llext_ctor_dtor z_impl_sof_shell_llext_ctor_dtor
+#define sof_shell_llext_call z_impl_sof_shell_llext_call
 
 #endif
 
