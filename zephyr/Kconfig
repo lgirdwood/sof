@@ -283,6 +283,22 @@ config SOF_ZEPHYR_NO_SOF_CLOCK
 menu "SOF shell commands"
 	depends on SHELL
 
+config SOF_SHELL_USERSPACE
+	bool "Run the SOF shell command thread in user mode"
+	depends on USERSPACE
+	help
+	  When enabled, the SOF shell command thread is intended to run as a
+	  Zephyr user-mode thread. The kernel (RTOS/infrastructure) shell
+	  commands in zephyr/shell/kernel.c reach privileged global state
+	  (IPC counters, scheduler info, ...) through system calls so that a
+	  misbehaving shell command cannot corrupt supervisor state.
+
+	  This option enables the system-call plumbing used by those commands.
+	  On supervisor-only builds (or with this option disabled) the system
+	  call wrappers compile to direct function calls with no overhead.
+
+	  If unsure, say n.
+
 config SOF_SHELL_HEAP_USAGE
 	bool "Module heap usage command"
 	default y

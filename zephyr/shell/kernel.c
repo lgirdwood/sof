@@ -23,6 +23,7 @@
 #include <sof/schedule/schedule.h>
 #include <string.h>
 #include <sof/ipc/common.h>
+#include <sof/sof_shell_syscall.h>
 #if CONFIG_SOF_SHELL_PROBE_MIRROR
 #include <sof/probe/probe.h>
 #endif
@@ -1337,12 +1338,12 @@ __cold static int cmd_sof_ipc_stats(const struct shell *sh, size_t argc, char *a
 	struct ipc_stats s;
 
 	if (argc > 1 && !strcmp(argv[1], "reset")) {
-		ipc_stats_reset();
+		sof_shell_ipc_stats_reset();
 		shell_print(sh, "ipc stats reset");
 		return 0;
 	}
 
-	ipc_stats_get(&s);
+	sof_shell_ipc_stats_get(&s);
 	shell_print(sh, "IPC statistics:");
 	shell_print(sh, "  rx_count        : %u", s.rx_count);
 	shell_print(sh, "  rx_errors       : %u", s.rx_errors);
@@ -1356,7 +1357,7 @@ __cold static int cmd_sof_ipc_last(const struct shell *sh, size_t argc, char *ar
 {
 	struct ipc_stats s;
 
-	ipc_stats_get(&s);
+	sof_shell_ipc_stats_get(&s);
 	shell_print(sh, "Last IPC RX: pri=0x%08x ext=0x%08x @ %llu cycles",
 		    s.last_rx_pri, s.last_rx_ext, (unsigned long long)s.last_rx_time);
 	shell_print(sh, "Last IPC TX: pri=0x%08x ext=0x%08x @ %llu cycles",
