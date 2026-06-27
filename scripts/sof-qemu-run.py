@@ -91,7 +91,7 @@ def main():
         print("Please ensure you have sourced the Zephyr environment (e.g., source zephyr-env.sh).")
         sys.exit(1)
 
-    child = pexpect.spawn(west_path, ["-v", "build", "-t", "run"], encoding='utf-8')
+    child = pexpect.spawn(west_path, ["-v", "build", "-d", args.build_dir, "-t", "run"], encoding='utf-8')
 
     # We will accumulate output to check for crashes
     full_output = ""
