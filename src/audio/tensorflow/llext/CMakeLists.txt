@@ -473,17 +473,32 @@ target_compile_options(tflm_lib PRIVATE
 	-Wno-shadow
 )
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-	target_include_directories(tflm_lib SYSTEM PRIVATE
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0/xtensa-intel_ace15_mtpm_zephyr-elf
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include
-	)
+# When cross-compiling for Xtensa bare-metal targets, LLVM Clang acts as the compiler
+# driver and code generator, but does not provide a standalone C++ standard library
+# (libc++) or bare-metal C runtime headers for Xtensa architectures. Consequently,
+# Clang relies on the GNU C++ standard library (libstdc++) and sysroot include/library
+# headers provided by the Zephyr SDK toolchain.
+if(NOT ZEPHYR_SDK_INSTALL_DIR AND DEFINED ENV{ZEPHYR_SDK_INSTALL_DIR})
+	set(SDK_DIR $ENV{ZEPHYR_SDK_INSTALL_DIR})
+elseif(ZEPHYR_SDK_INSTALL_DIR)
+	set(SDK_DIR ${ZEPHYR_SDK_INSTALL_DIR})
+else()
+	set(SDK_DIR "/home/lrg/zephyr-sdk-1.0.1")
 endif()
 
+if(CROSS_COMPILE_TARGET)
+	set(TARGET_TRIPLE ${CROSS_COMPILE_TARGET})
+else()
+	set(TARGET_TRIPLE "xtensa-intel_ace15_mtpm_zephyr-elf")
+endif()
 
-
-
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+	target_include_directories(tflm_lib SYSTEM PRIVATE
+		${SDK_DIR}/gnu/${TARGET_TRIPLE}/${TARGET_TRIPLE}/include/c++/14.3.0
+		${SDK_DIR}/gnu/${TARGET_TRIPLE}/${TARGET_TRIPLE}/include/c++/14.3.0/${TARGET_TRIPLE}
+		${SDK_DIR}/gnu/${TARGET_TRIPLE}/${TARGET_TRIPLE}/include
+	)
+endif()
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	target_compile_options(tflm_lib PRIVATE
@@ -492,7 +507,6 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	)
 endif()
 
-
 if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	set(TFLM_STD_LIBS c++ hal)
 	set(TFLM_LIBS_PATH .)
@@ -500,10 +514,11 @@ else()
 	set(TFLM_STD_LIBS stdc++)
 	set(TFLM_LIBS_PATH
 		.
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/lib
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/lib/gcc/xtensa-intel_ace15_mtpm_zephyr-elf/14.3.0
+		${SDK_DIR}/gnu/${TARGET_TRIPLE}/${TARGET_TRIPLE}/lib
+		${SDK_DIR}/gnu/${TARGET_TRIPLE}/lib/gcc/${TARGET_TRIPLE}/14.3.0
 	)
 endif()
+
 
 sof_llext_build("tflm"
 	SOURCES ../tflm-classify.c ../llext-wrap.c
