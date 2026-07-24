@@ -470,14 +470,20 @@ target_compile_options(tflm_lib PRIVATE
 	-DTF_LITE_MCU_DEBUG_LOG
 	-DTF_LITE_USE_CTIME
 	-DHIFI4
-	-mlongcalls
-	-DNNLIB_V2
 	-Wno-shadow
 )
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-	target_compile_options(tflm_lib PRIVATE -stdlib=libc++)
+	target_include_directories(tflm_lib SYSTEM PRIVATE
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0/xtensa-intel_ace15_mtpm_zephyr-elf
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include
+	)
 endif()
+
+
+
+
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	target_compile_options(tflm_lib PRIVATE
@@ -489,8 +495,14 @@ endif()
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	set(TFLM_STD_LIBS c++ hal)
+	set(TFLM_LIBS_PATH .)
 else()
 	set(TFLM_STD_LIBS stdc++)
+	set(TFLM_LIBS_PATH
+		.
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/lib
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/lib/gcc/xtensa-intel_ace15_mtpm_zephyr-elf/14.3.0
+	)
 endif()
 
 sof_llext_build("tflm"
@@ -502,7 +514,8 @@ sof_llext_build("tflm"
 	# TFLM is a C++ userspace application so hence we need to link
 	# userspace C++, C, maths and C runtime for llext module usage.
 	LIBS tflm_lib ${TFLM_EXTRA_LIBS} ${TFLM_STD_LIBS} m c gcc
-	LIBS_PATH .
+	LIBS_PATH ${TFLM_LIBS_PATH}
 )
+
 
 
