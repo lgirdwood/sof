@@ -12,8 +12,14 @@
 #include <sof/audio/module_adapter/module/generic.h>
 #include <sof/math/fir_hifi3.h>
 #include <user/fir.h>
+#if defined(__XCC__) && !defined(__XCC_CLANG__)
 #include <xtensa/config/defs.h>
 #include <xtensa/tie/xt_hifi3.h>
+#else
+#include <xtensa/config/core-isa.h>
+#include <xtensahifiintrin.h>
+#endif
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>

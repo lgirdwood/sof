@@ -8,9 +8,24 @@
 #ifndef __SOF_AUDIO_FORMAT_HIFI3_H__
 #define __SOF_AUDIO_FORMAT_HIFI3_H__
 
-#include <stdint.h>
+#if defined(__XCC__) && !defined(__XCC_CLANG__)
 #include <xtensa/config/defs.h>
 #include <xtensa/tie/xt_hifi3.h>
+#define HAS_HIFI_INTRINSICS 1
+#elif defined(__clang__)
+#include <xtensa/config/core-isa.h>
+#if defined(__has_include)
+#if __has_include(<xtensahifiintrin.h>)
+#include <xtensahifiintrin.h>
+#define HAS_HIFI_INTRINSICS 1
+#endif
+#endif
+#endif
+
+#if defined(HAS_HIFI_INTRINSICS)
+
+
+
 
 /* Saturation inline functions */
 
@@ -174,4 +189,11 @@ static inline ae_int32x2 vec_sat_int8x2(int32_t x, int32_t y)
 	return AE_F32X2_SRAI(AE_F32X2_SLAIS(d0, 24), 24);
 }
 
+#else
+#include "format_generic.h"
+#endif /* HAS_HIFI_INTRINSICS */
+
 #endif /* __SOF_AUDIO_FORMAT_HIFI3_H__ */
+
+
+

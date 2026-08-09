@@ -6,10 +6,23 @@
 #include <xa_type_def.h>
 #include <nnlib/xa_nnlib_standards.h>
 #include <nnlib/xa_nnlib_kernels_api.h>
+#include <sof/trace/trace.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/printk.h>
 
-extern int printk(const char *fmt, ...);
+LOG_MODULE_DECLARE(tflmcly, CONFIG_SOF_LOG_LEVEL);
+
+extern struct tr_ctx tflm_tr;
+extern void sof_ut_log(const char *msg);
+
+
+
+
+
+
 
 /* Plain C Reference implementations for verification */
+
 
 static void ref_activation_f32(float *out, const float *inp, float min_val, float max_val, int len)
 {
@@ -56,9 +69,9 @@ int test_activations_run(void)
 	 * 1. Test xa_nn_vec_activation_min_max_f32_f32 (ReLU6)
 	 * ------------------------------------------------------------- */
 	{
-		float inp_f32[8] = { -5.5f, -1.2f, 0.0f, 0.5f, 2.8f, 5.9f, 8.4f, 100.0f };
-		float out_hifi[8] = { 0 };
-		float out_ref[8] = { 0 };
+		static __attribute__((aligned(8))) float inp_f32[8] = { -5.5f, -1.2f, 0.0f, 0.5f, 2.8f, 5.9f, 8.4f, 100.0f };
+		static __attribute__((aligned(8))) float out_hifi[8] = { 0 };
+		static __attribute__((aligned(8))) float out_ref[8] = { 0 };
 		float min_f = 0.0f, max_f = 6.0f;
 		int len = 8;
 
@@ -77,7 +90,9 @@ int test_activations_run(void)
 				}
 			}
 		}
+
 		if (errors == 0) {
+			sof_ut_log("VALIDATION PASSED: xa_nn_vec_activation_min_max_f32_f32 matches plain C reference!");
 			printk("VALIDATION PASSED: xa_nn_vec_activation_min_max_f32_f32 matches plain C reference!\n");
 		}
 	}
@@ -86,9 +101,9 @@ int test_activations_run(void)
 	 * 2. Test xa_nn_vec_activation_min_max_16_16
 	 * ------------------------------------------------------------- */
 	{
-		int16_t inp_16[8] = { -500, -10, 0, 5, 20, 45, 100, 32767 };
-		int16_t out_hifi[8] = { 0 };
-		int16_t out_ref[8] = { 0 };
+		static __attribute__((aligned(8))) int16_t inp_16[8] = { -500, -10, 0, 5, 20, 45, 100, 32767 };
+		static __attribute__((aligned(8))) int16_t out_hifi[8] = { 0 };
+		static __attribute__((aligned(8))) int16_t out_ref[8] = { 0 };
 		int min_i = 0, max_i = 50;
 		int len = 8;
 
@@ -108,6 +123,7 @@ int test_activations_run(void)
 			}
 		}
 		if (errors == 0) {
+			sof_ut_log("VALIDATION PASSED: xa_nn_vec_activation_min_max_16_16 matches plain C reference!");
 			printk("VALIDATION PASSED: xa_nn_vec_activation_min_max_16_16 matches plain C reference!\n");
 		}
 	}
@@ -116,9 +132,9 @@ int test_activations_run(void)
 	 * 3. Test xa_nn_vec_activation_min_max_8_8
 	 * ------------------------------------------------------------- */
 	{
-		int8_t inp_8[8] = { -128, -50, 0, 10, 30, 45, 80, 127 };
-		int8_t out_hifi[8] = { 0 };
-		int8_t out_ref[8] = { 0 };
+		static __attribute__((aligned(8))) int8_t inp_8[8] = { -128, -50, 0, 10, 30, 45, 80, 127 };
+		static __attribute__((aligned(8))) int8_t out_hifi[8] = { 0 };
+		static __attribute__((aligned(8))) int8_t out_ref[8] = { 0 };
 		int min_i = 0, max_i = 50;
 		int len = 8;
 
@@ -138,9 +154,12 @@ int test_activations_run(void)
 			}
 		}
 		if (errors == 0) {
+			sof_ut_log("VALIDATION PASSED: xa_nn_vec_activation_min_max_8_8 matches plain C reference!");
 			printk("VALIDATION PASSED: xa_nn_vec_activation_min_max_8_8 matches plain C reference!\n");
 		}
 	}
+
+
 
 	return errors;
 }

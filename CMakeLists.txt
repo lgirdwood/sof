@@ -2,6 +2,8 @@
 
 cmake_minimum_required(VERSION 3.13)
 
+add_compile_options(-mllvm --text-section-literals=false)
+
 if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}")
 	message(FATAL_ERROR
 		" In-source builds are not supported.\n"

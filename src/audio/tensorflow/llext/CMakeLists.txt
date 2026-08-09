@@ -10,67 +10,53 @@ set(FLATBUFFERS_PATH ${sof_top_dir}/../flatbuffers)
 set(GEMMLOWP_PATH ${sof_top_dir}/../gemmlowp)
 set(RUY_PATH ${sof_top_dir}/../ruy)
 
-if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
+if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
+
+
+
 set(TFLM_EXTRA_LIBS nn_hifi_lib)
 add_library(nn_hifi_lib STATIC
+
+
 	${NN_HIFI_PATH}/algo/common/src/xa_nnlib_common_api.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_pad_8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_stride_slice_int16.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_batch_to_space_nd_8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_transpose_8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_depth_to_space_8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_pad_16.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_stride_slice_int32.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_space_to_batch_nd_8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_pad_32.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_stride_slice_int8.c
-	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_space_to_depth_8.c
 	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_32_32.c
 	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_f32_f32.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_sym16_sym16.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_softmax_asym8_asym8.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_32_16.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_16_16.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_8_8.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_asym16_asym16.c
-	${NN_HIFI_PATH}/algo/kernels/activations/hifi4/xa_nn_activations_32_8.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_16x16_16_circ_nb.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_circ_buf.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_group_sym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_asym8xasym8_asym8_circ_nb.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_sym8sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_abs_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_add_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sub_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_div_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_neg_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_square_f32.c
+	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/nanf_tbl.c
+	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/inff_tbl.c
+	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/pow2f_tbl.c
+	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/expf_tbl.c
+
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_sym8sxasym8s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_8x8_8_circ.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_sym8sxsym16s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_sym8sxsym16s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_8x16.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_circ_buf.c
-
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_8x8.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_16x16_16_circ.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_f32.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_f32.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_f32_circ.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_circ_buf.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_sym8sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_sym8sxasym8s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_8x16_16_circ.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_sym8sxsym16s_sym16s_circ.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_sym8sxsym16s_sym16s_circ.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv1d_std_8x8.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_8x16.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym8sxsym16s.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_f32.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_f32_circ_nb.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_asym8xasym8_asym8_circ.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_sym8sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym8sxsym16s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym8sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_asym8xasym8_asym8_circ.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_sym8sxasym8s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_8x8.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_sym8sxsym16s.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_transpose_conv_sym8sxsym16s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv1d_std_8x16.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_8x8.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_sym8sxasym8s_asym8s_circ.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_sym8sxasym8s_asym8s_circ.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_pointwise_asym8xasym8.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_asym8xasym8.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv1d_std_circ_buf.c
@@ -78,125 +64,84 @@ add_library(nn_hifi_lib STATIC
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_8x16_16_circ_nb.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv1d_std_16x16.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_matXvec_8x8_8_circ_nb.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym4sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv1d_std_f32.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_sym8sxsym16s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_std_sym4sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_sym8sxsym16s.c
 	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_asym8xasym8.c
-	${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_8x16.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_f32.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_asym8xasym8_batch.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_sym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_8x8.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_8x16.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_asym4sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_sym8sxsym16s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_f32_batch.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_f32.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_16x16_batch.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_sym8sxsym16s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_asym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_16x8.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_8x16.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_8x8.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_asym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_asym8xasym8.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_8x16_batch.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_asym8xasym8.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_sym8sxasym8s.c
-	${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_8x8_batch.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_f32.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_8.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_asym8_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_f32_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_16_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_16.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_16_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_asym8.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_inv_256_tbl.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_8_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_16.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_8.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_f32_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_asym8_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_f32.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_asym8.c
-	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_8_nhwc.c
-	${NN_HIFI_PATH}/algo/kernels/norm/hifi4/xa_nn_l2_norm_asym8s.c
-	${NN_HIFI_PATH}/algo/kernels/norm/hifi4/xa_nn_l2_norm_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sqrt_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_add_quant8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_lstm_utils.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_dot_prod_16x16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sub_quant16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_round_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_acc_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_cosine_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_reduce_asym8s_asym8s.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_memset_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_floor_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_squared_diff_quant8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_add_quant16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_reduce_asym16s_asym16s.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_minmax_8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_logn_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_div_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sub_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_compare_quant8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_logical_bool.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_broadcast_8_8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_quantize.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_neg_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_quant16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_add_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_vec_interpolation_q15.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_square_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sine_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_abs_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_memmove.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_mul_quant8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_squared_diff_quant16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_memmove_16.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_sub_quant8.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_ceil_f32.c
-	${NN_HIFI_PATH}/algo/kernels/basic/hifi4/xa_nn_elm_rsqrt_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/cnn/hifi4/xa_nn_conv2d_depthwise_8x16.c
+
 	${NN_HIFI_PATH}/algo/kernels/fc/hifi4/xa_nn_fully_connected.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_tanh32x32_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/scl_sigmoidf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/inv2pif_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/nanf_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/pow2f_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_sigmoidf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_reluf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/expf_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_tanhf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_sigmoid32x32_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/lognf_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/sinf_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_cosinef_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_sinef_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_softmaxf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/scl_tanhf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_softmax32x32_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_lognf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/sqrt2f_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/inff_tbl.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_alognf_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/vec_relu32x32_hifi4.c
-	${NN_HIFI_PATH}/algo/ndsp/hifi4/src/tanhf_tbl.c
+	# ${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_sym8sxasym8s.c
+	# ${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matXvec_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/matXvec/hifi4/xa_nn_matmul_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/norm/hifi4/xa_nn_l2_norm_f32.c
+	# ${NN_HIFI_PATH}/algo/kernels/norm/hifi4/xa_nn_l2_norm_asym8s.c
+	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_avgpool_f32.c
+	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_maxpool_f32.c
+	${NN_HIFI_PATH}/algo/kernels/pool/hifi4/xa_nn_inv_256_tbl.c
+	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_transpose_8.c
+	${NN_HIFI_PATH}/algo/kernels/reorg/hifi4/xa_nn_pad_8.c
 )
 
+
+
+
+
+
+
+
+
+target_compile_definitions(nn_hifi_lib PRIVATE
+	-DHIFI4=1
+	-DHAVE_VFPU=0
+	-DHAVE_VFPU_SINGLE_PRECISION=0
+	-DXCHAL_HAVE_HIFI4=1
+	-DXCHAL_HAVE_HIFI4_VFPU=0
+
+	__xtensa__=1
+	__XTENSA__=1
+	__XCC__
+	__XCC_CLANG__
+	"XT_MAX(a,b)=((a)>(b)?(a):(b))"
+	"XT_MIN(a,b)=((a)<(b)?(a):(b))"
+	"AE_MOVINT16_FROMINT32(v)=((ae_int16)(v))"
+	"AE_CVT64F32_H(v)=((ae_int64)(int64_t)(int32_t)AE_MOVAD32_H(v))"
+	"AE_CVT64F32_L(v)=((ae_int64)(int64_t)(int32_t)AE_MOVAD32_L(v))"
+)
+
+
+
+
 target_include_directories(nn_hifi_lib PRIVATE
+
 	${NN_HIFI_PATH}/include
 	${NN_HIFI_PATH}/algo/common/include/
 	${NN_HIFI_PATH}/include/nnlib/
 	${NN_HIFI_PATH}/algo/ndsp/hifi4/include
+	${sof_top_dir}/../modules/hal/xtensa/include
+	${sof_top_dir}/../modules/hal/xtensa/zephyr/soc/intel_ace15_mtpm
+	/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include
+	/home/lrg/work/llvm-project-nnlib/build/lib/clang/24/include
 )
+
+
+if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+	target_compile_definitions(nn_hifi_lib PRIVATE
+		__XCC__
+		__XCC_CLANG__
+	)
+	target_compile_options(nn_hifi_lib PRIVATE
+		-mcpu=intel_ace15_mtpm
+		"SHELL:-include xtensahifiintrin.h"
+	)
+endif()
+
+
+
+
+
+
+
+
 
 # TODO: Need to detect and add mul16/32 options.
 #ifeq "$(has_mul16)" "0"
@@ -206,6 +151,8 @@ target_include_directories(nn_hifi_lib PRIVATE
 #CFLAGS += -mno-mul32 -mno-div32
 #endif
 target_compile_options(nn_hifi_lib PRIVATE
+	-O2
+	"SHELL:-include ${NN_HIFI_PATH}/algo/common/include/xa_nnlib_hifi_isa_compat.h"
 	-fsigned-char
 	-fno-exceptions
 	-mlongcalls
@@ -218,27 +165,31 @@ target_compile_options(nn_hifi_lib PRIVATE
 	-DTFLITE_SINGLE_ROUNDING=1
 )
 
+
+if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 target_compile_options(nn_hifi_lib PRIVATE
 	-INLINE:requested
 	-mcoproc
 	-m32
 )
+endif()
 else()
+
 set(TFLM_EXTRA_LIBS "")
 endif()
 
 
 
-if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
+if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa" OR CMAKE_C_COMPILER_ID STREQUAL "Clang")
 	set(TFLM_KERNEL_SOURCES
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/sub.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/conv_hifi.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/pooling_vision.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/softmax_vision.cc
-		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/unidirectional_sequence_lstm.cc
+		# ${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/unidirectional_sequence_lstm.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/transpose_conv.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/fully_connected_common_xtensa.cc
-		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/lstm_eval_hifi.cc
+		# ${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/lstm_eval_hifi.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/add_vision.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/depthwise_conv.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/reshape.cc
@@ -254,7 +205,7 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/softmax_int8_int16.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/logistic.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/reduce.cc
-		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/lstm_eval.cc
+		# ${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/lstm_eval.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/reshape_vision.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/pad.cc
 		${TFLM_PATH}/tensorflow/lite/micro/kernels/xtensa/reduce_vision.cc
@@ -288,6 +239,9 @@ endif()
 # All sources have been left in for completeness now, but will be removed
 # when support is mature.
 add_library(tflm_lib STATIC
+
+
+
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/core/api/error_reporter.cc
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/schema/schema_utils.cc
 	${TFLM_PATH}/tensorflow/lite/core/c/common.cc
@@ -393,7 +347,6 @@ add_library(tflm_lib STATIC
 	${TFLM_KERNEL_SOURCES}
 
 	${TFLM_PATH}/tensorflow/lite/micro/mock_micro_graph.cc
-	${TFLM_PATH}/tensorflow/lite/micro/flatbuffer_utils.cc
 	${TFLM_PATH}/tensorflow/lite/micro/micro_interpreter_graph.cc
 	${TFLM_PATH}/tensorflow/lite/micro/micro_resource_variable.cc
 	${TFLM_PATH}/tensorflow/lite/micro/micro_interpreter_context.cc
@@ -403,30 +356,10 @@ add_library(tflm_lib STATIC
 	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/non_persistent_arena_buffer_allocator.cc
 	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/single_arena_buffer_allocator.cc
 	${TFLM_PATH}/tensorflow/lite/micro/micro_allocator.cc
-	${TFLM_PATH}/tensorflow/lite/micro/tflite_bridge/flatbuffer_conversions_bridge.cc
-	${TFLM_PATH}/tensorflow/lite/micro/tflite_bridge/micro_error_reporter.cc
-	${TFLM_PATH}/tensorflow/lite/micro/system_setup.cc
-	#${TFLM_PATH}/tensorflow/lite/micro/span_test.cc
-	${TFLM_PATH}/tensorflow/lite/micro/test_helper_custom_ops.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_context.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_log.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_profiler.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_time.cc
-	#${TFLM_PATH}/tensorflow/lite/micro/static_vector_test.cc
-	${TFLM_PATH}/tensorflow/lite/micro/debug_log.cc
-	${TFLM_PATH}/tensorflow/lite/micro/test_helpers.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_op_resolver.cc
-	${TFLM_PATH}/tensorflow/lite/micro/recording_micro_allocator.cc
-	${TFLM_PATH}/tensorflow/lite/micro/memory_helpers.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_allocation_info.cc
-	${TFLM_PATH}/tensorflow/lite/micro/memory_planner/greedy_memory_planner.cc
-	${TFLM_PATH}/tensorflow/lite/micro/memory_planner/non_persistent_buffer_planner_shim.cc
-	${TFLM_PATH}/tensorflow/lite/micro/memory_planner/linear_memory_planner.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_utils.cc
-	${TFLM_PATH}/tensorflow/lite/micro/micro_interpreter.cc
 	../micro_speech_quantized_model_data.cc
 	../speech.cc
 )
+
 
 target_include_directories(tflm_lib PRIVATE
 	${TFLM_PATH}
@@ -435,6 +368,9 @@ target_include_directories(tflm_lib PRIVATE
 	${RUY_PATH}
 	${NN_HIFI_PATH}
 	${NN_HIFI_PATH}/include
+	${NN_HIFI_PATH}/algo/common/include
+	${sof_top_dir}/../modules/hal/xtensa/include
+	${sof_top_dir}/../modules/hal/xtensa/zephyr/soc/intel_ace15_mtpm
 	${sof_top_dir}/posix/include
 )
 
@@ -447,11 +383,15 @@ target_include_directories(tflm_lib PRIVATE
 #endif
 target_compile_options(tflm_lib PRIVATE
 	-std=c++17
+	-fPIC
 	-fno-rtti
 	-fno-exceptions
 	-fno-threadsafe-statics
 	-Wnon-virtual-dtor
 	-fno-unwind-tables
+	-fno-asynchronous-unwind-tables
+
+
 	-fmessage-length=0
 	-DTF_LITE_STATIC_MEMORY
 	-DTF_LITE_DISABLE_X86_NEON
@@ -472,12 +412,32 @@ target_compile_options(tflm_lib PRIVATE
 	-DHIFI4
 	-mlongcalls
 	-DNNLIB_V2
+	-fno-function-sections
+	-fno-data-sections
+	"SHELL:-include xtensahifiintrin.h"
+	"SHELL:-include /home/lrg/work/sof-arl/nnlib-hifi4/xa_nnlib/algo/common/include/xa_nnlib_hifi_isa_compat.h"
+
+
 	-Wno-shadow
 )
 
+
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-	target_compile_options(tflm_lib PRIVATE -stdlib=libc++)
+	target_include_directories(tflm_lib SYSTEM PRIVATE
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include/c++/14.3.0/xtensa-intel_ace15_mtpm_zephyr-elf
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/include
+	)
 endif()
+
+target_compile_options(tflm_lib PRIVATE
+	-ffunction-sections
+	-fdata-sections
+)
+
+
+
+
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 	target_compile_options(tflm_lib PRIVATE
@@ -494,15 +454,34 @@ else()
 endif()
 
 sof_llext_build("tflm"
-	SOURCES ../tflm-classify.c ../llext-wrap.c
+	SOURCES ../tflm-classify.c ../llext-wrap.c tests/test_basic.c tests/test_activations.c tests/test_cnn.c tests/test_fc.c tests/test_matxvec.c tests/test_norm.c tests/test_pool.c tests/test_reorg.c
 
 	INCLUDES
 		${TFLM_PATH}
+		${NN_HIFI_PATH}/algo/common/include
+		${NN_HIFI_PATH}/algo/kernels/include
+		${NN_HIFI_PATH}/include
+		${sof_top_dir}/../modules/hal/xtensa/zephyr/soc/intel_ace15_mtpm
 
-	# TFLM is a C++ userspace application so hence we need to link
-	# userspace C++, C, maths and C runtime for llext module usage.
-	LIBS tflm_lib ${TFLM_EXTRA_LIBS} ${TFLM_STD_LIBS} m c gcc
+
+	CFLAGS -fno-function-sections -fno-data-sections -D__XCC__ -D__XCC_CLANG__
+
+
+	LIBS ${TFLM_EXTRA_LIBS}
+
 	LIBS_PATH .
 )
+
+llext_link_options("tflm" -Wl,--whole-archive -Wl,-s)
+
+
+
+
+
+
+
+
+
+
 
 

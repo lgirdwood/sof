@@ -109,14 +109,15 @@ def main():
                     SH_FLAGS.SHF_ALLOC | SH_FLAGS.SHF_EXECINSTR and
 		    s_type == 'SHT_PROGBITS'):
 			# An executable section.
-			if s_name == '.text':
+			if s_name == '.text' or s_name.startswith('.text.') or s_name == '.literal' or s_name.startswith('.literal.'):
 				text_found = True
 				text_addr = max_alignment(text_addr, 0x1000, s_alignment)
-				text_size = s_size
-				if not is_relocatable:
+				text_size += s_size
+				if not is_relocatable and s_name == '.text':
 					command.append(f'-Wl,-Ttext=0x{text_addr:x}')
 			else:
 				executable.append(section)
+
 
 			continue
 
@@ -201,6 +202,8 @@ def main():
 
 	start_addr = align_up(start_addr, 0x1000)
 
+
+
 	for section in writable:
 		s_alignment = section.header['sh_addralign']
 		s_name = section.name
@@ -216,9 +219,40 @@ def main():
 		start_addr += section.header['sh_size']
 
 	command.extend(['-o', f'{args.file}.tmp'])
-	command.extend(args.params)
+	command.extend([('-r' if p == '-shared' else p) for p in args.params if 'fuse-ld' not in p])
 
+
+
+
+
+
+	if 'clang' in command[0]:
+		command[0] = '/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/bin/xtensa-intel_ace15_mtpm_zephyr-elf-gcc'
+		if '-mtext-section-literals' not in ' '.join(command):
+			command.insert(1, '-mtext-section-literals')
+		if '-mlongcalls' not in ' '.join(command):
+			command.insert(2, '-mlongcalls')
+		if '-Wl,--unresolved-symbols=ignore-all' not in ' '.join(command):
+			command.insert(3, '-Wl,--unresolved-symbols=ignore-all')
+		command.insert(4, '-Wl,-T,/home/lrg/work/sof-arl/sof-arl/scripts/llext_merge.ld')
+
+
+
+
+
+
+	print("LLEXT LINK HELPER COMMAND:", command, flush=True)
 	subprocess.run(command)
+
+
+
+
+
+
+
+
+
+
 
 	copy_command = [args.copy]
 
@@ -227,8 +261,22 @@ def main():
 	if first_dram_rodata:
 		copy_command.extend(['--set-section-alignment', f'{first_dram_rodata}=4096'])
 
-	copy_command.extend([f'{args.file}.tmp', f'{args.output}'])
+	copy_command.extend(['--strip-unneeded', '--remove-section=.group', f'{args.file}.tmp', f'{args.output}'])
 	subprocess.run(copy_command)
+
+	ld_cmd = command[0]
+	if 'gcc' in ld_cmd or 'clang' in ld_cmd:
+		ld_cmd = ld_cmd.replace('gcc', 'ld').replace('clang', 'ld')
+	merge_cmd = [
+		ld_cmd,
+		'-r', '-T', '/home/lrg/work/sof-arl/sof-arl/scripts/llext_merge.ld',
+		args.output, '-o', f'{args.output}.merged'
+	]
+	print("LLEXT MERGE COMMAND:", merge_cmd, flush=True)
+	subprocess.run(merge_cmd)
+	os.replace(f'{args.output}.merged', args.output)
+
+
 
 if __name__ == "__main__":
 	main()

@@ -57,6 +57,15 @@ SOF_DEFINE_REG_UUID(lib_manager);
 
 DECLARE_TR_CTX(lib_manager_tr, SOF_UUID(lib_manager_uuid), LOG_LEVEL_INFO);
 
+void sof_ut_log(const char *msg)
+{
+	printk("[UT LOG] %s\n", msg);
+	tr_err(&lib_manager_tr, "UT: %s", msg);
+}
+
+EXPORT_SYMBOL(sof_ut_log);
+
+
 struct lib_manager_dma_ext {
 	struct sof_dma *dma;
 	struct dma_chan_data *chan;
@@ -918,7 +927,8 @@ static int lib_manager_dma_deinit(struct lib_manager_dma_ext *dma_ext, uint32_t 
 
 static int lib_manager_load_data_from_host(struct lib_manager_dma_ext *dma_ext, uint32_t size)
 {
-	uint64_t timeout = k_ms_to_cyc_ceil64(200);
+	uint64_t timeout = k_ms_to_cyc_ceil64(5000);
+
 	struct dma_status stat;
 	int ret;
 
@@ -1145,6 +1155,10 @@ err_dma_init:
 }
 
 int lib_manager_load_library(uint32_t dma_id, uint32_t lib_id, uint32_t type)
+
+
+
+
 {
 	void __sparse_cache *man_tmp_buffer;
 	struct lib_manager_dma_ext *dma_ext;
@@ -1218,19 +1232,22 @@ cleanup:
 	rfree(dma_ext);
 	_ext_lib->runtime_data = NULL;
 
-	uint32_t module_id = lib_id << LIB_MANAGER_LIB_ID_SHIFT;
-	const struct sof_man_module *mod = lib_manager_get_module_manifest(module_id);
-
-	if (!ret && mod && module_is_llext(mod))
-		/* Auxiliary LLEXT libraries need to be linked upon loading */
-		ret = llext_manager_add_library(module_id);
-
 #if CONFIG_KCPS_DYNAMIC_CLOCK_CONTROL
 	core_kcps_adjust(cpu_get_id(), -(CLK_MAX_CPU_HZ / 1000));
 #endif
 
-	if (!ret)
+	if (!ret) {
 		tr_info(&lib_manager_tr, "loaded library id: %u", lib_id);
+	} else {
+		tr_err(&lib_manager_tr, "lib_manager_load_library failed ret=%d", ret);
+	}
 
 	return ret;
 }
+
+
+
+
+
+
+

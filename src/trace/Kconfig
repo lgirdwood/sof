@@ -118,6 +118,18 @@ config LOG_BACKEND_SOF_PROBE_OUTPUT_AUTO_ENABLE
 		every boot. The probes DMA is still needed before the
 		log output can be enabled.
 
+config LOG_BACKEND_SOF_PROBE_BOOT_HOOK_INIT
+	bool "Register probe logging hook at boot for pre-buffering"
+	depends on LOG_BACKEND_SOF_PROBE
+	help
+		Register the probe_logging_hook immediately at boot time
+		via SYS_INIT. This activates the log_backend_probe pre-buffer
+		from the very first log message, so logs generated before the
+		host opens the DMA channel are captured (up to PRE_BUFFER_SIZE
+		bytes) and drained as soon as the extraction DMA is started.
+		This allows the kernel to pass a boot flag to start logging
+		immediately without any userspace interaction.
+
 config LOG_BACKEND_SOF_PROBE_OUTPUT_DICTIONARY
 	bool "Dictionary"
 	select LOG_DICTIONARY_SUPPORT

@@ -14,10 +14,16 @@
 #if SOF_USE_MIN_HIFI(3, FILTER)
 
 #include <sof/audio/audio_stream.h>
-#include <sof/audio/buffer.h>
 #include <user/fir.h>
+#if defined(__XCC__) && !defined(__XCC_CLANG__)
 #include <xtensa/config/defs.h>
 #include <xtensa/tie/xt_hifi3.h>
+#else
+#include <xtensa/config/core-isa.h>
+#include <xtensahifiintrin.h>
+#endif
+
+
 
 struct sof_eq_fir_coef_data;
 

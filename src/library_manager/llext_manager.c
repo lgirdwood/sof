@@ -387,7 +387,11 @@ static int llext_manager_load_module(struct lib_manager_module *mctx)
 	memset((__sparse_force void *)bss_addr, 0, bss_size);
 	mctx->mapped = true;
 
+	tr_info(&lib_manager_tr, "Calling llext_entry for loaded module...");
+	llext_call_fn(mctx->llext, "llext_entry");
+
 	return 0;
+
 
 e_rodata:
 	if (rodata_size)
@@ -526,7 +530,9 @@ static int llext_manager_link(const char *name,
 	mctx->segment[LIB_MANAGER_TEXT].addr = hdr->sh_addr;
 	mctx->segment[LIB_MANAGER_TEXT].size = hdr->sh_size;
 
+
 	tr_dbg(&lib_manager_tr, ".text: start: %#lx size %#x",
+
 	       mctx->segment[LIB_MANAGER_TEXT].addr,
 	       mctx->segment[LIB_MANAGER_TEXT].size);
 
@@ -726,6 +732,11 @@ static int llext_manager_link_single(uint32_t module_id, const struct sof_man_fw
 		return ret;
 	}
 
+
+
+
+
+
 	/* if ret > 0, then the "driver" is already loaded */
 	if (!ret)
 		/* mctx->mod_manifest points to a const array of module manifests */
@@ -743,6 +754,31 @@ static int llext_manager_link_single(uint32_t module_id, const struct sof_man_fw
 
 	return mod_ctx_idx;
 }
+
+void llext_manager_run_tests(uint32_t module_id)
+{
+	const struct lib_manager_mod_ctx *ctx = lib_manager_get_mod_ctx(module_id);
+
+	if (!ctx)
+		return;
+
+	struct llext *llext = ctx->mod[0].llext;
+
+	if (llext) {
+		const void *test_sym = llext_find_sym(&llext->sym_tab, "start_tflm_ut_thread");
+
+		if (!test_sym)
+			test_sym = llext_find_sym(&llext->exp_tab, "start_tflm_ut_thread");
+		if (test_sym) {
+			void (*start_ut_fn)(void) = (void (*)(void))test_sym;
+			tr_info(&lib_manager_tr, "Scheduling LLEXT unit test thread (10s delay)...");
+			start_ut_fn();
+		} else {
+			tr_info(&lib_manager_tr, "start_tflm_ut_thread symbol not found in module 0x%x", module_id);
+		}
+	}
+}
+
 
 static int llext_lib_find(const struct llext *llext, struct lib_manager_module **dep_ctx)
 {
@@ -1213,8 +1249,21 @@ int llext_manager_add_library(uint32_t module_id)
 		}
 	}
 
+	if (ctx->mod && ctx->mod[0].llext) {
+		tr_err(&lib_manager_tr, "[LLEXT PERF] Invoking llext_entry for loaded library 0x%x...", module_id);
+		int fn_ret = llext_call_fn(ctx->mod[0].llext, "llext_entry");
+		tr_err(&lib_manager_tr, "[LLEXT PERF] llext_call_fn returned %d", fn_ret);
+	}
+
 	return 0;
+
 }
+
+
+
+
+
+
 
 bool comp_is_llext(struct comp_dev *comp)
 {

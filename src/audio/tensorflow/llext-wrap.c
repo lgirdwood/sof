@@ -17,6 +17,15 @@
 struct stat;
 struct _reent;
 
+void __assert_no_args(void)
+{
+}
+
+int abs(int x)
+{
+	return x < 0 ? -x : x;
+}
+
 size_t _read_r(struct _reent *ptr, int fd, char *buf, size_t cnt)
 {
 	errno = -ENOTSUP;
@@ -76,3 +85,15 @@ void _exit(int status)
 	/* NOTREACHED */
 }
 #endif
+
+__attribute__((weak)) void *_Znwj(size_t size)
+{
+	return NULL;
+}
+
+__attribute__((weak)) int comp_register(void *comp)
+{
+	return 0;
+}
+
+__attribute__((weak)) int notifier_event(void *comp, int event, void *data) { return 0; }

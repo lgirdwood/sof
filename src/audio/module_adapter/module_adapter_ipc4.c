@@ -147,9 +147,23 @@ int module_adapter_init_data(struct comp_dev *dev,
 
 	if (cfg == NULL)
 		return -EINVAL;
-	if (cfgsz > MAILBOX_HOSTBOX_SIZE || cfgsz < sizeof(cfg->base_cfg)) {
+	if (cfgsz > MAILBOX_HOSTBOX_SIZE) {
 		comp_err(dev, "invalid config size %zu", cfgsz);
 		return -EINVAL;
+	}
+
+	/*
+	 * Infrastructure modules such as PROBE do not use base_module_extended_cfg
+	 * (their init configuration payload is not an audio format header).
+	 */
+	if ((dev->drv->uid && memcmp(dev->drv->uid, &(struct sof_uuid)SOF_REG_UUID(probe4), sizeof(struct sof_uuid)) == 0) ||
+	    cfgsz < sizeof(cfg->base_cfg)) {
+		comp_info(dev, "non-audio module (probe) init size %zu, skipping audio_fmt check", cfgsz);
+		dst->size = cfgsz;
+		dst->init_data = cfg;
+		if (!config->ipc_extended_init || !dst->ext_data->module_data)
+			dst->avail = true;
+		return 0;
 	}
 
 	dst->base_cfg = cfg->base_cfg;

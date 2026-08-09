@@ -6,10 +6,23 @@
 #include <xa_type_def.h>
 #include <nnlib/xa_nnlib_standards.h>
 #include <nnlib/xa_nnlib_kernels_api.h>
+#include <sof/trace/trace.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/sys/printk.h>
 
-extern int printk(const char *fmt, ...);
+LOG_MODULE_DECLARE(tflmcly, CONFIG_SOF_LOG_LEVEL);
+
+extern struct tr_ctx tflm_tr;
+extern void sof_ut_log(const char *msg);
+
+
+
+
+
+
 
 static float fabsf_val(float v)
+
 {
 	return (v < 0.0f) ? -v : v;
 }
@@ -48,11 +61,12 @@ int test_basic_run(void)
 {
 	int status = 0;
 	int errors = 0;
-	float inp1[8] = { 1.5f, -2.0f, 3.25f, 4.0f, -5.5f, 6.0f, 7.5f, -8.0f };
-	float inp2[8] = { 0.5f,  3.0f, -1.25f, 2.0f,  1.5f, -4.0f, 0.5f, 10.0f };
-	float out_hifi[8] = { 0 };
-	float out_ref[8] = { 0 };
+	static __attribute__((aligned(8))) float inp1[8] = { 1.5f, -2.0f, 3.25f, 4.0f, -5.5f, 6.0f, 7.5f, -8.0f };
+	static __attribute__((aligned(8))) float inp2[8] = { 0.5f,  3.0f, -1.25f, 2.0f,  1.5f, -4.0f, 0.5f, 10.0f };
+	static __attribute__((aligned(8))) float out_hifi[8] = { 0 };
+	static __attribute__((aligned(8))) float out_ref[8] = { 0 };
 	int len = 8;
+
 
 	/* 1. Test xa_nn_elm_add_f32xf32_f32 */
 	ref_elm_add_f32(out_ref, inp1, inp2, len);
@@ -69,7 +83,10 @@ int test_basic_run(void)
 			}
 		}
 	}
+
 	if (errors == 0) {
+
+		sof_ut_log("VALIDATION PASSED: xa_nn_elm_add_f32xf32_f32 matches plain C reference!");
 		printk("VALIDATION PASSED: xa_nn_elm_add_f32xf32_f32 matches plain C reference!\n");
 	}
 
@@ -89,6 +106,7 @@ int test_basic_run(void)
 		}
 	}
 	if (errors == 0) {
+		sof_ut_log("VALIDATION PASSED: xa_nn_elm_sub_f32xf32_f32 matches plain C reference!");
 		printk("VALIDATION PASSED: xa_nn_elm_sub_f32xf32_f32 matches plain C reference!\n");
 	}
 
@@ -108,6 +126,7 @@ int test_basic_run(void)
 		}
 	}
 	if (errors == 0) {
+		sof_ut_log("VALIDATION PASSED: xa_nn_elm_mul_f32xf32_f32 matches plain C reference!");
 		printk("VALIDATION PASSED: xa_nn_elm_mul_f32xf32_f32 matches plain C reference!\n");
 	}
 
@@ -127,8 +146,11 @@ int test_basic_run(void)
 		}
 	}
 	if (errors == 0) {
+		sof_ut_log("VALIDATION PASSED: xa_nn_elm_abs_f32_f32 matches plain C reference!");
 		printk("VALIDATION PASSED: xa_nn_elm_abs_f32_f32 matches plain C reference!\n");
 	}
+
+
 
 	return errors;
 }

@@ -149,7 +149,7 @@ struct comp_buffer {
 	/* list of buffers, to be used i.e. in raw data processing mode*/
 	struct list_item buffers_list;
 
-#if CONFIG_PROBE
+#if IS_ENABLED(CONFIG_PROBE)
 	/** probe produce callback, called on buffer produce */
 	void (*probe_cb_produce)(void *arg, struct buffer_cb_transact *cb_data);
 	/** probe free callback, called on buffer free */

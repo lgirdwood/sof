@@ -149,7 +149,7 @@ static void comp_buffer_free(struct sof_audio_buffer *audio_buffer)
 
 	buf_dbg(buffer, "entry");
 
-#if CONFIG_PROBE
+#if IS_ENABLED(CONFIG_PROBE)
 	if (buffer->probe_cb_free)
 		buffer->probe_cb_free(buffer->probe_cb_arg);
 #endif
@@ -528,13 +528,13 @@ void comp_update_buffer_produce(struct comp_buffer *buffer, uint32_t bytes)
 		return;
 	}
 
-#if CONFIG_PROBE
+#if IS_ENABLED(CONFIG_PROBE)
 	void *produce_begin = audio_stream_get_wptr(&buffer->stream);
 #endif
 
 	audio_stream_produce(&buffer->stream, bytes);
 
-#if CONFIG_PROBE
+#if IS_ENABLED(CONFIG_PROBE)
 	if (buffer->probe_cb_produce) {
 		struct buffer_cb_transact cb_data = {
 			.buffer = buffer,

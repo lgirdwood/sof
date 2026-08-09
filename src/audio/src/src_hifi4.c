@@ -14,8 +14,14 @@
 #include "src_common.h"
 
 #include <sof/math/numbers.h>
+#if defined(__XCC__) && !defined(__XCC_CLANG__)
 #include <xtensa/config/defs.h>
 #include <xtensa/tie/xt_hifi4.h>
+#else
+#include <xtensa/config/core-isa.h>
+#include <xtensahifiintrin.h>
+#endif
+
 #include <stddef.h>
 #include <stdint.h>
 

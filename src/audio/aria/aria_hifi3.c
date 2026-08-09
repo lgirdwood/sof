@@ -5,8 +5,15 @@
 #include "aria.h"
 
 #if SOF_USE_HIFI(3, ARIA) || SOF_USE_HIFI(4, ARIA)
+#if defined(__XCC__) && !defined(__XCC_CLANG__)
 #include <xtensa/config/defs.h>
 #include <xtensa/tie/xt_hifi3.h>
+#else
+#include <xtensa/config/core-isa.h>
+#include <xtensahifiintrin.h>
+#endif
+
+
 
 extern const int32_t sof_aria_index_tab[];
 

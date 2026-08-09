@@ -28,6 +28,10 @@
 #ifndef  __XA_TYPE_DEF_H__
 #define  __XA_TYPE_DEF_H__
 
+
+
+
+
 /****************************************************************************/
 /*     types               type define    prefix        examples      bytes */
 /************************  ***********    ******    ****************  ***** */
@@ -97,3 +101,7 @@ typedef XA_ERRORCODE xa_codec_func_t(xa_codec_handle_t p_xa_module_obj,
 				     pVOID             pv_value);
 
 #endif /* __XA_TYPE_DEF_H__ */
+
+
+
+

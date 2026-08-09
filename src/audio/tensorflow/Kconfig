@@ -2,9 +2,7 @@
 
 config COMP_TENSORFLOW
 	tristate "Tensorflow Micro component"
-	depends on SOF_STAGING
-	depends on CPP
-	depends on STD_CPP17
+	select CPP
 	help
 	  Select for Tensorflow component support. This module supports
 	  Tensorflow Micro library. It is used for running machine learning
