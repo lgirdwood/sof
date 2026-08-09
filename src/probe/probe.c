@@ -210,7 +210,7 @@ static int probe_dma_init(struct probe_dma_ext *dma, uint32_t direction)
 	if (err < 0)
 		return err;
 
-	channel = dma_request_channel(dma->dc.dmac->z_dev, &channel);
+	channel = dma_request_channel(dma->dc.dmac->z_dev, NULL);
 	if (channel < 0) {
 		tr_err(&pr_tr, "dma_request_channel() failed");
 		return -EINVAL;
@@ -226,7 +226,28 @@ static int probe_dma_init(struct probe_dma_ext *dma, uint32_t direction)
 	dma_cfg.source_data_size = sizeof(uint32_t);
 	dma_cfg.dest_data_size = sizeof(uint32_t);
 	dma_cfg.head_block = &dma_block_cfg;
+	/*
+	 * block_size controls DGBS (DMA Gateway Buffer Size) — the hardware
+	 * ring wrap boundary.  It must equal the full ring buffer size so the
+	 * hardware and software ring pointers stay in sync.
+	 */
 	dma_block_cfg.block_size = (uint32_t)dma->dmapb.size;
+
+	/*
+	 * dest_burst_length is re-purposed here as the DGMBS (DMA Gateway
+	 * Minimum Block Size) override.  DGMBS is the fill-level gate: the
+	 * hardware will not start a host transfer until at least this many
+	 * bytes are available.  The HDA DMA driver will use this value for
+	 * DGMBS instead of block_size when it is non-zero.
+	 *
+	 * Without this override, DGMBS = DGBS = 8192, meaning the DMA waits
+	 * until the entire ring is full before transferring — causing 8 KB
+	 * bursts every ~12 seconds even with a 500 ms flush heartbeat.
+	 *
+	 * 128 is the HDA hardware minimum (the buffer alignment unit, see
+	 * HDA_ALIGN_MASK in intel_adsp_hda.h).
+	 */
+	dma_cfg.dest_burst_length = 128;
 
 	switch (direction) {
 	case SOF_DMA_DIR_LMEM_TO_HMEM:
@@ -246,6 +267,7 @@ static int probe_dma_init(struct probe_dma_ext *dma, uint32_t direction)
 	return 0;
 }
 #endif
+
 /**
  * \brief Stop, deinit and free DMA and buffer used by probes.
  *
@@ -260,10 +282,14 @@ static int probe_dma_deinit(struct probe_dma_ext *dma)
 #else
 	err = dma_stop_legacy(dma->dc.chan);
 #endif
-	if (err < 0) {
-		tr_err(&pr_tr, "dma_stop() failed");
-		return err;
-	}
+	if (err < 0)
+		tr_err(&pr_tr, "dma_stop() failed: %d, continuing cleanup", err);
+	/*
+	 * Always release the DMA channel and device reference regardless of
+	 * dma_stop() outcome. Returning early here would leak the channel and
+	 * prevent dma_request_channel() from succeeding on the next probe
+	 * session, silently breaking all subsequent probe logging sessions.
+	 */
 #if CONFIG_ZEPHYR_NATIVE_DRIVERS
 	dma_release_channel(dma->dc.dmac->z_dev, dma->dc.chan->index);
 	sof_dma_put(dma->dc.dmac);
@@ -369,31 +395,30 @@ int probe_init(const struct probe_dma *probe_dma)
 	tr_dbg(&pr_tr, "entry");
 
 	if (_probe) {
-		tr_err(&pr_tr, "Probes already initialized.");
-		return -EINVAL;
+		tr_dbg(&pr_tr, "Probes already initialized, re-using instance.");
+	} else {
+		/* alloc probes main struct */
+		sof_get()->probe = rzalloc(SOF_MEM_FLAG_USER,
+					   sizeof(*_probe));
+		if (!sof_get()->probe) {
+			tr_err(&pr_tr, "Alloc failed.");
+			return -ENOMEM;
+		}
+		_probe = probe_get();
+
+		if (!_probe) {
+			tr_err(&pr_tr, "Alloc failed.");
+			return -ENOMEM;
+		}
+
+		/* initialize injection DMAs as invalid */
+		for (i = 0; i < CONFIG_PROBE_DMA_MAX; i++)
+			_probe->inject_dma[i].stream_tag = PROBE_DMA_INVALID;
+
+		/* initialize probe points as invalid */
+		for (i = 0; i < CONFIG_PROBE_POINTS_MAX; i++)
+			_probe->probe_points[i].stream_tag = PROBE_POINT_INVALID;
 	}
-
-	/* alloc probes main struct */
-	sof_get()->probe = rzalloc(SOF_MEM_FLAG_USER,
-				   sizeof(*_probe));
-	if (!sof_get()->probe) {
-		tr_err(&pr_tr, "Alloc failed.");
-		return -ENOMEM;
-	}
-	_probe = probe_get();
-
-	if (!_probe) {
-		tr_err(&pr_tr, "Alloc failed.");
-		return -ENOMEM;
-	}
-
-	/* initialize injection DMAs as invalid */
-	for (i = 0; i < CONFIG_PROBE_DMA_MAX; i++)
-		_probe->inject_dma[i].stream_tag = PROBE_DMA_INVALID;
-
-	/* initialize probe points as invalid */
-	for (i = 0; i < CONFIG_PROBE_POINTS_MAX; i++)
-		_probe->probe_points[i].stream_tag = PROBE_POINT_INVALID;
 
 	/* setup extraction dma if requested */
 	if (probe_dma) {
@@ -472,7 +497,14 @@ int probe_deinit(void)
 		schedule_task_free(&_probe->dmap_work);
 		err = probe_dma_deinit(&_probe->ext_dma);
 		if (err < 0)
-			return err;
+			tr_err(&pr_tr, "probe_dma_deinit failed: %d, continuing cleanup", err);
+		/*
+		 * Always free the probe struct even on DMA cleanup failure.
+		 * Returning early here leaves sof_get()->probe non-NULL, causing
+		 * probe_init() to take the "re-use" path which fails to add a new
+		 * logging probe point (already connected), keeping the logging hook
+		 * NULL and routing all FW logs to the 4KB pre-buffer indefinitely.
+		 */
 	}
 
 	sof_get()->probe = NULL;
@@ -504,6 +536,40 @@ int probe_dma_add(uint32_t count, const struct probe_dma *probe_dma)
 		tr_dbg(&pr_tr, "\tprobe_dma[%u] stream_tag = %u, dma_buffer_size = %u",
 		       i, probe_dma[i].stream_tag,
 		       probe_dma[i].dma_buffer_size);
+
+		if (_probe->ext_dma.stream_tag == PROBE_DMA_INVALID) {
+			_probe->ext_dma.stream_tag = probe_dma[i].stream_tag;
+			_probe->ext_dma.dma_buffer_size = probe_dma[i].dma_buffer_size;
+
+			err = probe_dma_init(&_probe->ext_dma, SOF_DMA_DIR_LMEM_TO_HMEM);
+			if (err < 0) {
+				tr_err(&pr_tr, "probe_dma_init extraction failed");
+				_probe->ext_dma.stream_tag = PROBE_DMA_INVALID;
+				return err;
+			}
+
+#if CONFIG_ZEPHYR_NATIVE_DRIVERS
+			err = dma_start(_probe->ext_dma.dc.dmac->z_dev, _probe->ext_dma.dc.chan->index);
+#else
+			err = dma_start_legacy(_probe->ext_dma.dc.chan);
+#endif
+			if (err < 0) {
+				tr_err(&pr_tr, "failed to start extraction dma");
+				_probe->ext_dma.stream_tag = PROBE_DMA_INVALID;
+				return -EBUSY;
+			}
+
+			schedule_task_init_ll(&_probe->dmap_work,
+					      SOF_UUID(probe_task_uuid),
+					      SOF_SCHEDULE_LL_TIMER, SOF_TASK_PRI_LOW,
+					      probe_task, _probe, 0, 0);
+			schedule_task(&_probe->dmap_work, 1000, 1000);
+
+#if CONFIG_LOG_BACKEND_SOF_PROBE_OUTPUT_AUTO_ENABLE
+			probe_auto_enable_logs(probe_dma[i].stream_tag);
+#endif
+			continue;
+		}
 
 		first_free = CONFIG_PROBE_DMA_MAX;
 
@@ -860,8 +926,7 @@ static uint32_t probe_gen_format(uint32_t frame_fmt, uint32_t rate,
  */
 static void kick_probe_task(struct probe_pdata *_probe)
 {
-	if (_probe->ext_dma.dmapb.size - _probe->ext_dma.dmapb.avail <
-		_probe->ext_dma.dmapb.size >> 2)
+	if (_probe->ext_dma.dmapb.avail > 0)
 		reschedule_task(&_probe->dmap_work, 0);
 }
 
@@ -870,10 +935,18 @@ static ssize_t probe_logging_hook(uint8_t *buffer, size_t length)
 {
 	struct probe_pdata *_probe = probe_get();
 	uint64_t checksum;
+	size_t free_bytes;
 	size_t max_len;
 	int ret;
 
-	max_len = _probe->ext_dma.dmapb.avail - sizeof(struct probe_data_packet) - sizeof(checksum);
+	if (!_probe || _probe->ext_dma.stream_tag == PROBE_DMA_INVALID)
+		return -EINVAL;
+
+	free_bytes = _probe->ext_dma.dmapb.size - _probe->ext_dma.dmapb.avail;
+	if (free_bytes <= sizeof(struct probe_data_packet) + sizeof(checksum))
+		return 0;
+
+	max_len = free_bytes - sizeof(struct probe_data_packet) - sizeof(checksum);
 	length = MIN(max_len, length);
 
 	ret = probe_gen_header(PROBE_LOGGING_BUFFER_ID, length, 0, &checksum);
