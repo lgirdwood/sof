@@ -551,8 +551,14 @@ int probe_shell_dma_init(const struct probe_dma *shell_dma)
 		return -EINVAL;
 	}
 
-	if (!shell_dma || shell_dma->stream_tag == PROBE_DMA_INVALID) {
-		tr_dbg(&pr_tr, "probe_shell_dma_init: no shell DMA provided, skipping");
+	/* stream_tag == 0 means absent: the kernel may send 0 when the INIT payload
+	 * is sized for the legacy struct (only gtw_cfg), leaving shell_dma zeroed.
+	 */
+	if (!shell_dma ||
+	    shell_dma->stream_tag == PROBE_DMA_INVALID ||
+	    shell_dma->stream_tag == 0) {
+		tr_dbg(&pr_tr, "probe_shell_dma_init: no shell DMA provided (tag=%u), skipping",
+			shell_dma ? shell_dma->stream_tag : 0xFFFFFFFF);
 		return 0;
 	}
 
