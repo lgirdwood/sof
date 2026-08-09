@@ -43,6 +43,7 @@ SOF_DEFINE_REG_UUID(probe);
 DECLARE_TR_CTX(pr_tr, SOF_UUID(PROBE_UUID), LOG_LEVEL_INFO);
 
 SOF_DEFINE_REG_UUID(probe_task);
+SOF_DEFINE_REG_UUID(probe_shell_task);
 
 LOG_MODULE_REGISTER(probe, CONFIG_SOF_LOG_LEVEL);
 
@@ -50,6 +51,11 @@ LOG_MODULE_REGISTER(probe, CONFIG_SOF_LOG_LEVEL);
 #define PROBE_POINT_INVALID	0xFFFFFFFF
 
 #define PROBE_BUFFER_LOCAL_SIZE	8192
+/*
+ * Shell DMA ring is intentionally smaller: shell responses are short and
+ * latency matters more than throughput.
+ */
+#define PROBE_SHELL_BUFFER_SIZE	4096
 #define DMA_ELEM_SIZE		32
 
 /**
@@ -80,7 +86,9 @@ struct probe_dma_ext {
  */
 struct probe_pdata {
 	struct task dmap_work;					  /**< probe task */
-	struct probe_dma_ext ext_dma;				  /**< extraction DMA */
+	struct task shell_work;					  /**< shell DMA drain task */
+	struct probe_dma_ext ext_dma;				  /**< logging extraction DMA */
+	struct probe_dma_ext shell_dma;				  /**< shell output DMA (optional) */
 	struct probe_dma_ext inject_dma[CONFIG_PROBE_DMA_MAX];	  /**< injection DMA */
 	struct probe_point probe_points[CONFIG_PROBE_POINTS_MAX]; /**< probe points */
 	struct probe_data_packet header;			  /**< data packet header */
@@ -307,9 +315,9 @@ static int probe_dma_deinit(struct probe_dma_ext *dma)
 }
 
 /*
- * \brief Probe task for extraction.
+ * \brief Probe task for logging extraction (ext_dma).
  *
- * Copy extraction probes data to host if available.
+ * Copy logging probe data to host if available.
  * Return err if dma copy failed.
  */
 static enum task_state probe_task(void *data)
@@ -359,6 +367,64 @@ static enum task_state probe_task(void *data)
 	if (_probe->ext_dma.dmapb.r_ptr >= _probe->ext_dma.dmapb.end_addr)
 		_probe->ext_dma.dmapb.r_ptr -= _probe->ext_dma.dmapb.size;
 	_probe->ext_dma.dmapb.avail -= avail;
+
+	return SOF_TASK_STATE_RESCHEDULE;
+}
+
+/**
+ * \brief Shell DMA drain task (shell_dma).
+ *
+ * Mirrors probe_task but operates on the shell_dma ring buffer.  Runs as a
+ * separate LL task so shell output and logging never block each other.
+ */
+static enum task_state probe_shell_task(void *data)
+{
+	struct probe_pdata *_probe = probe_get();
+	uint32_t copy_align, avail;
+	int err;
+
+	if (_probe->shell_dma.stream_tag == PROBE_DMA_INVALID ||
+	    !_probe->shell_dma.dmapb.avail)
+		return SOF_TASK_STATE_RESCHEDULE;
+
+#if CONFIG_ZEPHYR_NATIVE_DRIVERS
+	err = dma_get_attribute(_probe->shell_dma.dc.dmac->z_dev,
+				DMA_ATTR_COPY_ALIGNMENT, &copy_align);
+#else
+	err = dma_get_attribute_legacy(_probe->shell_dma.dc.dmac,
+				       DMA_ATTR_COPY_ALIGNMENT, &copy_align);
+#endif
+	if (err < 0) {
+		tr_err(&pr_tr, "shell dma_get_attribute failed.");
+		return SOF_TASK_STATE_COMPLETED;
+	}
+
+	avail = ALIGN_DOWN(_probe->shell_dma.dmapb.avail, copy_align);
+	if (avail + _probe->shell_dma.dmapb.r_ptr >= _probe->shell_dma.dmapb.end_addr)
+		avail = _probe->shell_dma.dmapb.end_addr - _probe->shell_dma.dmapb.r_ptr;
+
+	if (avail > 0)
+#if CONFIG_ZEPHYR_NATIVE_DRIVERS
+		err = dma_reload(_probe->shell_dma.dc.dmac->z_dev,
+				 _probe->shell_dma.dc.chan->index, 0, 0, avail);
+#else
+		err = dma_copy_to_host_nowait(&_probe->shell_dma.dc,
+					      &_probe->shell_dma.config, 0,
+					      (void *)_probe->shell_dma.dmapb.r_ptr,
+					      avail);
+#endif
+	else
+		return SOF_TASK_STATE_RESCHEDULE;
+
+	if (err < 0) {
+		tr_err(&pr_tr, "shell dma_copy_to_host() failed.");
+		return err;
+	}
+
+	_probe->shell_dma.dmapb.r_ptr += avail;
+	if (_probe->shell_dma.dmapb.r_ptr >= _probe->shell_dma.dmapb.end_addr)
+		_probe->shell_dma.dmapb.r_ptr -= _probe->shell_dma.dmapb.size;
+	_probe->shell_dma.dmapb.avail -= avail;
 
 	return SOF_TASK_STATE_RESCHEDULE;
 }
@@ -415,6 +481,9 @@ int probe_init(const struct probe_dma *probe_dma)
 		for (i = 0; i < CONFIG_PROBE_DMA_MAX; i++)
 			_probe->inject_dma[i].stream_tag = PROBE_DMA_INVALID;
 
+		/* initialize shell DMA as invalid until kernel provides one */
+		_probe->shell_dma.stream_tag = PROBE_DMA_INVALID;
+
 		/* initialize probe points as invalid */
 		for (i = 0; i < CONFIG_PROBE_POINTS_MAX; i++)
 			_probe->probe_points[i].stream_tag = PROBE_POINT_INVALID;
@@ -462,6 +531,72 @@ int probe_init(const struct probe_dma *probe_dma)
 	return 0;
 }
 
+/**
+ * \brief Initialise the shell output DMA slot.
+ *
+ * Called from probe_mod_init (IPC4) when the kernel provides a second HDA
+ * capture stream for Zephyr shell output.  May also be called at runtime via
+ * IPC4_PROBE_MODULE_SHELL_DMA_ADD SET_LARGE_CONFIG.
+ *
+ * \param[in] shell_dma  DMA config from kernel (stream_tag + buffer_size).
+ * \return 0 on success, negative errno otherwise.
+ */
+int probe_shell_dma_init(const struct probe_dma *shell_dma)
+{
+	struct probe_pdata *_probe = probe_get();
+	int err;
+
+	if (!_probe) {
+		tr_err(&pr_tr, "probe_shell_dma_init: probes not initialised");
+		return -EINVAL;
+	}
+
+	if (!shell_dma || shell_dma->stream_tag == PROBE_DMA_INVALID) {
+		tr_dbg(&pr_tr, "probe_shell_dma_init: no shell DMA provided, skipping");
+		return 0;
+	}
+
+	/* Tear down any existing shell DMA before re-initialising */
+	if (_probe->shell_dma.stream_tag != PROBE_DMA_INVALID) {
+		schedule_task_free(&_probe->shell_work);
+		probe_dma_deinit(&_probe->shell_dma);
+	}
+
+	tr_dbg(&pr_tr, "shell_dma: stream_tag=%u", shell_dma->stream_tag);
+
+	_probe->shell_dma.stream_tag = shell_dma->stream_tag;
+	_probe->shell_dma.dma_buffer_size = PROBE_SHELL_BUFFER_SIZE;
+
+	err = probe_dma_init(&_probe->shell_dma, SOF_DMA_DIR_LMEM_TO_HMEM);
+	if (err < 0) {
+		tr_err(&pr_tr, "shell probe_dma_init() failed: %d", err);
+		_probe->shell_dma.stream_tag = PROBE_DMA_INVALID;
+		return err;
+	}
+
+#if CONFIG_ZEPHYR_NATIVE_DRIVERS
+	err = dma_start(_probe->shell_dma.dc.dmac->z_dev,
+			_probe->shell_dma.dc.chan->index);
+#else
+	err = dma_start_legacy(_probe->shell_dma.dc.chan);
+#endif
+	if (err < 0) {
+		tr_err(&pr_tr, "failed to start shell DMA");
+		probe_dma_deinit(&_probe->shell_dma);
+		_probe->shell_dma.stream_tag = PROBE_DMA_INVALID;
+		return -EBUSY;
+	}
+
+	schedule_task_init_ll(&_probe->shell_work,
+			      SOF_UUID(probe_shell_task_uuid),
+			      SOF_SCHEDULE_LL_TIMER, SOF_TASK_PRI_LOW,
+			      probe_shell_task, _probe, 0, 0);
+
+	tr_info(&pr_tr, "shell DMA slot initialised (stream_tag=%u)",
+		shell_dma->stream_tag);
+	return 0;
+}
+
 int probe_deinit(void)
 {
 	struct probe_pdata *_probe = probe_get();
@@ -505,6 +640,15 @@ int probe_deinit(void)
 		 * logging probe point (already connected), keeping the logging hook
 		 * NULL and routing all FW logs to the 4KB pre-buffer indefinitely.
 		 */
+	}
+
+	/* Tear down the optional shell output DMA slot */
+	if (_probe->shell_dma.stream_tag != PROBE_DMA_INVALID) {
+		tr_dbg(&pr_tr, "Freeing shell task and DMA.");
+		schedule_task_free(&_probe->shell_work);
+		err = probe_dma_deinit(&_probe->shell_dma);
+		if (err < 0)
+			tr_err(&pr_tr, "shell probe_dma_deinit failed: %d, continuing", err);
 	}
 
 	sof_get()->probe = NULL;
@@ -926,11 +1070,32 @@ static uint32_t probe_gen_format(uint32_t frame_fmt, uint32_t rate,
  */
 static void kick_probe_task(struct probe_pdata *_probe)
 {
-	if (_probe->ext_dma.dmapb.avail > 0)
+	if (_probe->ext_dma.dmapb.size - _probe->ext_dma.dmapb.avail <
+		_probe->ext_dma.dmapb.size >> 2)
 		reschedule_task(&_probe->dmap_work, 0);
 }
 
-static ssize_t probe_write_payload(uint32_t buffer_id, const uint8_t *buffer,
+/*
+ * Kick the shell DMA drain task when the ring is >= 75% full.
+ */
+static void kick_shell_task(struct probe_pdata *_probe)
+{
+	if (_probe->shell_dma.stream_tag == PROBE_DMA_INVALID)
+		return;
+	if (_probe->shell_dma.dmapb.size - _probe->shell_dma.dmapb.avail <
+		_probe->shell_dma.dmapb.size >> 2)
+		reschedule_task(&_probe->shell_work, 0);
+}
+
+/**
+ * \brief Write a probe payload packet to the given DMA ring.
+ *
+ * Shared helper used by both logging (ext_dma) and shell output (shell_dma).
+ * The caller selects the DMA ring by passing the appropriate
+ * probe_dma_ext pointer.
+ */
+static ssize_t probe_write_payload(struct probe_dma_ext *dma,
+				   uint32_t buffer_id, const uint8_t *buffer,
 				   size_t length)
 {
 	struct probe_pdata *_probe = probe_get();
@@ -939,10 +1104,10 @@ static ssize_t probe_write_payload(uint32_t buffer_id, const uint8_t *buffer,
 	size_t free_space;
 	int ret;
 
-	if (!_probe || _probe->ext_dma.stream_tag == PROBE_DMA_INVALID || !buffer || !length)
+	if (!_probe || dma->stream_tag == PROBE_DMA_INVALID || !buffer || !length)
 		return 0;
 
-	free_space = _probe->ext_dma.dmapb.size - _probe->ext_dma.dmapb.avail;
+	free_space = dma->dmapb.size - dma->dmapb.avail;
 	if (free_space <= overhead)
 		return 0;
 
@@ -952,28 +1117,46 @@ static ssize_t probe_write_payload(uint32_t buffer_id, const uint8_t *buffer,
 	if (ret < 0)
 		return ret;
 
-	ret = copy_to_pbuffer(&_probe->ext_dma.dmapb, (void *)buffer, length);
+	ret = copy_to_pbuffer(&dma->dmapb, (void *)buffer, length);
 	if (ret < 0)
 		return ret;
 
-	ret = copy_to_pbuffer(&_probe->ext_dma.dmapb, &checksum, sizeof(checksum));
+	ret = copy_to_pbuffer(&dma->dmapb, &checksum, sizeof(checksum));
 	if (ret < 0)
 		return ret;
-
-	kick_probe_task(_probe);
 
 	return length;
 }
 
 ssize_t probe_shell_output(const uint8_t *buffer, size_t length)
 {
-	return probe_write_payload(PROBE_SHELL_BUFFER_ID, buffer, length);
+	struct probe_pdata *_probe = probe_get();
+	ssize_t ret;
+
+	if (!_probe || _probe->shell_dma.stream_tag == PROBE_DMA_INVALID)
+		return 0;
+
+	ret = probe_write_payload(&_probe->shell_dma, PROBE_SHELL_BUFFER_ID,
+				  buffer, length);
+	if (ret > 0)
+		kick_shell_task(_probe);
+	return ret;
 }
 
 #if CONFIG_LOG_BACKEND_SOF_PROBE
 static ssize_t probe_logging_hook(uint8_t *buffer, size_t length)
 {
-	return probe_write_payload(PROBE_LOGGING_BUFFER_ID, buffer, length);
+	struct probe_pdata *_probe = probe_get();
+	ssize_t ret;
+
+	if (!_probe)
+		return 0;
+
+	ret = probe_write_payload(&_probe->ext_dma, PROBE_LOGGING_BUFFER_ID,
+				  buffer, length);
+	if (ret > 0)
+		kick_probe_task(_probe);
+	return ret;
 }
 #endif
 
@@ -1566,6 +1749,15 @@ static int probe_mod_init(struct processing_module *mod)
 	if (ret < 0)
 		return -EINVAL;
 
+	/*
+	 * Optionally init the shell output DMA slot.  The kernel sets
+	 * shell_dma.stream_tag = 0xFFFFFFFF when no second stream is
+	 * available; probe_shell_dma_init() treats that as a no-op.
+	 */
+	ret = probe_shell_dma_init(&probe_cfg->shell_dma);
+	if (ret < 0)
+		comp_warn(dev, "shell DMA init failed (%d); shell output disabled", ret);
+
 	return 0;
 }
 
@@ -1605,6 +1797,11 @@ static int probe_set_config(struct processing_module *mod, uint32_t param_id,
 	case IPC4_PROBE_MODULE_INJECTION_DMA_DETACH:
 		return probe_dma_remove(fragment_size / sizeof(uint32_t),
 					(const uint32_t *)fragment);
+	case IPC4_PROBE_MODULE_SHELL_DMA_ADD:
+		/* Runtime (re-)init of the shell output DMA slot */
+		if (fragment_size < sizeof(struct probe_dma))
+			return -EINVAL;
+		return probe_shell_dma_init((const struct probe_dma *)fragment);
 	default:
 		return -EINVAL;
 	}

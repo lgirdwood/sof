@@ -11,8 +11,6 @@
 #include <ipc/probe.h>
 #include <sys/types.h>
 
-/* Buffer id used in probe extraction packets for mirrored shell text output. */
-#define PROBE_SHELL_BUFFER_ID 0x01000001
 
 /**
  * A buffer of logging data is available for processing.
@@ -62,6 +60,17 @@ int probe_init(const struct probe_dma *extraction_probe_dma);
  * are still in use.
  */
 int probe_deinit(void);
+
+/*
+ * \brief Initialise the optional shell output DMA slot.
+ *
+ * Called from IPC4 probe module init when the kernel provides a second HDA
+ * capture stream for Zephyr shell stdout.  If shell_dma->stream_tag is
+ * PROBE_DMA_INVALID (0xFFFFFFFF), this is a no-op.
+ *
+ * param[in] shell_dma - DMA config (stream_tag + dma_buffer_size) from kernel
+ */
+int probe_shell_dma_init(const struct probe_dma *shell_dma);
 
 /*
  * \brief Setup injection DMAs for probes.

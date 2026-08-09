@@ -141,6 +141,7 @@ d7f6712d-131c-45a7-82ed6aa9dc2291ea pm_runtime
 9d1fb66e-4ffb-497f-994b17719686596e probe
 7cad0808-ab10-cd23-ef4512ab34cd56ef probe4
 2f0b1901-cac0-4b87-812ff2d5e4f19e4a probe_task
+3a1c7fe2-d5b1-4c98-a73fe8b2c5d10f5b probe_shell_task
 393608d8-4188-11ee-be560242ac122002 ring_buffer
 5c7ca334-e15d-11eb-ba800242ac130004 rtnr
 5276b491-5b64-464e-8984dc228ef9e6a1 sa

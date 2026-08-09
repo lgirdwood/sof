@@ -35,6 +35,12 @@
  */
 #define PROBE_LOGGING_BUFFER_ID		0x01000000
 
+/*
+ * Buffer id used in the probe output stream headers for
+ * Zephyr shell output packets (second DMA slot).
+ */
+#define PROBE_SHELL_BUFFER_ID		0x02000000
+
 #define PROBE_PURPOSE_EXTRACTION	0
 #define PROBE_PURPOSE_INJECTION		1
 
@@ -47,6 +53,8 @@
 #define IPC4_PROBE_MODULE_PROBE_POINTS_ADD	  3
 #define IPC4_PROBE_MODULE_DISCONNECT_PROBE_POINTS 4
 #define IPC4_PROBE_MODULE_AVAILABLE_PROBE_POINTS  5
+/* SET_LARGE_CONFIG param_id for adding the shell output DMA after probe init */
+#define IPC4_PROBE_MODULE_SHELL_DMA_ADD		  6
 
 /**
  * Description of probe dma
@@ -91,7 +99,16 @@ struct sof_ipc_probe_info_params {
 
 struct ipc4_probe_module_cfg {
 	struct ipc4_base_module_cfg base_cfg;
+	/**
+	 * Logging extraction DMA (stream_tag from host HDA capture stream).
+	 */
 	struct probe_dma gtw_cfg;
+	/**
+	 * Optional: shell output DMA (second HDA capture stream).
+	 * Set stream_tag = 0xFFFFFFFF when not provided; the FW will skip
+	 * shell DMA initialisation and shell output will be silently dropped.
+	 */
+	struct probe_dma shell_dma;
 } __packed __aligned(8);
 
 #endif /* __SOF_IPC4_PROBE_H__ */
