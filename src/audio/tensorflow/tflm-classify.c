@@ -32,6 +32,16 @@
 #include <zephyr/kernel.h>
 
 extern void sof_ut_log(const char *msg);
+
+/* Weak stub: overridden by the UT test harness when running under unit tests.
+ * In production FW builds the UT logging sink is absent so we provide a no-op.
+ */
+__attribute__((weak)) void sof_ut_log(const char *msg)
+{
+	/* no-op in production */
+	(void)msg;
+}
+
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
