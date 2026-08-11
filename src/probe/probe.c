@@ -57,6 +57,14 @@ LOG_MODULE_REGISTER(probe, CONFIG_SOF_LOG_LEVEL);
  */
 #define PROBE_SHELL_BUFFER_SIZE	4096
 #define DMA_ELEM_SIZE		32
+/*
+ * HDA host DMA copy alignment for ACE15/MTPM (ARL-S) — from the devicetree
+ * node intel_adsp_hda_link_out: dma-copy-alignment = <16>.
+ * Every probe packet written to dmapb must be padded to a multiple of this
+ * value so that probe_task's ALIGN_DOWN(avail, copy_align) never leaves
+ * a permanent tail of un-drainable bytes.
+ */
+#define PROBE_DMA_ALIGN		16
 
 /**
  * DMA buffer
@@ -932,14 +940,15 @@ static int copy_from_pbuffer(struct probe_dma_buf *pbuf, void *data,
 /**
  * \brief Generate probe data packet header, update timestamp, calc crc
  *	  and copy data to probe buffer.
+ * \param[in] dmapb target DMA ring buffer
  * \param[in] buffer_id component buffer id
  * \param[in] size data size.
  * \param[in] format audio format.
  * \param[out] checksum.
  * \return 0 on success, error code otherwise.
  */
-static int probe_gen_header(uint32_t buffer_id, uint32_t size,
-			    uint32_t format, uint64_t *checksum)
+static int probe_gen_header(struct probe_dma_buf *dmapb, uint32_t buffer_id,
+			    uint32_t size, uint32_t format, uint64_t *checksum)
 {
 	struct probe_pdata *_probe = probe_get();
 	struct probe_data_packet *header;
@@ -965,7 +974,7 @@ static int probe_gen_header(uint32_t buffer_id, uint32_t size,
 
 	dcache_writeback_region((__sparse_force void __sparse_cache *)header, sizeof(*header));
 
-	return copy_to_pbuffer(&_probe->ext_dma.dmapb, header,
+	return copy_to_pbuffer(dmapb, header,
 			       sizeof(struct probe_data_packet));
 }
 
@@ -1081,17 +1090,6 @@ static void kick_probe_task(struct probe_pdata *_probe)
 		reschedule_task(&_probe->dmap_work, 0);
 }
 
-/*
- * Kick the shell DMA drain task when the ring is >= 75% full.
- */
-static void kick_shell_task(struct probe_pdata *_probe)
-{
-	if (_probe->shell_dma.stream_tag == PROBE_DMA_INVALID)
-		return;
-	if (_probe->shell_dma.dmapb.size - _probe->shell_dma.dmapb.avail <
-		_probe->shell_dma.dmapb.size >> 2)
-		reschedule_task(&_probe->shell_work, 0);
-}
 
 /**
  * \brief Write a probe payload packet to the given DMA ring.
@@ -1114,12 +1112,15 @@ static ssize_t probe_write_payload(struct probe_dma_ext *dma,
 		return 0;
 
 	free_space = dma->dmapb.size - dma->dmapb.avail;
-	if (free_space <= overhead)
+	/* Reserve (PROBE_DMA_ALIGN - 1) extra bytes for the alignment pad
+	 * that will be appended after the packet footer.
+	 */
+	if (free_space <= overhead + PROBE_DMA_ALIGN - 1)
 		return 0;
 
-	length = MIN(length, free_space - overhead);
+	length = MIN(length, free_space - overhead - (PROBE_DMA_ALIGN - 1));
 
-	ret = probe_gen_header(buffer_id, length, 0, &checksum);
+	ret = probe_gen_header(&dma->dmapb, buffer_id, length, 0, &checksum);
 	if (ret < 0)
 		return ret;
 
@@ -1131,23 +1132,66 @@ static ssize_t probe_write_payload(struct probe_dma_ext *dma,
 	if (ret < 0)
 		return ret;
 
+	/* Zero-pad the probe packet to the next PROBE_DMA_ALIGN boundary.
+	 * probe_task drains dmapb in ALIGN_DOWN(avail, copy_align) chunks.
+	 * If the packet size (overhead + payload) is not a multiple of
+	 * copy_align, the remaining 1..(copy_align-1) bytes are permanently
+	 * stuck — ALIGN_DOWN rounds them to zero and no DMA fires.
+	 * Adding at most (PROBE_DMA_ALIGN - 1) = 15 zero bytes after the
+	 * footer eliminates the tail.  The host parser handles trailing zeros
+	 * correctly via its magic-byte scan.
+	 */
+	{
+		uint32_t pkt   = overhead + length;
+		uint32_t pad   = ALIGN_UP(pkt, PROBE_DMA_ALIGN) - pkt;
+
+		if (pad > 0) {
+			static const uint8_t zeros[PROBE_DMA_ALIGN - 1];
+
+			ret = copy_to_pbuffer(&dma->dmapb, (void *)zeros, pad);
+			if (ret < 0)
+				return ret;
+		}
+	}
+
 	return length;
 }
 
-ssize_t probe_shell_output(const uint8_t *buffer, size_t length)
+
+int probe_shell_output(const uint8_t *buffer, size_t length)
 {
 	struct probe_pdata *_probe = probe_get();
 	ssize_t ret;
 
-	if (!_probe || _probe->shell_dma.stream_tag == PROBE_DMA_INVALID)
+	/* Route shell output through the logging DMA ring (ext_dma) so it
+	 * reaches the probe server via the existing compress stream.  Shell
+	 * packets are distinguished from log packets by PROBE_SHELL_BUFFER_ID.
+	 * The separate shell_dma stream is not used for output: the kernel-side
+	 * compress reader only drains ext_dma (stream_tag 1).
+	 */
+	if (!_probe) {
+		tr_dbg(&pr_tr, "probe_shell_output: probe not init (len=%zu)", length);
 		return 0;
+	}
+	if (_probe->ext_dma.stream_tag == PROBE_DMA_INVALID) {
+		tr_dbg(&pr_tr, "probe_shell_output: ext_dma invalid (len=%zu)", length);
+		return 0;
+	}
 
-	ret = probe_write_payload(&_probe->shell_dma, PROBE_SHELL_BUFFER_ID,
+	tr_dbg(&pr_tr, "probe_shell_output: len=%zu tag=%u avail=%zu",
+	       length, _probe->ext_dma.stream_tag, _probe->ext_dma.dmapb.avail);
+
+	ret = probe_write_payload(&_probe->ext_dma, PROBE_SHELL_BUFFER_ID,
 				  buffer, length);
+
+	tr_dbg(&pr_tr, "probe_shell_output: write_payload ret=%zd", ret);
+
 	if (ret > 0)
-		kick_shell_task(_probe);
+		kick_probe_task(_probe);
 	return ret;
 }
+
+
 
 #if CONFIG_LOG_BACKEND_SOF_PROBE
 static ssize_t probe_logging_hook(uint8_t *buffer, size_t length)
@@ -1206,7 +1250,7 @@ static void probe_cb_produce(void *arg, struct buffer_cb_transact *cb_data)
 		format = probe_gen_format(audio_stream_get_frm_fmt(&buffer->stream),
 					  audio_stream_get_rate(&buffer->stream),
 					  audio_stream_get_channels(&buffer->stream));
-		ret = probe_gen_header(buffer_id,
+		ret = probe_gen_header(&_probe->ext_dma.dmapb, buffer_id,
 				       cb_data->transaction_amount,
 				       format, &checksum);
 		if (ret < 0)

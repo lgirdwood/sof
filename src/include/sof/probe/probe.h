@@ -42,7 +42,7 @@ void probe_logging_init(probe_logging_hook_t hook);
  * @return Number of bytes written (can be less than length when buffer is
  *         near full), 0 when probes are inactive, negative errno on error.
  */
-ssize_t probe_shell_output(const uint8_t *buffer, size_t length);
+int probe_shell_output(const uint8_t *buffer, size_t length);
 
 /*
  * \brief Initialize probes subsystem
