@@ -51,6 +51,16 @@ function setup_mfcc()
 	setup.tplg_fn = 'mel40_10ms.conf';
 	export_mfcc_setup(gen_cfg, setup);
 
+	% Same 40-bin/20ms-hop mel spectrogram with compress PCM output for the
+	% on-device TFLM wake-word path (KPB -> SRC -> MFCC -> tflmcly).
+	setup = get_mel_spectrogram_config();
+	setup.frame_length = 30.0;
+	setup.frame_shift = 20.0;
+	setup.num_mel_bins = 40;
+	setup.compress_output = true;
+	setup.tplg_fn = 'mel40_compress.conf';
+	export_mfcc_setup(gen_cfg, setup);
+
 	% Blob for mel spectrogram with compress PCM output and DTX
 	setup = get_mel_spectrogram_config();
 	setup.compress_output = true;
