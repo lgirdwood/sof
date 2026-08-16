@@ -41,6 +41,16 @@ function setup_mfcc()
 	setup.tplg_fn = 'mel40.conf';
 	export_mfcc_setup(gen_cfg, setup);
 
+	% Blob for 40-bin/10ms-hop mel spectrogram, matching microWakeWord's
+	% MixConv front-end shape (40 features per 10ms stride over a 30ms
+	% window) -- see src/audio/microwakeword.
+	setup = get_mel_spectrogram_config();
+	setup.frame_length = 30.0; % 480 samples at 16 kHz
+	setup.frame_shift = 10.0; % 160 samples at 16 kHz
+	setup.num_mel_bins = 40;
+	setup.tplg_fn = 'mel40_10ms.conf';
+	export_mfcc_setup(gen_cfg, setup);
+
 	% Blob for mel spectrogram with compress PCM output and DTX
 	setup = get_mel_spectrogram_config();
 	setup.compress_output = true;
