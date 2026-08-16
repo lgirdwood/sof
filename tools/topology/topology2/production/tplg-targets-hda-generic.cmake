@@ -129,4 +129,8 @@ EFX_DMIC0_DRC_PARAMS=dmic_default,DOLBY_DAX_CORE_ID=1"
 "sof-hda-tflm\;sof-mtl-hda-tflm-kpb\;PLATFORM=mtl,HDA_MIC_MFCC_PARAMS=default"
 "sof-hda-tflm\;sof-ptl-hda-tflm-kpb\;PLATFORM=ptl,HDA_MIC_MFCC_PARAMS=default"
 "sof-hda-tflm\;sof-tgl-hda-tflm-kpb\;PLATFORM=tgl,HDA_MIC_MFCC_PARAMS=default"
+
+# HDA Mic microWakeWord (MWW) Topology Targets with KPB
+"sof-hda-mww\;sof-hda-mww\;HDA_MIC_MFCC_PARAMS=default"
+"sof-hda-mww\;sof-ptl-hda-mww-kpb\;PLATFORM=ptl,HDA_MIC_MFCC_PARAMS=default"
 )
