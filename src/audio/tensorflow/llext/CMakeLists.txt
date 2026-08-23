@@ -287,7 +287,7 @@ endif()
 # a memory and performance optimized TFLM for SOF.
 # All sources have been left in for completeness now, but will be removed
 # when support is mature.
-add_library(tflm_lib STATIC
+add_library(tflm_lib OBJECT
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/core/api/error_reporter.cc
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/schema/schema_utils.cc
 	${TFLM_PATH}/tensorflow/lite/core/c/common.cc
@@ -527,23 +527,26 @@ else()
 endif()
 
 sof_llext_build("tflm"
-	SOURCES ../tflm-classify.c ../llext-wrap.c
+	SOURCES
+		../tflm-classify.c
+		../llext-wrap.c
+		$<TARGET_OBJECTS:tflm_lib>
 
 	INCLUDES
 		${TFLM_PATH}
 		${sof_top_dir}/src/include
 		${sof_top_dir}/src/arch/xtensa/include
 		${ZEPHYR_BASE}/include
-		${ZEPHYR_BASE}/soc/intel/intel_adsp/ace/include/ace15_mtpm
+		${ZEPHYR_BASE}/soc/intel/intel_adsp/ace/include/${SOC_TOOLCHAIN_NAME}
 		${ZEPHYR_BASE}/../modules/hal/xtensa/include
-		${ZEPHYR_BASE}/../modules/hal/xtensa/zephyr/soc/intel_ace15_mtpm
+		${ZEPHYR_BASE}/../modules/hal/xtensa/zephyr/soc/${SOC_TOOLCHAIN_NAME}
 
 	# TFLM is a C++ userspace application so hence we need to link
 	# userspace C++, C, maths and C runtime for llext module usage.
-	LIBS tflm_lib ${TFLM_EXTRA_LIBS} ${TFLM_STD_LIBS} m c gcc
+	LIBS ${TFLM_EXTRA_LIBS} ${TFLM_STD_LIBS} m gcc
 	LIBS_PATH .
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/xtensa-intel_ace15_mtpm_zephyr-elf/lib
-		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/lib/gcc/xtensa-intel_ace15_mtpm_zephyr-elf/14.3.0
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/lib
+		/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/lib/gcc/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/14.3.0
 )
 
 # Note: format_hifi3.h needs xtensa/config/defs.h and xtensa/tie/xt_hifi3.h.
@@ -554,8 +557,8 @@ sof_llext_build("tflm"
 # xtensa ELF objects. Add the target triple and xtensa linker path explicitly.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 	llext_link_options(tflm
-		--target=xtensa-intel_ace15_mtpm_zephyr-elf
-		--ld-path=/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-intel_ace15_mtpm_zephyr-elf/bin/xtensa-intel_ace15_mtpm_zephyr-elf-ld
+		--target=xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf
+		--ld-path=/home/lrg/zephyr-sdk-1.0.1/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/bin/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf-ld
 	)
 endif()
 

@@ -138,6 +138,7 @@ function(sof_llext_build module)
 		set(EXTRA_LINKER_PARAMS ${EXTRA_LINKER_PARAMS}
 			--target=${_compiler_target}
 			${_ld_path_flag}
+			-Wl,--unresolved-symbols=ignore-all
 		)
 	endif()
 

@@ -16,6 +16,10 @@ set(GEMMLOWP_PATH ${sof_top_dir}/../gemmlowp)
 set(RUY_PATH ${sof_top_dir}/../ruy)
 set(NN_HIFI_PATH ${sof_top_dir}/../nnlib-hifi4/xa_nnlib)
 
+if(NOT DEFINED ZEPHYR_SDK_INSTALL_DIR OR "${ZEPHYR_SDK_INSTALL_DIR}" STREQUAL "")
+  set(ZEPHYR_SDK_INSTALL_DIR "/home/lrg/zephyr-sdk-1.0.1")
+endif()
+
 set(MWW_TOOLCHAIN_ROOT
 	${ZEPHYR_SDK_INSTALL_DIR}/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf)
 set(MWW_HAL_SOC_PATH ${sof_top_dir}/../modules/hal/xtensa/zephyr/soc/${SOC_TOOLCHAIN_NAME})
@@ -48,7 +52,7 @@ set(MWW_LLEXT_KERNEL_SOURCES
 	${TFLM_PATH}/tensorflow/lite/micro/kernels/strided_slice.cc
 )
 
-add_library(mww_tflm_lib STATIC
+add_library(mww_tflm_lib OBJECT
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/core/api/error_reporter.cc
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/schema/schema_utils.cc
 	${TFLM_PATH}/tensorflow/lite/core/c/common.cc
@@ -132,6 +136,7 @@ target_compile_options(mww_tflm_lib PRIVATE
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 	target_compile_options(mww_tflm_lib PRIVATE
+		-fno-pic
 		-stdlib=libc++
 		-fno-vectorize
 		-fno-slp-vectorize
@@ -148,6 +153,7 @@ sof_llext_build("mww"
 	SOURCES
 		../mww.c
 		../llext-wrap.c
+		$<TARGET_OBJECTS:mww_tflm_lib>
 	INCLUDES
 		${TFLM_PATH}
 		${FLATBUFFERS_PATH}/include
@@ -155,13 +161,12 @@ sof_llext_build("mww"
 		${RUY_PATH}
 		${sof_top_dir}/posix/include
 	LIBS
-		mww_tflm_lib
 		m
-		c
 		gcc
 	LIBS_PATH
 		.
 		${MWW_TOOLCHAIN_ROOT}/lib
+		${MWW_TOOLCHAIN_ROOT}/../lib/gcc/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/14.3.0
 )
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
