@@ -3,7 +3,7 @@
 
 # -mllvm --text-section-literals=false is a Clang-only flag; guard it
 if(CMAKE_C_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  add_compile_options(-mllvm --text-section-literals=false)
+  add_compile_options(-mno-text-section-literals)
 endif()
 
 # are we building the llext module ?
@@ -124,7 +124,7 @@ endif() # MWW_HAVE_NNLIB_HIFI4
 # READ_VARIABLE, ASSIGN_VARIABLE, CONCATENATION, STRIDED_SLICE, LOGISTIC and
 # QUANTIZE in addition to CONV_2D/DEPTHWISE_CONV_2D/FULLY_CONNECTED/RESHAPE
 # (confirmed by direct flatbuffer inspection, see plan Stage 1).
-add_library(mww_tflm_lib STATIC
+add_library(mww_tflm_lib OBJECT
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/core/api/error_reporter.cc
 	${TFLM_PATH}/tensorflow/compiler/mlir/lite/schema/schema_utils.cc
 	${TFLM_PATH}/tensorflow/lite/core/c/common.cc
@@ -139,6 +139,7 @@ add_library(mww_tflm_lib STATIC
 	${TFLM_PATH}/tensorflow/lite/kernels/internal/reference/comparisons.cc
 	${TFLM_PATH}/tensorflow/lite/kernels/internal/reference/portable_tensor_utils.cc
 	${TFLM_PATH}/tensorflow/lite/kernels/kernel_util.cc
+	${TFLM_PATH}/tensorflow/lite/micro/kernels/kernel_util.cc
 	${TFLM_PATH}/tensorflow/lite/micro/kernels/call_once.cc
 	${TFLM_PATH}/tensorflow/lite/micro/kernels/var_handle.cc
 	${TFLM_PATH}/tensorflow/lite/micro/kernels/read_variable.cc
@@ -165,6 +166,7 @@ add_library(mww_tflm_lib STATIC
 	${TFLM_PATH}/tensorflow/lite/micro/micro_resource_variable.cc
 	${TFLM_PATH}/tensorflow/lite/micro/micro_interpreter_context.cc
 	${TFLM_PATH}/tensorflow/lite/micro/fake_micro_context.cc
+	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/ibuffer_allocator.cc
 	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/persistent_arena_buffer_allocator.cc
 	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/recording_single_arena_buffer_allocator.cc
 	${TFLM_PATH}/tensorflow/lite/micro/arena_allocator/non_persistent_arena_buffer_allocator.cc
@@ -254,22 +256,28 @@ target_compile_options(mww_tflm_lib PRIVATE
 	-Wmissing-field-initializers
 	-Wstrict-aliasing
 	-Wno-unused-parameter
-	-DXTENSA
 	-DTF_LITE_MCU_DEBUG_LOG
 	-DTF_LITE_USE_CTIME
+	-DFLATBUFFERS_REQUIRE_UNALIGNED_ACCESS=0
+	-DFLATBUFFERS_UNALIGNED_LOAD_PROPOGATES=0
 	-mlongcalls
 	-Wno-shadow
 )
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+	string(REPLACE "-mtext-section-literals" "-mno-text-section-literals" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+	string(REPLACE "-mtext-section-literals" "-mno-text-section-literals" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 	target_compile_options(mww_tflm_lib PRIVATE
+		-O2
+		-DNDEBUG=1
 		-stdlib=libc++
-		"SHELL:-include xtensahifiintrin.h"
 		-fno-vectorize
 		-fno-slp-vectorize
+		-mno-text-section-literals
 	)
 else()
 	target_compile_options(mww_tflm_lib PRIVATE
+		-DNDEBUG=1
 		-fno-tree-vectorize
 		-fno-tree-slp-vectorize
 	)
@@ -281,6 +289,7 @@ if(CMAKE_C_COMPILER_ID STREQUAL "Xtensa")
 		-mcoproc
 	)
 elseif(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+	zephyr_library_compile_options(-mno-text-section-literals)
 	target_compile_options(mww_tflm_lib PRIVATE
 		-mcpu=${SOC_TOOLCHAIN_NAME}
 	)
@@ -296,6 +305,10 @@ endif()
 
 add_local_sources(sof mww.c)
 
+if(NOT CONFIG_COMP_MWW STREQUAL "m")
+  zephyr_library_sources($<TARGET_OBJECTS:mww_tflm_lib>)
+endif()
+
 if(MWW_HAVE_NNLIB_HIFI4)
   zephyr_link_libraries(mww_tflm_lib mww_nn_hifi_lib)
 else()
@@ -306,7 +319,7 @@ endif()
 # default CONFIG_MINIMAL_LIBC is missing abs()/libm symbols TFLM needs in a
 # statically-linked (non-LLEXT) image; extract just those archive members
 # from the toolchain's libc.a into a small private archive.
-if(NOT CONFIG_COMP_MWW STREQUAL "m")
+if(NOT CONFIG_COMP_MWW STREQUAL "m" AND EXISTS ${ZEPHYR_SDK_INSTALL_DIR}/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/lib/libc.a)
   set(MWW_TOOLCHAIN_LIBC_ARCHIVE
     ${ZEPHYR_SDK_INSTALL_DIR}/gnu/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/xtensa-${SOC_TOOLCHAIN_NAME}_zephyr-elf/lib/libc.a)
   set(MWW_LIBC_SHIM_MEMBERS

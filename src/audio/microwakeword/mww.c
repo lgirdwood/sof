@@ -193,7 +193,7 @@ static int mww_prepare(struct processing_module *mod,
 		return ret;
 	}
 
-	ret = MWW_InitOps(&cd->mwc);
+	ret = MWW_InitOps(&cd->mwc, NULL, 0);
 	if (ret < 0) {
 		comp_err(dev, "MWW_InitOps failed: %d (%s)", ret, cd->mwc.error);
 		return ret;

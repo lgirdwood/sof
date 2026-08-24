@@ -28,8 +28,7 @@ static constexpr int kFeatureElementCount = MWW_FEATURE_ELEM_COUNT;
 // -variable ring buffers). Refine down using
 // MicroInterpreter::arena_used_bytes() once measured on hardware (logged in
 // MWW_InitOps() below).
-static constexpr size_t kArenaSize = 131072;
-alignas(16) static uint8_t g_arena[kArenaSize];
+static constexpr size_t kDefaultArenaSize = 262144;
 
 // inference
 static const tflite::Model *model;
@@ -38,6 +37,8 @@ static TfLiteTensor *output;
 static tflite::MicroInterpreter *interpreter;
 static tflite::MicroAllocator *allocator;
 static tflite::MicroResourceVariables *resource_variables;
+
+#include <new>
 
 // stream, stream_1..stream_5: the MixConv graph's 6 persistent ring-buffer
 // state variables (VAR_HANDLE/ASSIGN_VARIABLE/READ_VARIABLE), confirmed by
@@ -51,6 +52,10 @@ static constexpr int kNumResourceVariables = 6;
 // CONV_2D, DEPTHWISE_CONV_2D, FULLY_CONNECTED, LOGISTIC, QUANTIZE.
 using MwwOpResolver = tflite::MicroMutableOpResolver<12>;
 static MwwOpResolver *op_resolver;
+
+alignas(16) static uint8_t g_op_resolver_buf[sizeof(MwwOpResolver)];
+alignas(16) static uint8_t g_interpreter_buf[sizeof(tflite::MicroInterpreter)];
+alignas(16) static uint8_t g_mww_arena[kDefaultArenaSize];
 
 int RegisterOps(MwwOpResolver *op_resolver) {
 	printk("[MWW DBG] RegisterOps entry op_resolver=%p\n", (void *)op_resolver);
@@ -83,43 +88,29 @@ int RegisterOps(MwwOpResolver *op_resolver) {
 
 static int Init_Interpreter(struct mww_classify *mwc);
 
-int MWW_InitOps(struct mww_classify *mwc)
+int MWW_InitOps(struct mww_classify *mwc, uint8_t *arena_buf, size_t arena_size)
 {
-	printk("[MWW DBG] MWW_InitOps entry &model=%p model=%p\n", (void *)&model, (void *)model);
-	op_resolver = new MwwOpResolver();
+	if (!arena_buf || arena_size == 0) {
+		arena_buf = g_mww_arena;
+		arena_size = kDefaultArenaSize;
+	}
+	printk("[MWW DBG] MWW_InitOps entry &model=%p model=%p arena_buf=%p arena_size=%zu\n",
+	       (void *)&model, (void *)model, (void *)arena_buf, arena_size);
+
+	op_resolver = new (g_op_resolver_buf) MwwOpResolver();
 	printk("[MWW DBG] op_resolver=%p\n", (void *)op_resolver);
-	if (op_resolver) {
-		void **vptr = *(void ***)op_resolver;
-		printk("[MWW DBG] op_resolver vptr=%p\n", (void *)vptr);
-		for (int vi = -2; vi < 16; vi++) {
-			printk("[MWW DBG] vtable[%d] @%p = %p\n", vi,
-			       (void *)&vptr[vi], vptr[vi]);
-		}
-	}
-	if (!op_resolver) {
-		mwc->error = "op_resolver alloc failed (OOM)";
-		return -ENOMEM;
-	}
 
 	if (RegisterOps(op_resolver) != 0) {
 		mwc->error = "register ops failed";
 		return -EINVAL;
 	}
-	printk("[MWW DBG] RegisterOps OK, model=%p g_arena=%p kArenaSize=%u\n", (void *)model, (void *)g_arena, (unsigned)kArenaSize);
+	printk("[MWW DBG] RegisterOps OK, model=%p arena_buf=%p arena_size=%zu\n",
+	       (void *)model, (void *)arena_buf, arena_size);
 
-	// VAR_HANDLE/ASSIGN_VARIABLE require an explicit MicroResourceVariables
-	// instance registered with the interpreter -- without one,
-	// VarHandlePrepare()/AssignVariable Eval() fail with kTfLiteError as soon
-	// as AllocateTensors() prepares the first VAR_HANDLE node (see
-	// tensorflow/lite/micro/kernels/var_handle.cc). Building via the
-	// allocator-based MicroInterpreter constructor lets us create the
-	// allocator once and share it with MicroResourceVariables::Create().
-	allocator = tflite::MicroAllocator::Create(g_arena, kArenaSize);
+	allocator = tflite::MicroAllocator::Create(arena_buf, arena_size);
 	printk("[MWW DBG] allocator=%p\n", (void *)allocator);
 	if (!allocator) {
 		mwc->error = "allocator alloc failed (OOM)";
-		delete op_resolver;
-		op_resolver = nullptr;
 		return -ENOMEM;
 	}
 
@@ -127,19 +118,15 @@ int MWW_InitOps(struct mww_classify *mwc)
 	printk("[MWW DBG] resource_variables=%p\n", (void *)resource_variables);
 	if (!resource_variables) {
 		mwc->error = "resource_variables alloc failed (OOM)";
-		delete op_resolver;
-		op_resolver = nullptr;
 		return -ENOMEM;
 	}
 
-	// create the interpreter
-	interpreter = new tflite::MicroInterpreter(model, *op_resolver,
-						   allocator, resource_variables);
+	// create the interpreter via placement new
+	interpreter = new (g_interpreter_buf) tflite::MicroInterpreter(model, *op_resolver,
+								       allocator, resource_variables);
 	printk("[MWW DBG] interpreter=%p\n", (void *)interpreter);
 	if (!interpreter) {
 		mwc->error = "interpreter alloc failed (OOM)";
-		delete op_resolver;
-		op_resolver = nullptr;
 		return -ENOMEM;
 	}
 
@@ -147,10 +134,6 @@ int MWW_InitOps(struct mww_classify *mwc)
 	// and allocate the tensors
 	if (interpreter->AllocateTensors() != kTfLiteOk) {
 		mwc->error = "interpreter tensor allocate failed";
-		delete interpreter;
-		delete op_resolver;
-		interpreter = nullptr;
-		op_resolver = nullptr;
 		return -EINVAL;
 	}
 
@@ -203,13 +186,12 @@ static int Init_Interpreter(struct mww_classify *mwc)
 
 int MWW_SetModel(struct mww_classify *mwc, unsigned char *model_tflite)
 {
-	// ignore passed in model today until we can load via binary kcontrol
+	const unsigned char *src_model = model_tflite ? model_tflite : g_mww_model_data;
 
-	// Map the model into a usable data structure. This doesn't involve any
-	// copying or parsing, it's a very lightweight operation.
-	model = tflite::GetModel(g_mww_model_data);
-	printk("[MWW DBG] g_mww_model_data=%p &model=%p model=%p\n", (void *)g_mww_model_data, (void *)&model, (void *)model);
-	if (model->version() != TFLITE_SCHEMA_VERSION) {
+	// Map the model into a usable data structure.
+	model = tflite::GetModel(src_model);
+	printk("[MWW DBG] src_model=%p &model=%p model=%p\n", (void *)src_model, (void *)&model, (void *)model);
+	if (!model || model->version() != TFLITE_SCHEMA_VERSION) {
 		mwc->error = "failed to load model";
 		return -EINVAL;
 	}

@@ -44,7 +44,7 @@ extern "C"
 	int MWW_SetModel(struct mww_classify *mwc, unsigned char *model);
 
 	/* 2nd - register the kernels and init TF micro for inference */
-	int MWW_InitOps(struct mww_classify *mwc);
+	int MWW_InitOps(struct mww_classify *mwc, uint8_t *arena_buf, size_t arena_size);
 
 	/* 3rd - perform the inference */
 	int MWW_ProcessClassify(struct mww_classify *mwc);
