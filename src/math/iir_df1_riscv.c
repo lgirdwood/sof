@@ -15,13 +15,11 @@
 
 #define ROUND_BIT(b) ((b) > 0 ? (1ULL << ((b) - 1)) : 0)
 
-static inline int32_t sat_clamp64(int64_t x)
+static inline int32_t sat_clamp_q31(int64_t x)
 {
-	if (x > INT32_MAX)
-		return INT32_MAX;
-	if (x < INT32_MIN)
-		return INT32_MIN;
-	return (int32_t)x;
+	if (__builtin_expect(x >= (int64_t)INT32_MIN && x <= (int64_t)INT32_MAX, 1))
+		return (int32_t)x;
+	return (x > INT32_MAX) ? INT32_MAX : INT32_MIN;
 }
 
 /* Series DF1 IIR optimized for RISC-V */
@@ -68,7 +66,7 @@ int32_t iir_df1(struct iir_state_df1 *iir, int32_t x)
 
 			/* Shift Q3.61 to Q3.31 with symmetric rounding */
 			acc = (acc + (1LL << 29)) >> 30;
-			tmp = sat_clamp64(acc);
+			tmp = sat_clamp_q31(acc);
 
 			/* Update delay line */
 			delay[d] = y_n1;
@@ -80,14 +78,14 @@ int32_t iir_df1(struct iir_state_df1 *iir, int32_t x)
 			acc = ((int64_t)gain) * tmp;
 			const int shift_bits = 14 + shift_param;
 			acc = (acc + (1LL << (shift_bits - 1))) >> shift_bits;
-			in = sat_clamp64(acc);
+			in = sat_clamp_q31(acc);
 
 			c += SOF_EQ_IIR_NBIQUAD;
 			d += IIR_DF1_NUM_STATE;
 		}
 		out += in;
 	}
-	return sat_clamp64(out);
+	return sat_clamp_q31(out);
 }
 EXPORT_SYMBOL(iir_df1);
 
@@ -122,7 +120,7 @@ int32_t iir_df1_4th(struct iir_state_df1 *iir, int32_t x)
 		acc += ((int64_t)b0) * in;
 
 		acc = (acc + (1LL << 29)) >> 30;
-		tmp = sat_clamp64(acc);
+		tmp = sat_clamp_q31(acc);
 
 		delay[0] = y_n1;
 		delay[1] = tmp;
@@ -132,7 +130,7 @@ int32_t iir_df1_4th(struct iir_state_df1 *iir, int32_t x)
 		acc = ((int64_t)gain) * tmp;
 		const int shift_bits = 14 + shift_param;
 		acc = (acc + (1LL << (shift_bits - 1))) >> shift_bits;
-		in = sat_clamp64(acc);
+		in = sat_clamp_q31(acc);
 	}
 
 	/* Biquad 1 */
@@ -157,7 +155,7 @@ int32_t iir_df1_4th(struct iir_state_df1 *iir, int32_t x)
 		acc += ((int64_t)b0) * in;
 
 		acc = (acc + (1LL << 29)) >> 30;
-		tmp = sat_clamp64(acc);
+		tmp = sat_clamp_q31(acc);
 
 		delay[4] = y_n1;
 		delay[5] = tmp;
@@ -167,7 +165,7 @@ int32_t iir_df1_4th(struct iir_state_df1 *iir, int32_t x)
 		acc = ((int64_t)gain) * tmp;
 		const int shift_bits = 14 + shift_param;
 		acc = (acc + (1LL << (shift_bits - 1))) >> shift_bits;
-		in = sat_clamp64(acc);
+		in = sat_clamp_q31(acc);
 	}
 
 	return in;
@@ -175,3 +173,4 @@ int32_t iir_df1_4th(struct iir_state_df1 *iir, int32_t x)
 EXPORT_SYMBOL(iir_df1_4th);
 
 #endif /* SOF_USE_RISCV_SIMD(FILTER) */
+

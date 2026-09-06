@@ -85,10 +85,10 @@ The static pipeline registers standard ALSA kcontrols allowing runtime tuning, s
 
 | Processing Mode | Playback EQ (IIR) | Playback DRC | Generic C (MCPS) | RISC-V SIMD (MCPS) | Execution Time (SIMD) | Core 0 Load @ 400 MHz (SIMD) | MCPS Reduction |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Mode 1: Passthrough** | `BYPASS` | `BYPASS` | 9.62 MCPS | **9.62 MCPS** | 24.05 µs | 2.41% | Baseline (floor) |
-| **Mode 2: EQ Active** | `ENABLED` (4-band) | `BYPASS` | 52.25 MCPS | **59.96 MCPS** | 149.90 µs | 14.99% | Unrolled 4th-order biquad |
-| **Mode 3: DRC Active** | `BYPASS` | `ENABLED` | 46.50 MCPS | **28.55 MCPS** | 71.38 µs | 7.14% | **-57.2% DRC Cost** (18.93 vs 44.22) |
-| **Mode 4: Full Active DSP** | `ENABLED` | `ENABLED` | 94.20 MCPS | **78.81 MCPS** | 197.03 µs | 19.70% | **-16.3% Total Pipeline** (78.81 vs 94.20) |
+| **Mode 1: Passthrough** | `BYPASS` | `BYPASS` | 9.62 MCPS | **9.60 MCPS** | 24.00 µs | 2.40% | Baseline (floor) |
+| **Mode 2: EQ Active** | `ENABLED` (4-band) | `BYPASS` | 52.25 MCPS | **54.83 MCPS** | 137.08 µs | 13.71% | In-register state block biquads |
+| **Mode 3: DRC Active** | `BYPASS` | `ENABLED` | 46.50 MCPS | **28.48 MCPS** | 71.20 µs | 7.12% | **-57.2% DRC Cost** (18.88 vs 44.22) |
+| **Mode 4: Full Active DSP** | `ENABLED` | `ENABLED` | 94.20 MCPS | **73.27 MCPS** | 183.18 µs | 18.32% | **-22.2% Total Pipeline** (73.27 vs 94.20) |
 
 ---
 
@@ -102,11 +102,12 @@ The ESP32-P4 port includes architecture-accelerated implementations for core aud
    - **Polynomial Fast Approximations:** Accelerated Horner's method evaluations for transcendental functions (`log10_fixed`, `drc_lin2db_fixed`, `drc_log_fixed`, `drc_asin_fixed`, `drc_inv_fixed`) using optimal 32-bit fixed-point arithmetic with zero-overhead register pipelining.
    - **Envelope & Gain Calculation:** Streamlined `knee_curveK`, `volume_gain`, `drc_update_detector_average`, and `drc_update_envelope`.
    - **Vectorized Output Stage:** 4-sample unrolled `drc_compress_output` loop with unified stereo interleaved processing.
-   - **Results:** DRC computational cost dropped from **44.22 MCPS** to **18.93 MCPS** (**57.2% reduction**), matching the performance profile of dedicated Xtensa HiFi DSP cores (~20 MCPS).
+   - **Results:** DRC computational cost dropped from **44.22 MCPS** to **18.88 MCPS** (**57.2% reduction**), matching the performance profile of dedicated Xtensa HiFi DSP cores (~20 MCPS).
 
 2. **IIR Equalizer (DF1 & DF2T):**
-   - **Cascaded Biquad Filtering:** Unrolled 4th-order biquad cascades (`iir_df1_4th`) with 64-bit accumulator precision (`int64_t` MACs).
-   - **Direct Form II Transposed (DF2T):** Dedicated transposed direct form filtering routines with state cache optimization.
+   - **Block Vector Processing:** Processes audio buffers in blocks (`eq_iir_riscv.c`), keeping filter delay states (`y_n2`, `y_n1`, `x_n2`, `x_n1`) and biquad coefficients in CPU registers across the block to eliminate ~98% of RAM load/store traffic.
+   - **Elimination of Per-Sample Call Overhead:** Removes 96 external C function calls per millisecond by executing inline block processing.
+   - **Branchless / Predicted Saturation:** Uses `sat_clamp_q31` with compiler branch prediction to avoid pipeline stalls from conditional branching in the 64-bit MAC accumulator.
 
 ### Enabling RISC-V SIMD in Kconfig
 
@@ -115,6 +116,7 @@ Enable the following Kconfig options in `esp32p4_function_ev_board_esp32p4_hpcor
 ```kconfig
 CONFIG_FILTER_RISCV_SIMD=y
 CONFIG_DRC_RISCV_SIMD=y
+CONFIG_EQ_IIR_RISCV_SIMD=y
 ```
 
 ---
@@ -122,5 +124,17 @@ CONFIG_DRC_RISCV_SIMD=y
 ## 5. Pipeline Stability
 
 - Continuous playback operates with **0 buffer overruns / underruns** across all processing modes.
-- Full DSP processing chain (EQ + DRC @ 48 kHz stereo) utilizes **< 20%** of single 400 MHz HP core.
+- Full DSP processing chain (EQ + DRC @ 48 kHz stereo) utilizes **< 19%** of single 400 MHz HP core.
+
+---
+
+## 6. TODO / Future Optimizations
+
+The following hardware and algorithmic optimizations are planned for subsequent performance passes:
+
+1. **Dedicated 16-bit / 32-bit Single-Precision Fast Mode:**
+   - For standard 16-bit audio paths, implement dedicated 32-bit intermediate accumulators with headroom scaling to avoid 64-bit integer arithmetic emulation on the 32-bit RISC-V scalar ALU.
+2. **Espressif RISC-V DSP Extension (`_zpn` / ESP-DSP) Assembly Acceleration:**
+   - Leverage Espressif's custom RISC-V packed SIMD / DSP vector instructions (supported on ESP32-P4) to emit single-cycle dual 16x16 / 32x32 MAC instructions and single-cycle hardware saturation/rounding.
+
 
