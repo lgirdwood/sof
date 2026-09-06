@@ -242,20 +242,39 @@ int ipc4_pipeline_prepare(struct ipc_comp_dev *ppl_icd, uint32_t cmd)
 
 		/* init params when pipeline is complete or reset */
 		switch (status) {
+		case COMP_STATE_INIT:
+			tr_dbg(&ipc_tr, "pipeline %d: running from init", ppl_icd->id);
+			ret = ipc4_pipeline_complete(ipc, ppl_icd->id, cmd);
+			if (ret < 0)
+				return IPC4_INVALID_REQUEST;
+			host = pipeline_get_host_dev(ppl_icd);
+			if (!host) {
+				tr_err(&ipc_tr, "pipeline %d: host dev not found in INIT", ppl_icd->id);
+				return IPC4_INVALID_RESOURCE_ID;
+			}
+			ret = ipc4_pcm_params(host);
+			if (ret < 0)
+				tr_err(&ipc_tr, "pipeline %d: ipc4_pcm_params failed %d", ppl_icd->id, ret);
+			break;
 		case COMP_STATE_ACTIVE:
 		case COMP_STATE_PAUSED:
 			/* No action needed */
 			break;
 		case COMP_STATE_READY:
 			host = pipeline_get_host_dev(ppl_icd);
-			if (!host)
+			if (!host) {
+				tr_err(&ipc_tr, "pipeline %d: host dev not found in READY", ppl_icd->id);
 				return IPC4_INVALID_RESOURCE_ID;
+			}
 
-			tr_dbg(&ipc_tr, "pipeline %d: set params", ppl_icd->id);
+			tr_info(&ipc_tr, "pipeline %d: set params host comp 0x%x", ppl_icd->id, host->id);
 			ret = ipc4_pcm_params(host);
+			if (ret < 0) {
+				tr_err(&ipc_tr, "pipeline %d: ipc4_pcm_params failed %d", ppl_icd->id, ret);
+			}
 			break;
 		default:
-			ipc_cmd_err(&ipc_tr,
+			tr_err(&ipc_tr,
 				    "pipeline %d: Invalid state for RUNNING: %d",
 				    ppl_icd->id, status);
 			return IPC4_INVALID_REQUEST;
@@ -341,6 +360,7 @@ int ipc4_pipeline_trigger(struct ipc_comp_dev *ppl_icd, uint32_t cmd, bool *dela
 		case COMP_STATE_ACTIVE:
 			/* nothing to do if the pipeline is already running */
 			return 0;
+		case COMP_STATE_INIT:
 		case COMP_STATE_READY:
 		case COMP_STATE_PREPARE:
 			cmd = COMP_TRIGGER_PRE_START;
