@@ -338,6 +338,119 @@ static void vol_passthrough_s32_to_s32(struct processing_module *mod,
 }
 #endif /* CONFIG_FORMAT_S32LE */
 
+#if CONFIG_FORMAT_FLOAT
+static void vol_float_to_float(struct processing_module *mod, struct cir_buf_source *source,
+			       struct cir_buf_sink *sink, uint32_t frames, uint32_t attenuation)
+{
+	struct vol_data *cd = module_get_private_data(mod);
+	const float *x = source->ptr;
+	float *y = sink->ptr;
+	const int nch = cd->channels;
+	int remaining_samples = frames * nch;
+	float vol_f[PLATFORM_MAX_CHANNELS];
+
+	for (int j = 0; j < nch; j++) {
+#if COMP_VOLUME_Q8_16
+		vol_f[j] = (float)cd->volume[j] * (1.0f / 65536.0f);
+#elif COMP_VOLUME_Q1_31
+		vol_f[j] = (float)cd->volume[j] * (1.0f / 2147483648.0f);
+#else
+		vol_f[j] = (float)cd->volume[j] * (1.0f / 8388608.0f);
+#endif
+	}
+
+	if (nch == 2) {
+		const float vol_l = vol_f[0];
+		const float vol_r = vol_f[1];
+
+		while (remaining_samples) {
+			const int nmax_src = cir_buf_samples_without_wrap_s32(x, source->buf_end);
+			const int nmax_snk = cir_buf_samples_without_wrap_s32(y, sink->buf_end);
+			int n = MIN(remaining_samples, MIN(nmax_src, nmax_snk));
+
+			int i = 0;
+			for (; i <= n - 4; i += 4) {
+				y[i + 0] = x[i + 0] * vol_l;
+				y[i + 1] = x[i + 1] * vol_r;
+				y[i + 2] = x[i + 2] * vol_l;
+				y[i + 3] = x[i + 3] * vol_r;
+			}
+			for (; i < n; i += 2) {
+				y[i + 0] = x[i + 0] * vol_l;
+				y[i + 1] = x[i + 1] * vol_r;
+			}
+
+			remaining_samples -= n;
+			x = cir_buf_wrap(x + n, source->buf_start, source->buf_end);
+			y = cir_buf_wrap(y + n, sink->buf_start, sink->buf_end);
+		}
+	} else if (nch == 1) {
+		const float vol = vol_f[0];
+
+		while (remaining_samples) {
+			const int nmax_src = cir_buf_samples_without_wrap_s32(x, source->buf_end);
+			const int nmax_snk = cir_buf_samples_without_wrap_s32(y, sink->buf_end);
+			int n = MIN(remaining_samples, MIN(nmax_src, nmax_snk));
+
+			int i = 0;
+			for (; i <= n - 4; i += 4) {
+				y[i + 0] = x[i + 0] * vol;
+				y[i + 1] = x[i + 1] * vol;
+				y[i + 2] = x[i + 2] * vol;
+				y[i + 3] = x[i + 3] * vol;
+			}
+			for (; i < n; i++) {
+				y[i] = x[i] * vol;
+			}
+
+			remaining_samples -= n;
+			x = cir_buf_wrap(x + n, source->buf_start, source->buf_end);
+			y = cir_buf_wrap(y + n, sink->buf_start, sink->buf_end);
+		}
+	} else {
+		while (remaining_samples) {
+			const int nmax_src = cir_buf_samples_without_wrap_s32(x, source->buf_end);
+			const int nmax_snk = cir_buf_samples_without_wrap_s32(y, sink->buf_end);
+			int n = MIN(remaining_samples, MIN(nmax_src, nmax_snk));
+
+			for (int j = 0; j < nch; j++) {
+				const float vol = vol_f[j];
+				for (int i = j; i < n; i += nch) {
+					y[i] = x[i] * vol;
+				}
+			}
+
+			remaining_samples -= n;
+			x = cir_buf_wrap(x + n, source->buf_start, source->buf_end);
+			y = cir_buf_wrap(y + n, sink->buf_start, sink->buf_end);
+		}
+	}
+}
+
+static void vol_passthrough_float_to_float(struct processing_module *mod,
+					   struct cir_buf_source *source,
+					   struct cir_buf_sink *sink, uint32_t frames,
+					   uint32_t attenuation)
+{
+	struct vol_data *cd = module_get_private_data(mod);
+	const float *x = source->ptr;
+	float *y = sink->ptr;
+	const int nch = cd->channels;
+	int remaining_samples = frames * nch;
+
+	while (remaining_samples) {
+		const int nmax_src = cir_buf_samples_without_wrap_s32(x, source->buf_end);
+		const int nmax_snk = cir_buf_samples_without_wrap_s32(y, sink->buf_end);
+		int n = MIN(remaining_samples, MIN(nmax_src, nmax_snk));
+
+		memcpy_s(y, n * sizeof(float), x, n * sizeof(float));
+		remaining_samples -= n;
+		x = cir_buf_wrap(x + n, source->buf_start, source->buf_end);
+		y = cir_buf_wrap(y + n, sink->buf_start, sink->buf_end);
+	}
+}
+#endif /* CONFIG_FORMAT_FLOAT */
+
 const struct comp_func_map volume_func_map[] = {
 #if CONFIG_FORMAT_S16LE
 	{ SOF_IPC_FRAME_S16_LE, vol_s16_to_s16, vol_passthrough_s16_to_s16 },
@@ -347,6 +460,9 @@ const struct comp_func_map volume_func_map[] = {
 #endif
 #if CONFIG_FORMAT_S32LE
 	{ SOF_IPC_FRAME_S32_LE, vol_s32_to_s32, vol_passthrough_s32_to_s32 },
+#endif
+#if CONFIG_FORMAT_FLOAT
+	{ SOF_IPC_FRAME_FLOAT, vol_float_to_float, vol_passthrough_float_to_float },
 #endif
 };
 

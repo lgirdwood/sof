@@ -106,6 +106,20 @@ void drc_update_detector_average(struct drc_state *state,
 					abs_input_array[i] = s_abs;
 			}
 		}
+#if CONFIG_FORMAT_FLOAT
+	} else if (nbyte == 0) { /* float */
+		for (ch = 0; ch < nch; ch++) {
+			const float *sample_f = (const float *)state->pre_delay_buffers[ch] + div_start;
+			for (i = 0; i < DRC_DIVISION_FRAMES; i++) {
+				float val = sample_f[i] < 0.0f ? -sample_f[i] : sample_f[i];
+				if (val > 1.0f)
+					val = 1.0f;
+				int32_t s_abs = (int32_t)(val * 2147483647.0f);
+				if (s_abs > abs_input_array[i])
+					abs_input_array[i] = s_abs;
+			}
+		}
+#endif
 	} else {
 		for (ch = 0; ch < nch; ch++) {
 			sample32_p = (const int32_t *)state->pre_delay_buffers[ch] + div_start;
@@ -281,6 +295,32 @@ void drc_compress_output(struct drc_state *state,
 				for (j = 0; j < 4; j++)
 					x[j] = drc_mult_lshift(x[j], r4, lshift);
 			}
+#if CONFIG_FORMAT_FLOAT
+		} else if (nbyte == 0) { /* float */
+			const float gain_scale = 1.0f / 16777216.0f;
+			while (1) {
+				for (j = 0; j < 4; j++) {
+					tmp = x[j] + base;
+					post_warp_compressor_gain = drc_sin_fixed(tmp);
+					lshift = drc_get_lshift(24, 31, 24);
+					total_gain = drc_mult_lshift(p->master_linear_gain,
+								     post_warp_compressor_gain,
+								     lshift);
+					float total_gain_f = (float)total_gain * gain_scale;
+					for (ch = 0; ch < nch; ch++) {
+						float *sample_f = (float *)state->pre_delay_buffers[ch] +
+								  div_start + inc;
+						*sample_f = *sample_f * total_gain_f;
+					}
+					inc++;
+				}
+				if (++i == count)
+					break;
+				lshift = drc_get_lshift(30, 30, 30);
+				for (j = 0; j < 4; j++)
+					x[j] = drc_mult_lshift(x[j], r4, lshift);
+			}
+#endif
 		} else {
 			while (1) {
 				for (j = 0; j < 4; j++) {
@@ -348,6 +388,33 @@ void drc_compress_output(struct drc_state *state,
 					x[j] = tmp < ONE_Q30 ? tmp : ONE_Q30;
 				}
 			}
+#if CONFIG_FORMAT_FLOAT
+		} else if (nbyte == 0) { /* float */
+			const float gain_scale = 1.0f / 16777216.0f;
+			while (1) {
+				for (j = 0; j < 4; j++) {
+					post_warp_compressor_gain = drc_sin_fixed(x[j]);
+					lshift = drc_get_lshift(24, 31, 24);
+					total_gain = drc_mult_lshift(p->master_linear_gain,
+								     post_warp_compressor_gain,
+								     lshift);
+					float total_gain_f = (float)total_gain * gain_scale;
+					for (ch = 0; ch < nch; ch++) {
+						float *sample_f = (float *)state->pre_delay_buffers[ch] +
+								  div_start + inc;
+						*sample_f = *sample_f * total_gain_f;
+					}
+					inc++;
+				}
+				if (++i == count)
+					break;
+				lshift = drc_get_lshift(30, 30, 30);
+				for (j = 0; j < 4; j++) {
+					tmp = drc_mult_lshift(x[j], r4, lshift);
+					x[j] = tmp < ONE_Q30 ? tmp : ONE_Q30;
+				}
+			}
+#endif
 		} else {
 			while (1) {
 				for (j = 0; j < 4; j++) {
