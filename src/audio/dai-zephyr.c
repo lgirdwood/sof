@@ -1693,8 +1693,8 @@ int dai_zephyr_multi_endpoint_copy(struct dai_data **dd, struct comp_dev *dev,
 
 		/* trigger optional DAI_TRIGGER_COPY which prepares dai to copy */
 		ret = dai_trigger(dd[i]->dai->dev, direction, DAI_TRIGGER_COPY);
-		if (ret < 0)
-			comp_warn(dev, "dai trigger copy failed");
+		if (ret < 0 && ret != -ENOTSUP && ret != -EOPNOTSUPP && ret != -EINVAL)
+			comp_warn(dev, "dai trigger copy failed: %d", ret);
 
 		status = dai_dma_multi_endpoint_cb(dd[i], dev, frames, multi_endpoint_buffer);
 		if (status == SOF_DMA_CB_STATUS_END)
@@ -1896,8 +1896,8 @@ int dai_common_copy(struct dai_data *dd, struct comp_dev *dev, pcm_converter_fun
 
 	/* trigger optional DAI_TRIGGER_COPY which prepares dai to copy */
 	ret = dai_trigger(dd->dai->dev, dev->direction, DAI_TRIGGER_COPY);
-	if (ret < 0)
-		comp_warn(dev, "dai trigger copy failed");
+	if (ret < 0 && ret != -ENOTSUP && ret != -EOPNOTSUPP && ret != -EINVAL)
+		comp_warn(dev, "dai trigger copy failed: %d", ret);
 
 	if (dai_dma_cb(dd, dev, copy_bytes, converter) == SOF_DMA_CB_STATUS_END)
 		sof_dma_stop(dd->dma, dd->chan_index);

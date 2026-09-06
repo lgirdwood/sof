@@ -301,6 +301,9 @@ void sof_uac2_terminal_update_cb(const struct device *dev, uint8_t terminal,
 	ARG_UNUSED(microframes);
 	ARG_UNUSED(user_data);
 
+	LOG_INF("[UAC2 Terminal] update: terminal %u, enabled %d (PB expected %u, CAP expected %u)",
+		terminal, enabled, PLAYBACK_TERM_ID, CAPTURE_TERM_ID);
+
 	if (terminal == PLAYBACK_TERM_ID) { /* Playback Terminal */
 		g_status.playback_active = enabled;
 		if (enabled) {
@@ -1093,6 +1096,21 @@ int sof_static_pipeline_get_mute(uint32_t pipeline_id, bool *mute)
 		return sof_uac2_get_feature_mute(NULL, CAPTURE_FU_ID, 0, mute, NULL);
 	}
 	return -EINVAL;
+}
+
+int sof_static_pipeline_set_playback_active(bool start)
+{
+	g_status.playback_active = start;
+	if (g_playback_pipe && g_playback_pipe->source_comp) {
+		if (start) {
+			pipeline_trigger(g_playback_pipe, g_playback_pipe->source_comp, COMP_TRIGGER_PRE_START);
+			pipeline_trigger(g_playback_pipe, g_playback_pipe->source_comp, COMP_TRIGGER_START);
+		} else {
+			pipeline_trigger(g_playback_pipe, g_playback_pipe->source_comp, COMP_TRIGGER_STOP);
+		}
+	}
+	LOG_INF("Playback pipeline %s", start ? "STARTED" : "STOPPED");
+	return 0;
 }
 
 void sof_static_pipeline_get_status(struct sof_static_pipeline_status *status)
