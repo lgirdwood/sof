@@ -109,6 +109,10 @@ The ESP32-P4 port includes architecture-accelerated implementations for core aud
    - **Elimination of Per-Sample Call Overhead:** Removes 96 external C function calls per millisecond by executing inline block processing.
    - **Branchless / Predicted Saturation:** Uses `sat_clamp_q31` with compiler branch prediction to avoid pipeline stalls from conditional branching in the 64-bit MAC accumulator.
 
+3. **Master Volume Scaling:**
+   - **Contiguous Interleaved Vector Streaming:** Pre-loads channel gains into registers and streams linearly through interleaved stereo sample frames ($L_0, R_0, L_1, R_1$), eliminating strided per-channel loops (`volume_riscv.c`, `volume_riscv_with_peakvol.c`).
+   - **Branchless Multiply & Round:** Single-pass branch-predicted saturation across S16, S24, and S32 PCM formats.
+
 ### Enabling RISC-V SIMD in Kconfig
 
 Enable the following Kconfig options in `esp32p4_function_ev_board_esp32p4_hpcore.conf` or project configuration:
@@ -117,6 +121,7 @@ Enable the following Kconfig options in `esp32p4_function_ev_board_esp32p4_hpcor
 CONFIG_FILTER_RISCV_SIMD=y
 CONFIG_DRC_RISCV_SIMD=y
 CONFIG_EQ_IIR_RISCV_SIMD=y
+CONFIG_VOLUME_RISCV_SIMD=y
 ```
 
 ---
