@@ -269,7 +269,7 @@ static const struct comp_driver ecns_drv = {
 	},
 };
 
-static SHARED_DATA struct comp_driver_info ecns_info = {
+static struct comp_driver_info ecns_info = {
 	.drv = &ecns_drv,
 };
 

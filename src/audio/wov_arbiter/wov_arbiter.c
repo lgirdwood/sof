@@ -510,7 +510,7 @@ static const struct comp_driver wov_arbiter_drv = {
 	},
 };
 
-static SHARED_DATA struct comp_driver_info wov_arbiter_info = {
+static struct comp_driver_info wov_arbiter_info = {
 	.drv = &wov_arbiter_drv,
 };
 
