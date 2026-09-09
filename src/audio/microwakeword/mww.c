@@ -265,7 +265,7 @@ static void mww_notify_score(const struct comp_dev *dev, uint32_t score_idx)
 	notif.primary.r.rsp = SOF_IPC4_MESSAGE_DIR_MSG_REQUEST;
 	notif.primary.r.msg_tgt = SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG;
 
-	msg = ipc_msg_w_ext_init(notif.primary.dat, 0, data_size);
+	msg = ipc_msg_w_ext_init(NULL, notif.primary.dat, 0, data_size);
 	if (!msg)
 		return;
 

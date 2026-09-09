@@ -197,7 +197,7 @@ static void notify_host(const struct comp_dev *dev)
 
 	if (cd->msg)
 		ipc_msg_free(cd->msg);
-	cd->msg = ipc_msg_w_ext_init(notif.primary.dat, notif.extension.dat, 0);
+	cd->msg = ipc_msg_w_ext_init(NULL, notif.primary.dat, notif.extension.dat, 0);
 
 	if (cd->msg)
 		ipc_msg_send(cd->msg, NULL, true);
@@ -243,7 +243,7 @@ static void notify_control_change(const struct comp_dev *dev, uint16_t control_i
 	notif.primary.r.rsp = SOF_IPC4_MESSAGE_DIR_MSG_REQUEST;
 	notif.primary.r.msg_tgt = SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG;
 
-	msg = ipc_msg_w_ext_init(notif.primary.dat, 0, data_size);
+	msg = ipc_msg_w_ext_init(NULL, notif.primary.dat, 0, data_size);
 	if (!msg)
 		return;
 
