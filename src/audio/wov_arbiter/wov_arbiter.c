@@ -34,6 +34,9 @@
 #include <ipc4/module.h>
 #include <ipc4/notification.h>
 #include <sof/ipc/msg.h>
+#include <sof/ipc/common.h>
+#include <sof/ipc/topology.h>
+#include <sof/audio/pipeline.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -56,6 +59,7 @@ struct wov_arb_data {
 	uint8_t active_slot;
 	/* Number of input pins (= KPB slots); read from nb_input_pins at init. */
 	uint8_t num_slots;
+	uint32_t copy_count;
 };
 
 #if CONFIG_IPC_MAJOR_4
@@ -177,7 +181,28 @@ static struct comp_dev *wov_arb_new(const struct comp_driver *drv,
 	dev->direction_set = true;
 	dev->state = COMP_STATE_READY;
 
-	comp_info(dev, "wov_arb_new: num_slots=%u", cd->num_slots);
+#if CONFIG_IPC_MAJOR_4
+	struct ipc_comp_dev *ipc_pipe;
+	struct ipc *ipc = ipc_get();
+
+	ipc_pipe = ipc_get_comp_by_ppl_id(ipc, COMP_TYPE_PIPELINE, config->pipeline_id,
+					  IPC_COMP_IGNORE_REMOTE);
+	if (ipc_pipe && ipc_pipe->pipeline) {
+		dev->pipeline = ipc_pipe->pipeline;
+		if (dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_LL || !dev->period)
+			dev->period = ipc_pipe->pipeline->period;
+	}
+
+	if (!dev->period)
+		dev->period = 10000;
+
+	component_set_nearest_period_frames(dev, cd->base_cfg.audio_fmt.sampling_frequency);
+	if (!dev->frames)
+		dev->frames = 160;
+#endif
+
+	comp_info(dev, "wov_arb_new: num_slots=%u, ppl=%u, period=%u, frames=%u",
+		  cd->num_slots, config->pipeline_id, dev->period, dev->frames);
 
 	return dev;
 }
@@ -197,11 +222,19 @@ static int wov_arb_prepare(struct comp_dev *dev)
 {
 	struct wov_arb_data *cd = comp_get_drvdata(dev);
 
-	comp_info(dev, "wov_arb_prepare");
+	comp_info(dev, "wov_arb_prepare: period=%u, frames=%u", dev->period, dev->frames);
 
 	cd->active_slot = WOV_ARB_NO_ACTIVE;
+	cd->copy_count = 0;
+
+	if (!dev->frames) {
+		component_set_nearest_period_frames(dev, cd->base_cfg.audio_fmt.sampling_frequency);
+		if (!dev->frames)
+			dev->frames = 160;
+	}
 
 	/* Subscribe to keyword-detected events from any WOV detector. */
+	notifier_unregister(dev, NULL, NOTIFIER_ID_WOV_DETECT);
 	notifier_register(dev, NULL, NOTIFIER_ID_WOV_DETECT, arb_on_detect, 0);
 
 	/* Broadcast RESUME so all WOV detector slots start unpaused. */
@@ -423,17 +456,27 @@ static int wov_arb_copy(struct comp_dev *dev)
 			break;
 	}
 
+	uint32_t fill_bytes = 0;
 	if (copied_dst_bytes == 0 && sink_free > 0) {
 		/* No active audio copied: push period-sized silence so the host copier stays fed. */
 		uint32_t dst_frame_bytes = audio_stream_frame_bytes(&sink->stream);
+		if (!dst_frame_bytes)
+			dst_frame_bytes = 2;
 		uint32_t period_dst_bytes = dev->frames * dst_frame_bytes;
-		uint32_t fill_bytes = MIN(sink_free, period_dst_bytes ? period_dst_bytes : 640);
+		fill_bytes = MIN(sink_free, period_dst_bytes ? period_dst_bytes : 320);
+		fill_bytes = (fill_bytes / dst_frame_bytes) * dst_frame_bytes;
 
 		if (fill_bytes > 0) {
 			audio_stream_set_zero(&sink->stream, fill_bytes);
 			buffer_stream_writeback(sink, fill_bytes);
 			comp_update_buffer_produce(sink, fill_bytes);
 		}
+	}
+
+	cd->copy_count++;
+	if ((cd->copy_count % 100) == 1) {
+		comp_info(dev, "wov_arb_copy #%u: active=%u, num_src=%u, act_avail=%u, copied=%u, fill=%u, sink_free=%u",
+			  cd->copy_count, cd->active_slot, num_sources, active_avail, copied_dst_bytes, fill_bytes, sink_free);
 	}
 
 	return 0;
