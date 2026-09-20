@@ -16,6 +16,10 @@ elseif(CONFIG_PLATFORM_TEENSY41)
 	set(ARCH host)
 	set(PLATFORM "teensy41")
 	set(PLATFORM_HEADERS "teensy41")
+elseif(CONFIG_PLATFORM_RP2350)
+	set(ARCH host)
+	set(PLATFORM "rp2350")
+	set(PLATFORM_HEADERS "rp2350")
 else()
 	# firmware build supports only xtensa arch for now
 	set(ARCH xtensa)
@@ -489,6 +493,19 @@ if (CONFIG_PLATFORM_TEENSY41)
 	set(PLATFORM "teensy41")
 	zephyr_include_directories(${SOF_PLATFORM_PATH}/teensy41/include)
 endif()
+
+if (CONFIG_PLATFORM_RP2350)
+	zephyr_library_sources(
+		${SOF_PLATFORM_PATH}/rp2350/platform.c
+		${SOF_PLATFORM_PATH}/rp2350/rp2350_pipeline_def.c
+		${SOF_PLATFORM_PATH}/rp2350/lib/clk.c
+		lib/dma.c
+	)
+
+	set(PLATFORM "rp2350")
+	zephyr_include_directories(${SOF_PLATFORM_PATH}/rp2350/include)
+endif()
+
 
 if (CONFIG_SOC_MIMX9596_M7)
 

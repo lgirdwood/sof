@@ -7,11 +7,13 @@
 #include <zephyr/shell/shell.h>
 #include <sof/audio/pipeline/sof_static_pipeline.h>
 #include <sof/audio/pipeline/static_pipeline.h>
+#if defined(CONFIG_SOC_FAMILY_ESPRESSIF)
 #include <soc/i2s_struct.h>
 #include <soc/gpio_struct.h>
 #include <soc/io_mux_struct.h>
 #include <soc/hp_sys_clkrst_struct.h>
 #include <soc/gpio_sig_map.h>
+#endif
 #include <sof/audio/usb_audio.h>
 #include <sof/audio/bt_service.h>
 #include <sof/audio/bt_audio.h>
@@ -292,6 +294,7 @@ static int cmd_sof_regs(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
+#if defined(CONFIG_SOC_FAMILY_ESPRESSIF)
 	shell_print(sh, "=== I2S0 / PDM Registers ===");
 	shell_print(sh, "  I2S0.tx_conf:         0x%08x (tx_start=%u, tx_pdm_en=%u, tx_tdm_en=%u, tx_slave=%u, bck_div=%u)",
 		(uint32_t)I2S0.tx_conf.val,
@@ -354,6 +357,9 @@ static int cmd_sof_regs(const struct shell *sh, size_t argc, char **argv)
 		(uint32_t)HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_clk_src_sel,
 		(uint32_t)HP_SYS_CLKRST.peri_clk_ctrl13.reg_i2s0_tx_div_n);
 	shell_print(sh, "============================");
+#else
+	shell_print(sh, "Hardware register dump not supported on this platform.");
+#endif
 	return 0;
 }
 

@@ -36,7 +36,9 @@ LOG_MODULE_REGISTER(static_pipeline_loader, CONFIG_SOF_LOG_LEVEL);
 extern const struct sof_uuid volume_uuid;
 extern const struct sof_uuid eq_iir_uuid;
 extern const struct sof_uuid drc_uuid;
+#if CONFIG_COMP_TDFB
 extern const struct sof_uuid tdfb_uuid;
+#endif
 extern const struct sof_uuid level_multiplier_uuid;
 extern const struct sof_uuid selector_uuid;
 
@@ -678,11 +680,13 @@ int sof_static_kcontrol_set(uint32_t ctrl_id, int32_t val)
 				if (cd) {
 					cd->enable_switch = (val != 0);
 				}
+#if CONFIG_COMP_TDFB
 			} else if (dev->drv->uid && !memcmp(dev->drv->uid, &tdfb_uuid, UUID_SIZE)) {
 				struct tdfb_comp_data *cd = module_get_private_data(mod);
 				if (cd) {
 					cd->beam_on = (val != 0);
 				}
+#endif
 			}
 		}
 		break;

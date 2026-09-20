@@ -40,6 +40,14 @@ USBD_DESC_PRODUCT_DEFINE(teensya_product, "SOF Teensy 4.1 Audio A");
 #else
 USBD_DESC_PRODUCT_DEFINE(default_product, "SOF Teensy 4.1 Audio");
 #endif
+#elif defined(CONFIG_PLATFORM_RP2350)
+#if defined(CONFIG_RP2350_BOARD_B)
+USBD_DESC_PRODUCT_DEFINE(rp2350b_product, "SOF RP2350 Audio B");
+#elif defined(CONFIG_RP2350_BOARD_A)
+USBD_DESC_PRODUCT_DEFINE(rp2350a_product, "SOF RP2350 Audio A");
+#else
+USBD_DESC_PRODUCT_DEFINE(default_product, "SOF RP2350 Audio");
+#endif
 #else
 USBD_DESC_PRODUCT_DEFINE(spider_product, "SOF ESP32P4 USB Spider");
 USBD_DESC_PRODUCT_DEFINE(aphid_product, "SOF ESP32P4 USB Aphid");
@@ -295,6 +303,18 @@ struct usbd_context *sample_usbd_setup_device(usbd_msg_cb_t msg_cb)
 #else
 	product_desc = &default_product;
 	LOG_INF("Board Identity: Generic Teensy 4.1 Audio");
+#endif
+#elif defined(CONFIG_PLATFORM_RP2350)
+	struct usbd_desc_node *product_desc;
+#if defined(CONFIG_RP2350_BOARD_B)
+	product_desc = &rp2350b_product;
+	LOG_INF("Board Identity: RP2350 BOARD B (Slave / Rx)");
+#elif defined(CONFIG_RP2350_BOARD_A)
+	product_desc = &rp2350a_product;
+	LOG_INF("Board Identity: RP2350 BOARD A (Master / Tx)");
+#else
+	product_desc = &default_product;
+	LOG_INF("Board Identity: Generic RP2350 Audio");
 #endif
 #elif defined(CONFIG_PLATFORM_ESP32P4)
 	uint8_t mac[6] = {0};

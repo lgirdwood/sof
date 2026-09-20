@@ -416,6 +416,8 @@ const struct uac2_ops *sof_get_uac2_ops(void)
 
 #if defined(CONFIG_PLATFORM_TEENSY41)
 extern const struct sof_static_topology g_teensy41_static_topology;
+#elif defined(CONFIG_PLATFORM_RP2350)
+extern const struct sof_static_topology g_rp2350_static_topology;
 #else
 extern const struct sof_static_topology g_esp32p4_static_topology;
 #endif
@@ -429,6 +431,17 @@ int sof_static_pipelines_init(struct sof *sof)
 		return ret;
 
 #if defined(CONFIG_TEENSY41_I2S_SLAVE)
+	g_status.clock_mode = SOF_CLOCK_SLAVE;
+#else
+	g_status.clock_mode = SOF_CLOCK_MASTER;
+#endif
+	return 0;
+#elif defined(CONFIG_PLATFORM_RP2350)
+	int ret = sof_static_topology_init(&g_rp2350_static_topology);
+	if (ret < 0)
+		return ret;
+
+#if defined(CONFIG_RP2350_BOARD_B)
 	g_status.clock_mode = SOF_CLOCK_SLAVE;
 #else
 	g_status.clock_mode = SOF_CLOCK_MASTER;

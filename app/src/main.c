@@ -8,7 +8,7 @@
 #include <sof/boot_test.h>
 #include <zephyr/logging/log.h>
 
-#if defined(CONFIG_PLATFORM_ESP32P4) || defined(CONFIG_PLATFORM_TEENSY41)
+#if defined(CONFIG_PLATFORM_ESP32P4) || defined(CONFIG_PLATFORM_TEENSY41) || defined(CONFIG_PLATFORM_RP2350)
 #include <zephyr/usb/usbd.h>
 #include <zephyr/usb/class/usbd_uac2.h>
 #include <zephyr/device.h>
@@ -19,6 +19,11 @@
 #if defined(CONFIG_COMP_BT_AUDIO)
 #include <sof/audio/bt_service.h>
 #endif
+#include <zephyr/drivers/gpio.h>
+#endif
+
+#if DT_NODE_EXISTS(DT_ALIAS(led0))
+static const struct gpio_dt_spec s_led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
 #endif
 
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
@@ -46,6 +51,12 @@ static int sof_app_main(void)
 {
 	int ret;
 
+#if DT_NODE_EXISTS(DT_ALIAS(led0))
+	if (s_led0.port && device_is_ready(s_led0.port)) {
+		gpio_pin_configure_dt(&s_led0, GPIO_OUTPUT_ACTIVE);
+	}
+#endif
+
 	LOG_INF("SOF on %s", CONFIG_BOARD);
 
 	/* sof_main is actually SOF initialization */
@@ -56,7 +67,7 @@ static int sof_app_main(void)
 
 	LOG_INF("SOF initialized");
 
-#if defined(CONFIG_PLATFORM_ESP32P4) || defined(CONFIG_PLATFORM_TEENSY41)
+#if defined(CONFIG_PLATFORM_ESP32P4) || defined(CONFIG_PLATFORM_TEENSY41) || defined(CONFIG_PLATFORM_RP2350)
 	/* Initialize static audio pipelines (EQ+DRC Playback & EQ Capture) */
 	sof_static_pipelines_init(sof_get());
 
