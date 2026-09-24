@@ -66,13 +66,13 @@ static const struct sof_static_comp rp2350_comps[] = {
 	SOF_STATIC_COMP_HOST(
 		.id = 1, .pipeline_id = 1, .name = "USB_PB",
 		.uuid = &usb_audio_uuid, .direction = SOF_IPC_STREAM_PLAYBACK,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2),
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2),
 		.ep.usb.terminal_id = PLAYBACK_TERM_ID
 	),
 	SOF_STATIC_COMP_MODULE(
 		.id = 2, .pipeline_id = 1, .name = "VOL_PB",
 		.uuid = &volume_uuid, .direction = SOF_IPC_STREAM_PLAYBACK,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2)
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2)
 	),
 	SOF_STATIC_COMP_MODULE(
 		.id = 3, .pipeline_id = 1, .name = "EQ_PB",
@@ -93,7 +93,7 @@ static const struct sof_static_comp rp2350_comps[] = {
 	SOF_STATIC_COMP_DAI(
 		.id = 5, .pipeline_id = 1, .name = "DAI_I2S_PB",
 		.uuid = &dai_uuid, .direction = SOF_IPC_STREAM_PLAYBACK,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2),
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2),
 		.ep.dai.dai_type = SOF_DAI_ZEPHYR_I2S,
 		.ep.dai.dai_index = 0,
 		.ep.dai.format = SOF_DAI_FMT_I2S
@@ -103,7 +103,7 @@ static const struct sof_static_comp rp2350_comps[] = {
 	SOF_STATIC_COMP_DAI(
 		.id = 6, .pipeline_id = 2, .name = "DAI_I2S_CAP",
 		.uuid = &dai_uuid, .direction = SOF_IPC_STREAM_CAPTURE,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2),
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2),
 		.ep.dai.dai_type = SOF_DAI_ZEPHYR_I2S,
 		.ep.dai.dai_index = 0,
 		.ep.dai.format = SOF_DAI_FMT_I2S
@@ -120,12 +120,12 @@ static const struct sof_static_comp rp2350_comps[] = {
 	SOF_STATIC_COMP_MODULE(
 		.id = 8, .pipeline_id = 2, .name = "VOL_CAP",
 		.uuid = &volume_uuid, .direction = SOF_IPC_STREAM_CAPTURE,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2)
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2)
 	),
 	SOF_STATIC_COMP_HOST(
 		.id = 9, .pipeline_id = 2, .name = "USB_CAP",
 		.uuid = &usb_audio_uuid, .direction = SOF_IPC_STREAM_CAPTURE,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2),
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2),
 		.ep.usb.terminal_id = CAPTURE_TERM_ID
 	),
 };
@@ -134,14 +134,14 @@ static const struct sof_static_comp rp2350_comps[] = {
  * 2. Intermediate Audio Buffers
  * ------------------------------------------------------------------------- */
 static const struct sof_static_buffer rp2350_buffers[] = {
-	SOF_STATIC_BUFFER(.id = 1, .size = 3072, .fmt = SOF_IPC_FRAME_S16_LE),
+	SOF_STATIC_BUFFER(.id = 1, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
 	SOF_STATIC_BUFFER(.id = 2, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
 	SOF_STATIC_BUFFER(.id = 3, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
-	SOF_STATIC_BUFFER(.id = 4, .size = 3072, .fmt = SOF_IPC_FRAME_S16_LE),
+	SOF_STATIC_BUFFER(.id = 4, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
 
-	SOF_STATIC_BUFFER(.id = 5, .size = 3072, .fmt = SOF_IPC_FRAME_S16_LE),
+	SOF_STATIC_BUFFER(.id = 5, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
 	SOF_STATIC_BUFFER(.id = 6, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
-	SOF_STATIC_BUFFER(.id = 7, .size = 3072, .fmt = SOF_IPC_FRAME_S16_LE),
+	SOF_STATIC_BUFFER(.id = 7, .size = 3072, .fmt = SOF_IPC_FRAME_FLOAT),
 };
 
 /* -------------------------------------------------------------------------
@@ -179,7 +179,7 @@ static const struct sof_static_pcm rp2350_pcms[] = {
 		.direction = SOF_IPC_STREAM_PLAYBACK,
 		.pipeline_id = 1,
 		.host_comp_id = 1,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2)
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2)
 	),
 	SOF_STATIC_PCM(
 		.pcm_id = 1,
@@ -187,7 +187,7 @@ static const struct sof_static_pcm rp2350_pcms[] = {
 		.direction = SOF_IPC_STREAM_CAPTURE,
 		.pipeline_id = 2,
 		.host_comp_id = 9,
-		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_S16_LE, 48000, 2)
+		.caps = SOF_STATIC_CAPS(SOF_IPC_FRAME_FLOAT, 48000, 2)
 	),
 };
 
@@ -239,10 +239,14 @@ static const struct sof_static_pipeline_desc rp2350_pipelines[] = {
 		.core = 0,
 		.period = 1000, /* 1ms */
 		.frames_per_sched = 48,
-		.time_domain = SOF_TIME_DOMAIN_TIMER,
+		.time_domain = SOF_TIME_DOMAIN_DMA,
 		.sched_comp_id = 1,
 		.source_comp_id = 1,
+#if defined(CONFIG_RP2350_INTERFACE_PIO_I2S)
+		.sink_comp_id = 5,
+#else
 		.sink_comp_id = 4,
+#endif
 	},
 	{
 		.pipeline_id = 2,
@@ -252,9 +256,13 @@ static const struct sof_static_pipeline_desc rp2350_pipelines[] = {
 		.core = 0,
 		.period = 1000, /* 1ms */
 		.frames_per_sched = 48,
-		.time_domain = SOF_TIME_DOMAIN_TIMER,
+		.time_domain = SOF_TIME_DOMAIN_DMA,
 		.sched_comp_id = 9,
+#if defined(CONFIG_RP2350_INTERFACE_PIO_I2S)
+		.source_comp_id = 6,
+#else
 		.source_comp_id = 7,
+#endif
 		.sink_comp_id = 9,
 	},
 };

@@ -93,11 +93,6 @@ static void sof_uac2_send_capture_pending(const struct device *dev)
 	while (1) {
 		void *buf = NULL;
 		if (k_mem_slab_alloc(&uac2_tx_slab, &buf, K_NO_WAIT) != 0) {
-			static uint32_t s_slab_alloc_fails;
-			s_slab_alloc_fails++;
-			if (s_slab_alloc_fails <= 5 || s_slab_alloc_fails % 100 == 0) {
-				LOG_WRN("[UAC2 TX SLAB FULL %u] Failed to allocate TX slab block!", s_slab_alloc_fails);
-			}
 			break;
 		}
 
@@ -111,19 +106,19 @@ static void sof_uac2_send_capture_pending(const struct device *dev)
 			have_data = usb_audio_peek_capture_data(buf, frame_bytes);
 		}
 
-		if (!have_data) {
-			k_mem_slab_free(&uac2_tx_slab, buf);
-			break;
-		}
-
-		if (g_status.capture_mute) {
+		if (have_data) {
+			if (g_status.capture_mute) {
+				memset(buf, 0, frame_bytes);
+			}
+		} else {
+			/* Fallback to silence frame to keep USB isochronous IN streaming active */
 			memset(buf, 0, frame_bytes);
 		}
 
 		int ret = usbd_uac2_send(dev, CAPTURE_TERM_ID, buf, frame_bytes);
 		if (ret == 0) {
 			g_tx_pkt_cnt++;
-			if (!g_status.capture_mute) {
+			if (have_data && !g_status.capture_mute) {
 #if CONFIG_COMP_BT_AUDIO
 				if (g_status.audio_route == SOF_AUDIO_ROUTE_USB_BT) {
 					bt_audio_consume_capture_data(frame_bytes);
@@ -173,6 +168,18 @@ void sof_uac2_sof_cb(const struct device *dev, void *user_data)
 		s_sof_diag_cnt = 0;
 	}
 
+	if (g_status.capture_active) {
+		struct pipeline *pipe = sof_static_pipeline_get(2);
+		if (pipe && pipe->status == COMP_STATE_ACTIVE) {
+			static uint32_t s_cap_copy_cnt;
+			s_cap_copy_cnt++;
+			if (s_cap_copy_cnt == 1 || s_cap_copy_cnt % 1000 == 0) {
+				LOG_INF("[SOF CAP] pipeline_copy #%u", s_cap_copy_cnt);
+			}
+			pipeline_copy(pipe);
+		}
+	}
+
 	if (g_status.capture_active && dev) {
 		sof_uac2_send_capture_pending(dev);
 	}
@@ -181,7 +188,6 @@ void sof_uac2_sof_cb(const struct device *dev, void *user_data)
 void sof_uac2_terminal_update_cb(const struct device *dev, uint8_t terminal,
 				 bool enabled, bool microframes, void *user_data)
 {
-	ARG_UNUSED(dev);
 	ARG_UNUSED(user_data);
 
 	LOG_INF("[UAC2 Terminal] update: terminal %u, enabled %d, microframes %d (PB expected %u, CAP expected %u)",
@@ -234,6 +240,18 @@ void sof_uac2_data_recv_cb(const struct device *dev, uint8_t terminal,
 #endif
 		{
 			usb_audio_feed_playback_data(buf, size);
+		}
+
+		if (g_status.playback_active) {
+			struct pipeline *pipe = sof_static_pipeline_get(1);
+			if (pipe && pipe->status == COMP_STATE_ACTIVE) {
+				static uint32_t s_pb_copy_cnt;
+				s_pb_copy_cnt++;
+				if (s_pb_copy_cnt == 1 || s_pb_copy_cnt % 1000 == 0) {
+					LOG_INF("[SOF PB] pipeline_copy #%u", s_pb_copy_cnt);
+				}
+				pipeline_copy(pipe);
+			}
 		}
 	}
 	if (buf) {

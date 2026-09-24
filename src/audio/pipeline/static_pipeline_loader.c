@@ -827,9 +827,18 @@ int sof_static_pipeline_trigger_by_uac2_term(uint8_t terminal_id, bool start)
 						int ret = pipeline_trigger_run(pipe, dev, COMP_TRIGGER_PRE_START);
 						if (ret < 0) {
 							LOG_ERR("Pipeline %u start trigger failed: %d", cdesc->pipeline_id, ret);
-						} else {
-							pipe->status = COMP_STATE_ACTIVE;
 						}
+						for (size_t j = 0; j < s_active_topo->num_comps; j++) {
+							if (s_active_topo->comps[j].pipeline_id == cdesc->pipeline_id) {
+								struct comp_dev *c = sof_static_comp_get(s_active_topo->comps[j].id);
+								if (c) {
+									comp_trigger(c, COMP_TRIGGER_PRE_START);
+									comp_trigger(c, COMP_TRIGGER_START);
+									c->state = COMP_STATE_ACTIVE;
+								}
+							}
+						}
+						pipe->status = COMP_STATE_ACTIVE;
 					}
 					if (pipe->pipe_task && !task_is_active(pipe->pipe_task)) {
 						pipeline_schedule_copy(pipe, 0);
@@ -839,6 +848,15 @@ int sof_static_pipeline_trigger_by_uac2_term(uint8_t terminal_id, bool start)
 						int ret = pipeline_trigger_run(pipe, dev, COMP_TRIGGER_STOP);
 						if (ret < 0) {
 							LOG_ERR("Pipeline %u stop trigger failed: %d", cdesc->pipeline_id, ret);
+						}
+						for (size_t j = 0; j < s_active_topo->num_comps; j++) {
+							if (s_active_topo->comps[j].pipeline_id == cdesc->pipeline_id) {
+								struct comp_dev *c = sof_static_comp_get(s_active_topo->comps[j].id);
+								if (c) {
+									comp_trigger(c, COMP_TRIGGER_STOP);
+									c->state = COMP_STATE_PAUSED;
+								}
+							}
 						}
 						pipe->status = COMP_STATE_PAUSED;
 					}
@@ -878,9 +896,20 @@ int sof_static_pipeline_trigger(uint32_t pipeline_id, bool start)
 			int ret = pipeline_trigger_run(pipe, dev, COMP_TRIGGER_PRE_START);
 			if (ret < 0) {
 				LOG_ERR("Pipeline %u start trigger failed: %d", pipeline_id, ret);
-			} else {
-				pipe->status = COMP_STATE_ACTIVE;
 			}
+			if (s_active_topo) {
+				for (size_t j = 0; j < s_active_topo->num_comps; j++) {
+					if (s_active_topo->comps[j].pipeline_id == pipeline_id) {
+						struct comp_dev *c = sof_static_comp_get(s_active_topo->comps[j].id);
+						if (c) {
+							comp_trigger(c, COMP_TRIGGER_PRE_START);
+							comp_trigger(c, COMP_TRIGGER_START);
+							c->state = COMP_STATE_ACTIVE;
+						}
+					}
+				}
+			}
+			pipe->status = COMP_STATE_ACTIVE;
 		}
 		if (pipe->pipe_task && !task_is_active(pipe->pipe_task)) {
 			pipeline_schedule_copy(pipe, 0);
@@ -890,6 +919,17 @@ int sof_static_pipeline_trigger(uint32_t pipeline_id, bool start)
 			int ret = pipeline_trigger_run(pipe, dev, COMP_TRIGGER_STOP);
 			if (ret < 0) {
 				LOG_ERR("Pipeline %u stop trigger failed: %d", pipeline_id, ret);
+			}
+			if (s_active_topo) {
+				for (size_t j = 0; j < s_active_topo->num_comps; j++) {
+					if (s_active_topo->comps[j].pipeline_id == pipeline_id) {
+						struct comp_dev *c = sof_static_comp_get(s_active_topo->comps[j].id);
+						if (c) {
+							comp_trigger(c, COMP_TRIGGER_STOP);
+							c->state = COMP_STATE_PAUSED;
+						}
+					}
+				}
 			}
 			pipe->status = COMP_STATE_PAUSED;
 		}
