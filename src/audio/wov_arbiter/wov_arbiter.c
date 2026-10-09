@@ -368,16 +368,18 @@ static int wov_arb_trigger(struct comp_dev *dev, int cmd)
 		cd->drain_frames_copied = 0;
 		cd->drain_frames_total = 0;
 		if (cd->active_slot != WOV_ARB_NO_ACTIVE) {
-			comp_info(dev, "wov_arb: stream stopped, resuming all slots");
 			cd->active_slot = WOV_ARB_NO_ACTIVE;
 #if CONFIG_IPC_MAJOR_4
 			notify_control_change(dev, cd->active_slot_ctl_id, 0);
 #endif
-			struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
-			notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-				       NOTIFIER_TARGET_CORE_ALL_MASK,
-				       &c, sizeof(c));
 		}
+
+		/* Clear any selected-slot filter too; filter writes leave active_slot idle. */
+		comp_info(dev, "wov_arb: stream stopped or paused, resuming all slots");
+		struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
+		notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
+			       NOTIFIER_TARGET_CORE_ALL_MASK,
+			       &c, sizeof(c));
 	}
 
 	return 0;
