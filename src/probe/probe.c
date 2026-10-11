@@ -40,7 +40,6 @@ SOF_DEFINE_REG_UUID(probe);
 #error "No or invalid IPC MAJOR version selected."
 #endif /* CONFIG_IPC_MAJOR_4 */
 
-/* unused with Zephyr, generates no output */
 DECLARE_TR_CTX(pr_tr, SOF_UUID(PROBE_UUID), LOG_LEVEL_INFO);
 
 SOF_DEFINE_REG_UUID(probe_task);
@@ -720,7 +719,7 @@ static int copy_from_pbuffer(struct probe_dma_buf *pbuf, void *data,
  * \param[in] buffer_id component buffer id
  * \param[in] size data size.
  * \param[in] format audio format.
- * \param[out] checksum.
+ * \param[out] checksum
  * \return 0 on success, error code otherwise.
  */
 static int probe_gen_header(uint32_t buffer_id, uint32_t size,
@@ -993,22 +992,18 @@ static void probe_cb_produce(void *arg, struct buffer_cb_transact *cb_data)
 		struct dma_status stat;
 
 		ret = dma_get_status(dma->dc.dmac->z_dev, dma->dc.chan->index, &stat);
-		if (ret < 0) {
-			tr_err(&pr_tr, "dma_get_status() failed, ret = %d", ret);
-			goto err;
-		}
 		dma->dmapb.avail = stat.pending_length;
 		free_bytes = stat.free;
 #else
 		ret = dma_get_data_size_legacy(dma->dc.chan,
 					       &dma->dmapb.avail,
 					       &free_bytes);
+#endif
 		if (ret < 0) {
-			tr_err(&pr_tr, "dma_get_data_size() failed, ret = %d",
+			tr_err(&pr_tr, "dma_get_data_size() failed, ret = %u",
 			       ret);
 			goto err;
 		}
-#endif
 
 		/* check if transaction amount exceeds component buffer end addr */
 		/* if yes: divide copying into two stages, head and tail */

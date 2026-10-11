@@ -17,14 +17,6 @@ struct ipc4_message_request;
 int ipc4_user_process_module_message(struct ipc4_message_request *ipc4, struct ipc_msg *reply);
 
 /**
- * \brief Load a dynamically loadable module.
- * @param[in] drv Component driver.
- * @param[in] mi SOF_IPC4_MOD_INIT_INSTANCE data
- */
-int ipc4_user_module_load(const struct comp_driver *drv,
-			  const struct ipc4_module_init_instance *mi);
-
-/**
  * @brief Process MOD_CONFIG_GET or MOD_CONFIG_SET in any execution context.
  * @param[in] ipc4 IPC4 message request.
  * @param[in] set true for CONFIG_SET, false for CONFIG_GET.
@@ -33,6 +25,19 @@ int ipc4_user_module_load(const struct comp_driver *drv,
  */
 int ipc4_process_module_config(struct ipc4_message_request *ipc4,
 			       bool set, uint32_t *reply_ext);
+
+/**
+ * @brief Process MOD_LARGE_CONFIG_GET in any execution context.
+ * @param[in] ipc4 IPC4 message request.
+ * @param[out] reply_ext Receives extension value for reply.
+ * @param[out] reply_tx_size Receives TX data size for reply.
+ * @param[out] reply_tx_data Receives TX data pointer for reply.
+ * @return IPC4 status code (0 on success).
+ */
+int ipc4_process_large_config_get(struct ipc4_message_request *ipc4,
+				  uint32_t *reply_ext,
+				  uint32_t *reply_tx_size,
+				  void **reply_tx_data);
 
 /**
  * @brief Process MOD_LARGE_CONFIG_SET in any execution context.
@@ -102,10 +107,26 @@ __syscall int ipc_wait_for_compound_msg(void);
 
 #include <zephyr/syscalls/handler.h>
 #else
+/**
+ * @brief Compound IPC message pre-start handler (internal implementation).
+ * @param msg_id IPC message identifier.
+ */
 void z_impl_ipc_compound_pre_start(int msg_id);
 #define ipc_compound_pre_start z_impl_ipc_compound_pre_start
+
+/**
+ * @brief Compound IPC message post-start handler (internal implementation).
+ * @param msg_id IPC message identifier.
+ * @param ret Return status of the IPC processing.
+ * @param delayed True if response is deferred/asynchronous.
+ */
 void z_impl_ipc_compound_post_start(uint32_t msg_id, int ret, bool delayed);
 #define ipc_compound_post_start z_impl_ipc_compound_post_start
+
+/**
+ * @brief Wait for active compound IPC message completion (internal implementation).
+ * @return 0 on success, negative error code on timeout.
+ */
 int z_impl_ipc_wait_for_compound_msg(void);
 #define ipc_wait_for_compound_msg z_impl_ipc_wait_for_compound_msg
 #endif

@@ -5,6 +5,12 @@
  * Author: Liam Girdwood <liam.r.girdwood@linux.intel.com>
  */
 
+/**
+ * @file sof/audio/pipeline.h
+ * @brief Audio pipeline management, graph scheduling, and execution control.
+ * @ingroup audio_pipeline_api
+ */
+
 #ifndef __SOF_AUDIO_PIPELINE_H__
 #define __SOF_AUDIO_PIPELINE_H__
 
@@ -26,7 +32,6 @@ struct comp_dev;
 struct ipc;
 struct ipc_msg;
 struct k_heap;
-struct mod_alloc_ctx;
 
 /*
  * Pipeline status to stop execution of current path, but to keep the
@@ -54,7 +59,7 @@ struct mod_alloc_ctx;
  * Audio pipeline.
  */
 struct pipeline {
-	struct mod_alloc_ctx *alloc;	/**< alloc context used for allocating this pipeline */
+	struct k_heap *heap;	/**< heap used for allocating this pipeline */
 	uint32_t comp_id;	/**< component id for pipeline */
 	uint32_t pipeline_id;	/**< pipeline id */
 	uint32_t sched_id;	/**< Scheduling component id */
@@ -71,6 +76,7 @@ struct pipeline {
 	int32_t xrun_bytes;		/* last xrun length */
 	uint32_t status;		/* pipeline status */
 	struct tr_ctx tctx;		/* trace settings */
+	bool expect_eos;		/* pipeline is expecting end of stream */
 
 	/* scheduling */
 #ifdef CONFIG_IPC_MAJOR_4
@@ -224,13 +230,6 @@ void pipeline_posn_grant_access(struct k_thread *thread);
  * \return 0 on success.
  */
 int pipeline_reset(struct pipeline *p, struct comp_dev *host_cd);
-
-/**
- * \brief Sets End Of Stream state for all devices in the pipeline.
- * \param[in] p pipeline.
- * \param[in] eos End Of Stream state.
- */
-void pipeline_set_eos(struct pipeline *p, bool eos);
 
 /**
  * \brief Walks the pipeline graph for each component.

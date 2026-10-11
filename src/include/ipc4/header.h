@@ -17,7 +17,8 @@
 
 /**
  * \file include/ipc4/header.h
- * \brief IPC4 global definitions.
+ * \brief IPC4 global message headers, envelope formats, and command types.
+ * \ingroup ipc4_api
  * NOTE: This ABI uses bit fields and is non portable.
  */
 
@@ -176,8 +177,8 @@ struct ipc4_message_reply {
 #define SOF_IPC4_SWITCH_CONTROL_PARAM_ID	200
 #define SOF_IPC4_ENUM_CONTROL_PARAM_ID		201
 #define SOF_IPC4_BYTES_CONTROL_PARAM_ID		202
-#define SOF_IPC4_NOTIFY_MODULE_EVENTID_ALSA_MAGIC_VAL ((uint32_t)0xA15A << 16)
-#define SOF_IPC4_NOTIFY_MODULE_EVENTID_COMPR_MAGIC_VAL ((uint32_t)0xC0C0 << 16)
+#define SOF_IPC4_NOTIFY_MODULE_EVENTID_ALSA_MAGIC_VAL ((uint32_t)(0xA15A << 16))
+#define SOF_IPC4_NOTIFY_MODULE_EVENTID_COMPR_MAGIC_VAL ((uint32_t)(0xC0C0 << 16))
 
 /**
  * struct sof_ipc4_ctrl_value_chan: generic channel mapped value data
