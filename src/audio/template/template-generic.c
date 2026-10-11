@@ -198,7 +198,7 @@ const struct template_proc_fnmap template_proc_fnmap[] = {
 #endif
 };
 
-/**
+/*
  * template_find_proc_func() - Find suitable processing function.
  * @src_fmt: Enum value for PCM format.
  *

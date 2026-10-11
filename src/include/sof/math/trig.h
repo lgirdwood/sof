@@ -8,6 +8,12 @@
  *         Shriram Shastry <malladi.sastry@linux.intel.com>
  */
 
+/**
+ * @file sof/math/trig.h
+ * @brief Trigonometric, CORDIC, and polynomial approximation functions.
+ * @ingroup dsp_math_api
+ */
+
 #ifndef __SOF_MATH_TRIG_H__
 #define __SOF_MATH_TRIG_H__
 
@@ -53,19 +59,19 @@ void cordic_approx(int32_t th_rad_fxp, int32_t a_idx, int32_t *sign, int32_t *b_
 
 /**
  * is_scalar_cordic_acos() - CORDIC-based approximation for inverse cosine
- * @param realvalue Input cosine value in Q2.30 format.
- * @param numiters_minus_one Number of iterations minus one.
+ * @param cosvalue Input cosine value in Q2.30 format.
+ * @param numiters Number of iterations.
  * @return Inverse cosine angle in Q3.29 format.
  */
-int32_t is_scalar_cordic_acos(int32_t realvalue, int numiters_minus_one);
+int32_t is_scalar_cordic_acos(int32_t cosvalue, int numiters);
 
 /**
  * is_scalar_cordic_asin() - CORDIC-based approximation for inverse sine
- * @param realvalue Input sine value in Q2.30 format.
- * @param numiters_minus_one Number of iterations minus one.
+ * @param sinvalue Input sine value in Q2.30 format.
+ * @param numiters Number of iterations.
  * @return Inverse sine angle in Q2.30 format.
  */
-int32_t is_scalar_cordic_asin(int32_t realvalue, int numiters_minus_one);
+int32_t is_scalar_cordic_asin(int32_t sinvalue, int numiters);
 
 /**
  * cmpx_cexp() - CORDIC-based approximation of complex exponential e^(j*THETA)

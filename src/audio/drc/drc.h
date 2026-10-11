@@ -4,6 +4,12 @@
  *
  * Author: Pin-chih Lin <johnylin@google.com>
  */
+/**
+ * @file audio/drc/drc.h
+ * @brief Dynamic Range Compressor (DRC) processing component interface.
+ * @ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_DRC_DRC_H__
 #define __SOF_AUDIO_DRC_DRC_H__
 
@@ -93,6 +99,13 @@ struct drc_proc_fnmap {
 extern const struct drc_proc_fnmap drc_proc_fnmap[];
 extern const size_t drc_proc_fncount;
 
+/**
+ * @brief Default pass-through processing callback when Dynamic Range Compression is bypassed.
+ * @param mod Pointer to processing module descriptor.
+ * @param source Pointer to input circular buffer source.
+ * @param sink Pointer to output circular buffer sink.
+ * @param frames Number of audio frames to pass through.
+ */
 void drc_default_pass(struct processing_module *mod,
 		      const struct cir_buf_source *source,
 		      struct cir_buf_sink *sink, uint32_t frames);

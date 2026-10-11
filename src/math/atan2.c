@@ -29,11 +29,11 @@
 #define SOFM_ATAN2_C3 -49499604	 /* Q3.29, -0.092200197922 */
 #define SOFM_ATAN2_C4 12781063	 /* Q3.29, +0.023806584771 */
 
-/**
+/*
  * sofm_atan2_32b() - Compute four-quadrant arctangent of y/x
- * @param y Imaginary component in Q1.31 format
- * @param x Real component in Q1.31 format
- * @return Angle in Q3.29 radians, range [-pi, +pi]
+ * @y: Imaginary component in Q1.31 format
+ * @x: Real component in Q1.31 format
+ * Return: Angle in Q3.29 radians, range [-pi, +pi]
  *
  * Uses degree-9 Remez minimax polynomial for the core atan(z) computation
  * where z = min(|y|,|x|) / max(|y|,|x|) is reduced to [0, 1] range.

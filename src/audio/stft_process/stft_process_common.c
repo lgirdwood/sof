@@ -602,13 +602,9 @@ const struct stft_process_proc_fnmap stft_process_functions[] = {
 };
 
 /**
- * stft_process_find_proc_func() - Find suitable processing function.
- * @src_fmt: Enum value for PCM format.
- *
- * This function finds the suitable processing function to use for
- * the used PCM format. If not found, return NULL.
- *
- * Return: Pointer to processing function for the requested PCM format.
+ * @brief Find suitable processing function.
+ * @param src_fmt Enum value for PCM format.
+ * @return Pointer to processing function for the requested PCM format, or NULL if not found.
  */
 stft_process_func stft_process_find_proc_func(enum sof_ipc_frame src_fmt)
 {

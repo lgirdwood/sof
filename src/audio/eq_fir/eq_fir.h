@@ -5,6 +5,12 @@
  * Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
  */
 
+/**
+ * @file audio/eq_fir/eq_fir.h
+ * @brief Finite Impulse Response (FIR) equalizer component interface.
+ * @ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_EQ_FIR_EQ_FIR_H__
 #define __SOF_AUDIO_EQ_FIR_EQ_FIR_H__
 

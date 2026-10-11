@@ -593,7 +593,7 @@ const struct phase_vocoder_proc_fnmap phase_vocoder_functions[] = {
 #endif
 };
 
-/**
+/*
  * phase_vocoder_find_proc_func() - Find suitable processing function.
  * @src_fmt: Enum value for PCM format.
  *

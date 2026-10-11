@@ -15,10 +15,10 @@
  * original so it's easier to track changes with IPC host code.
  */
 
-/*
- * \file volume/peak_volume.h
- * \brief peak volume definitions.
- * NOTE: This ABI uses bit fields and is non portable.
+/**
+ * @file volume/peak_volume.h
+ * @brief IPC4 Peak Volume and curve ramp configuration definitions.
+ * @ingroup audio_components_api
  */
 
 #ifndef __SOF_IPC4_PEAK_VOL_H__
@@ -80,6 +80,11 @@ struct ipc4_peak_volume_module_cfg {
 	struct ipc4_peak_volume_config config[];
 } __packed __aligned(4);
 
+/**
+ * @brief Convert IPC4 volume curve type enum to internal SOF volume ramp curve type.
+ * @param ipc4_type IPC4 curve type enum value.
+ * @return Corresponding SOF volume ramp type (SOF_VOLUME_LINEAR, SOF_VOLUME_LOG, etc.).
+ */
 static inline enum sof_volume_ramp ipc4_curve_type_convert(enum ipc4_curve_type ipc4_type)
 {
 	switch (ipc4_type) {

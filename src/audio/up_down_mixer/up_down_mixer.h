@@ -85,6 +85,12 @@ static inline channel_map create_channel_map(enum ipc4_channel_config channel_co
 	}
 }
 
+/**
+ * @brief Find the nibble index (spatial channel slot 0-7) where a channel is mapped.
+ * @param map Channel map bitfield.
+ * @param channel Channel index enum to locate.
+ * @return Nibble position (0-7), or 0xF if the channel is not present in the map.
+ */
 static inline uint8_t get_channel_location(const channel_map map,
 					   const enum ipc4_channel_index channel)
 {
@@ -102,6 +108,12 @@ static inline uint8_t get_channel_location(const channel_map map,
 	return offset;
 }
 
+/**
+ * @brief Extract the channel index enum at a specified slot location in a channel map.
+ * @param map Channel map bitfield.
+ * @param location Slot location (0-7).
+ * @return Extracted channel index enum value.
+ */
 static inline enum ipc4_channel_index get_channel_index(const channel_map map,
 							const uint8_t location)
 {

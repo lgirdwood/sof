@@ -38,7 +38,7 @@ LOG_MODULE_REGISTER(math_auditory, CONFIG_SOF_LOG_LEVEL);
 #define ONE_OVER_LOG2TEN_Q29	Q_CONVERT_FLOAT(0.3010299957, 29) /* 1/log2(10) */
 #define TEN_OVER_LOG2TEN_Q29	Q_CONVERT_FLOAT(3.0102999566, 29) /* 10/log2(10) */
 
-/**
+/*
  * Convert Hz to Mel
  * Wikipedia https://en.wikipedia.org/wiki/Mel_scale
  * mel = 1126.9941805389 * log(1 + hz / 700)
@@ -63,7 +63,7 @@ int16_t psy_hz_to_mel(int16_t hz)
 	return mel;
 }
 
-/**
+/*
  * Convert Mel to Hz
  * Wikipedia https://en.wikipedia.org/wiki/Mel_scale
  * hz = 700 * (exp(mel / 1126.9941805389) - 1)

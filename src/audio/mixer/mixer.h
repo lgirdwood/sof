@@ -5,6 +5,12 @@
  * Author: Janusz Jankowski <janusz.jankowski@linux.intel.com>
  */
 
+/**
+ * @file audio/mixer/mixer.h
+ * @brief Audio mixer processing component interface.
+ * @ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_MIXER_H__
 #define __SOF_AUDIO_MIXER_H__
 

@@ -7,6 +7,12 @@
  *         Keyon Jie <yang.jie@linux.intel.com>
  */
 
+/**
+ * @file audio/eq_iir/eq_iir.h
+ * @brief Infinite Impulse Response (IIR) equalizer component interface.
+ * @ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_EQ_IIR_EQ_IIR_H__
 #define __SOF_AUDIO_EQ_IIR_EQ_IIR_H__
 

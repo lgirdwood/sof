@@ -27,10 +27,9 @@
  * TODO: Add option for no ortho norm.
  */
 
-/**
- * \brief Initialize a 16 bit DCT matrix. The actual DCT transform is a matrix
+/*
+ * Initialize a 16 bit DCT matrix. The actual DCT transform is a matrix
  * multiply with the returned matrix.
- * \param[in,out]  dct  In input provide DCT type and size, in output the DCT matrix
  */
 int mod_dct_initialize_16(struct processing_module *mod, struct dct_plan_16 *dct)
 {

@@ -3,6 +3,13 @@
  * Copyright(c) 2025 Intel Corporation.
  *
  */
+
+/**
+ * \file audio/stft_process/stft_process.h
+ * \brief Short-Time Fourier Transform (STFT) processing module header
+ * \ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_STFT_PROCESS_H__
 #define __SOF_AUDIO_STFT_PROCESS_H__
 
@@ -90,11 +97,12 @@ struct stft_process_state {
 };
 
 /**
- * struct stft_process_func - Function call pointer for process function
- * @mod: Pointer to module data.
- * @source: Source for PCM samples data.
- * @sink: Sink for PCM samples data.
- * @frames: Number of audio data frames to process.
+ * @brief Function pointer for STFT audio processing function
+ * @param mod Pointer to module data.
+ * @param source Source for PCM samples data.
+ * @param sink Sink for PCM samples data.
+ * @param frames Number of audio data frames to process.
+ * @return Zero on success, negative error code on failure.
  */
 typedef int (*stft_process_func)(const struct processing_module *mod,
 			     struct sof_source *source,
@@ -102,31 +110,38 @@ typedef int (*stft_process_func)(const struct processing_module *mod,
 			     uint32_t frames);
 
 /**
- * struct stft_comp_data
- * @stft_process_func: Pointer to used processing function.
- * @channels_order[]: Vector with desired sink channels order.
- * @source_format: Source samples format.
- * @frame_bytes: Number of bytes in an audio frame.
- * @channels: Channels count.
- * @enable: Control processing on/off, on - reorder channels
+ * @struct stft_comp_data
+ * @brief STFT component private data.
  */
 struct stft_comp_data {
-	stft_process_func stft_process_func;		/**< processing function */
-	struct stft_process_state state;
-	struct sof_stft_process_config *config;
-	size_t frame_bytes;
-	int source_channel;
-	int max_frames;
-	int channels;
-	bool fft_done;
+	stft_process_func stft_process_func; /**< Processing function */
+	struct stft_process_state state; /**< STFT processing state */
+	struct sof_stft_process_config *config; /**< STFT configuration */
+	size_t frame_bytes; /**< Frame size in bytes */
+	int source_channel; /**< Source channel index */
+	int max_frames; /**< Maximum number of frames */
+	int channels; /**< Channel count */
+	bool fft_done; /**< FFT execution flag */
 };
 
+/**
+ * @brief Calculate number of samples available in buffer without wrapping
+ * @param buffer Pointer to STFT circular buffer.
+ * @param ptr Current read or write pointer within buffer.
+ * @return Number of contiguous samples before the end of the buffer.
+ */
 static inline int stft_process_buffer_samples_without_wrap(struct stft_process_buffer *buffer,
 							   int32_t *ptr)
 {
 	return buffer->end_addr - ptr;
 }
 
+/**
+ * @brief Wrap buffer pointer if it reaches or exceeds the buffer end address
+ * @param buffer Pointer to STFT circular buffer.
+ * @param ptr Pointer to wrap.
+ * @return Wrapped pointer within the buffer boundary.
+ */
 static inline int32_t *stft_process_buffer_wrap(struct stft_process_buffer *buffer, int32_t *ptr)
 {
 	if (ptr >= buffer->end_addr)
@@ -136,61 +151,48 @@ static inline int32_t *stft_process_buffer_wrap(struct stft_process_buffer *buff
 }
 
 /**
- * struct stft_process_proc_fnmap - processing functions for frame formats
- * @frame_fmt: Current frame format
- * @stft_process_proc_func: Function pointer for the suitable processing function
+ * @struct stft_process_proc_fnmap
+ * @brief Processing functions for frame formats.
  */
 struct stft_process_proc_fnmap {
-	enum sof_ipc_frame frame_fmt;
-	stft_process_func stft_process_function;
+	enum sof_ipc_frame frame_fmt; /**< Current frame format */
+	stft_process_func stft_process_function; /**< Function pointer for the suitable processing function */
 };
 
 /**
- * stft_process_find_proc_func() - Find suitable processing function.
- * @src_fmt: Enum value for PCM format.
- *
- * This function finds the suitable processing function to use for
- * the used PCM format. If not found, return NULL.
- *
- * Return: Pointer to processing function for the requested PCM format.
+ * @brief Find suitable processing function.
+ * @param src_fmt Enum value for PCM format.
+ * @return Pointer to processing function for the requested PCM format, or NULL if not found.
  */
 stft_process_func stft_process_find_proc_func(enum sof_ipc_frame src_fmt);
 
 #if CONFIG_IPC_MAJOR_4
 /**
- * stft_process_set_config() - Handle controls set
- * @mod: Pointer to module data.
- * @param_id: Id to know control type, used to know ALSA control type.
- * @pos: Position of the fragment in the large message.
- * @data_offset_size: Size of the whole configuration if it is the first or only
- *                    fragment. Otherwise it is offset of the fragment.
- * @fragment: Message payload data.
- * @fragment_size: Size of this fragment.
- * @response_size: Size of response.
- *
- * This function handles the real-time controls. The ALSA controls have the
- * param_id set to indicate the control type. The control ID, from topology,
- * is used to separate the controls instances of same type. In control payload
- * the num_elems defines to how many channels the control is applied to.
- *
- * Return: Zero if success, otherwise error code.
+ * @brief Handle controls set for STFT process module.
+ * @param mod Pointer to module data.
+ * @param param_id Id to know control type, used to know ALSA control type.
+ * @param pos Position of the fragment in the large message.
+ * @param data_offset_size Size of the whole configuration if it is the first or only
+ *                         fragment. Otherwise it is offset of the fragment.
+ * @param fragment Message payload data.
+ * @param fragment_size Size of this fragment.
+ * @param response Size of response buffer.
+ * @param response_size Size of response.
+ * @return Zero if success, otherwise error code.
  */
 int stft_process_set_config(struct processing_module *mod, uint32_t param_id,
 			    enum module_cfg_fragment_position pos, uint32_t data_offset_size,
 			    const uint8_t *fragment, size_t fragment_size,
 			    uint8_t *response, size_t response_size);
 /**
- * stft_process_set_config() - Handle controls get
- * @mod: Pointer to module data.
- * @config_id: Configuration ID.
- * @data_offset_size: Size of the whole configuration if it is the first or only
- *                    fragment. Otherwise it is offset of the fragment.
- * @fragment: Message payload data.
- * @fragment_size: Size of this fragment.
- *
- * This function is used for controls get.
- *
- * Return: Zero if success, otherwise error code.
+ * @brief Handle controls get for STFT process module.
+ * @param mod Pointer to module data.
+ * @param config_id Configuration ID.
+ * @param data_offset_size Size of the whole configuration if it is the first or only
+ *                         fragment. Otherwise it is offset of the fragment.
+ * @param fragment Message payload data.
+ * @param fragment_size Size of this fragment.
+ * @return Zero if success, otherwise error code.
  */
 int stft_process_get_config(struct processing_module *mod, uint32_t config_id,
 			    uint32_t *data_offset_size, uint8_t *fragment, size_t fragment_size);
@@ -213,126 +215,83 @@ static inline int stft_process_get_config(struct processing_module *mod, uint32_
 #endif
 
 /**
- * stft_process_setup() - Initialize STFT processing state and allocate buffers.
- * @mod: Pointer to processing module.
- * @max_frames: Maximum number of frames per processing call.
- * @rate: Audio sample rate in Hz.
- * @channels: Number of audio channels.
- *
- * Configures FFT parameters, allocates aligned sample and FFT buffers,
- * sets up window function, and creates FFT/IFFT plans based on the
- * component configuration.
- *
- * Return: Zero on success, otherwise a negative error code.
+ * @brief Initialize STFT processing state and allocate buffers.
+ * @param mod Pointer to processing module.
+ * @param max_frames Maximum number of frames per processing call.
+ * @param rate Audio sample rate in Hz.
+ * @param channels Number of audio channels.
+ * @return Zero on success, otherwise a negative error code.
  */
 int stft_process_setup(struct processing_module *mod, int max_frames, int rate, int channels);
 
 /**
- * stft_process_source_s16() - Copy S16_LE source data to STFT internal buffers.
- * @cd: STFT component data.
- * @source: Source for PCM samples data.
- * @frames: Number of audio data frames to process.
- *
- * De-interleaves S16_LE audio frames from the source circular buffer
- * into per-channel internal circular buffers. Each 16-bit sample is
- * converted to Q1.31 format by left-shifting 16 bits.
- *
- * Return: Zero on success, otherwise an error code.
+ * @brief Copy S16_LE source data to STFT internal buffers.
+ * @param cd STFT component data.
+ * @param source Source for PCM samples data.
+ * @param frames Number of audio data frames to process.
+ * @return Zero on success, otherwise an error code.
  */
 int stft_process_source_s16(struct stft_comp_data *cd, struct sof_source *source, int frames);
 
 /**
- * stft_process_sink_s16() - Copy STFT internal buffers to S16_LE sink.
- * @cd: STFT component data.
- * @sink: Sink for PCM samples data.
- * @frames: Number of audio data frames to produce.
- *
- * Interleaves per-channel STFT output buffers into the sink circular
- * buffer in S16_LE format. Q1.31 samples are converted to Q1.15 with
- * rounding and saturation. Output buffer samples are cleared after
- * reading to prepare for the next overlap-add cycle.
- *
- * Return: Zero on success, otherwise an error code.
+ * @brief Copy STFT internal buffers to S16_LE sink.
+ * @param cd STFT component data.
+ * @param sink Sink for PCM samples data.
+ * @param frames Number of audio data frames to produce.
+ * @return Zero on success, otherwise an error code.
  */
 int stft_process_sink_s16(struct stft_comp_data *cd, struct sof_sink *sink, int frames);
 
 /**
- * stft_process_source_s32() - Copy S32_LE source data to STFT internal buffers.
- * @cd: STFT component data.
- * @source: Source for PCM samples data.
- * @frames: Number of audio data frames to process.
- *
- * De-interleaves S32_LE audio frames from the source circular buffer
- * into per-channel internal circular buffers.
- *
- * Return: Zero on success, otherwise an error code.
+ * @brief Copy S32_LE source data to STFT internal buffers.
+ * @param cd STFT component data.
+ * @param source Source for PCM samples data.
+ * @param frames Number of audio data frames to process.
+ * @return Zero on success, otherwise an error code.
  */
 int stft_process_source_s32(struct stft_comp_data *cd, struct sof_source *source, int frames);
 
 /**
- * stft_process_sink_s32() - Copy STFT internal buffers to S32_LE sink.
- * @cd: STFT component data.
- * @sink: Sink for PCM samples data.
- * @frames: Number of audio data frames to produce.
- *
- * Interleaves per-channel STFT output buffers into the sink circular
- * buffer in S32_LE format. The output buffer samples are cleared after
- * reading to prepare for the next overlap-add cycle.
- *
- * Return: Zero on success, otherwise an error code.
+ * @brief Copy STFT internal buffers to S32_LE sink.
+ * @param cd STFT component data.
+ * @param sink Sink for PCM samples data.
+ * @param frames Number of audio data frames to produce.
+ * @return Zero on success, otherwise an error code.
  */
 int stft_process_sink_s32(struct stft_comp_data *cd, struct sof_sink *sink, int frames);
 
 /**
- * stft_process_free_buffers() - Free all STFT processing buffers.
- * @mod: Pointer to processing module.
- *
- * Releases sample buffers, FFT buffers, and FFT/IFFT plans allocated
- * during stft_process_setup().
+ * @brief Free all STFT processing buffers.
+ * @param mod Pointer to processing module.
  */
 void stft_process_free_buffers(struct processing_module *mod);
 
 /**
- * stft_process_fill_prev_samples() - Save overlap samples for next STFT frame.
- * @buf: Circular buffer to read overlap samples from.
- * @prev_data: Destination array for the overlap data.
- * @prev_data_length: Number of samples to copy.
- *
- * Copies prev_data_length samples from the circular buffer into the
- * linear prev_data array, handling wrap-around as needed.
+ * @brief Save overlap samples for next STFT frame.
+ * @param buf Circular buffer to read overlap samples from.
+ * @param prev_data Destination array for the overlap data.
+ * @param prev_data_length Number of samples to copy.
  */
 void stft_process_fill_prev_samples(struct stft_process_buffer *buf, int32_t *prev_data,
 				    int prev_data_length);
 
 /**
- * stft_process_fill_fft_buffer() - Assemble FFT input from overlap and new data.
- * @state: STFT processing state.
- * @ch: Channel index.
- *
- * Constructs the FFT input buffer by concatenating the previous overlap
- * samples and one hop of new samples from the input circular buffer.
- * Imaginary parts are set to zero. The overlap buffer is updated with
- * data for the next frame.
+ * @brief Assemble FFT input from overlap and new data.
+ * @param state STFT processing state.
+ * @param ch Channel index.
  */
 void stft_process_fill_fft_buffer(struct stft_process_state *state, int ch);
 
 /**
- * stft_process_apply_window() - Multiply FFT buffer by the analysis window.
- * @state: STFT processing state that contains the FFT buffer and window.
- *
- * The real part of each complex sample in the FFT buffer is multiplied
- * by the corresponding Q1.31 window coefficient.
+ * @brief Multiply FFT buffer by the analysis window.
+ * @param state STFT processing state that contains the FFT buffer and window.
  */
 void stft_process_apply_window(struct stft_process_state *state);
 
 /**
- * stft_process_overlap_add_ifft_buffer() - Overlap-add IFFT output to circular output buffer.
- * @state: STFT processing state.
- * @ch: Channel index.
- *
- * Each IFFT output sample is multiplied by the gain compensation value
- * and added with saturation to the existing content of the circular
- * output buffer.
+ * @brief Overlap-add IFFT output to circular output buffer.
+ * @param state STFT processing state.
+ * @param ch Channel index.
  */
 void stft_process_overlap_add_ifft_buffer(struct stft_process_state *state, int ch);
 

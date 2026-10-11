@@ -274,7 +274,7 @@ const struct sound_dose_proc_fnmap sound_dose_proc_fnmap[] = {
 #endif
 };
 
-/**
+/*
  * sound_dose_find_proc_func() - Find suitable processing function.
  * @src_fmt: Enum value for PCM format.
  *

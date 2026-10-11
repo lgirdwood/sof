@@ -107,15 +107,15 @@ uint8_t sofm_mu_law_encode(int16_t sample)
 	return byte;
 }
 
-/**
+/*
  * sofm_mu_law_decode() - Decode mu-law encoded code word
- * @param byte: Encoded code word
+ * @byte: Encoded code word
  *
  * The mu-law decoder expands a 8 bit code word into a 14 bit sample value.
  * In the SOF the high 14 bits are aligned to the most significant bits
  * to be compatible with normal s16 Q1.15 samples.
  *
- * @return: Sampple value in s16 format
+ * Return: Sample value in s16 format
  */
 int16_t sofm_mu_law_decode(int8_t byte)
 {

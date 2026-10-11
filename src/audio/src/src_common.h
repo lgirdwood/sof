@@ -5,6 +5,12 @@
  * Author: Seppo Ingalsuo <seppo.ingalsuo@linux.intel.com>
  */
 
+/**
+ * @file audio/src/src_common.h
+ * @brief Sample Rate Converter (SRC) processing component interface.
+ * @ingroup audio_components_api
+ */
+
 #ifndef __SOF_AUDIO_SRC_SRC_COMMON_H__
 #define __SOF_AUDIO_SRC_SRC_COMMON_H__
 

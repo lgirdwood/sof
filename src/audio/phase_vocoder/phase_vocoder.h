@@ -42,31 +42,21 @@ enum sof_phase_vocoder_fft_window_type {
 };
 
 /**
- * struct sof_phase_vocoder_config - IPC configuration blob for phase vocoder
- * @size: Size of this struct in bytes
- * @reserved: Reserved for future use
- * @sample_frequency: Sample rate in Hz, e.g. 16000
- * @window_gain_comp: Q1.31 gain for IFFT
- * @reserved_32: Reserved for future use
- * @mono: Set to 1 for mono, zero for all channels
- * @frame_length: Frame length in samples, e.g. 400 for 25 ms @ 16 kHz
- * @frame_shift: Frame shift in samples, e.g. 160 for 10 ms @ 16 kHz
- * @reserved_16: Reserved for future use
- * @reserved_pad: Reserved for future use, kept for ABI compatibility
- * @window: Window type, use RECTANGULAR_WINDOW, etc.
+ * @struct sof_phase_vocoder_config
+ * @brief IPC configuration blob for phase vocoder.
  */
 struct sof_phase_vocoder_config {
-	uint32_t size;
-	uint32_t reserved[8];
-	int32_t sample_frequency;
-	int32_t window_gain_comp;
-	int32_t reserved_32;
-	int16_t mono;
-	int16_t frame_length;
-	int16_t frame_shift;
-	int16_t reserved_16;
-	int32_t reserved_pad;
-	enum sof_phase_vocoder_fft_window_type window;
+	uint32_t size; /**< Size of this struct in bytes */
+	uint32_t reserved[8]; /**< Reserved for future use */
+	int32_t sample_frequency; /**< Sample rate in Hz, e.g. 16000 */
+	int32_t window_gain_comp; /**< Q1.31 gain for IFFT */
+	int32_t reserved_32; /**< Reserved for future use */
+	int16_t mono; /**< Set to 1 for mono, zero for all channels */
+	int16_t frame_length; /**< Frame length in samples, e.g. 400 for 25 ms @ 16 kHz */
+	int16_t frame_shift; /**< Frame shift in samples, e.g. 160 for 10 ms @ 16 kHz */
+	int16_t reserved_16; /**< Reserved for future use */
+	int32_t reserved_pad; /**< Reserved for future use, kept for ABI compatibility */
+	enum sof_phase_vocoder_fft_window_type window; /**< Window type, use RECTANGULAR_WINDOW, etc. */
 } __attribute__((packed));
 
 /**
@@ -182,35 +172,23 @@ typedef int (*phase_vocoder_func)(const struct processing_module *mod, struct so
 				  uint32_t sink_frames);
 
 /**
- * struct phase_vocoder_comp_data - Phase vocoder component data
- * @phase_vocoder_func: Pointer to used processing function.
- * @state: Phase vocoder algorithm state.
- * @config: Configuration blob for the module.
- * @mono_mix_coef: Gain for channel for mixing, Q1.15
- * @sample_rate: Audio sample rate in Hz
- * @speed_ctrl: Speed Q3.29, allowed range 0.5 to 2.0
- * @speed_enum: Speed control value as enum 0-15
- * @frame_bytes: Number of bytes in an audio frame.
- * @max_input_frames: Maximum number of input frames per processing call
- * @max_output_frames: Maximum number of output frames per processing call
- * @stream_channels: Channels count to consume/produce
- * @process_channels: Channels count to process.
- * @enable: Control processing on/off, off is pass-through
+ * @struct phase_vocoder_comp_data
+ * @brief Phase vocoder component data.
  */
 struct phase_vocoder_comp_data {
-	phase_vocoder_func phase_vocoder_func;
-	struct phase_vocoder_state state;
-	struct sof_phase_vocoder_config *config;
-	int32_t mono_mix_coef;
-	int32_t sample_rate;
-	int32_t speed_ctrl;
-	int32_t speed_enum;
-	size_t frame_bytes;
-	int max_input_frames;
-	int max_output_frames;
-	int stream_channels;
-	int process_channels;
-	bool enable;
+	phase_vocoder_func phase_vocoder_func; /**< Pointer to used processing function. */
+	struct phase_vocoder_state state; /**< Phase vocoder algorithm state. */
+	struct sof_phase_vocoder_config *config; /**< Configuration blob for the module. */
+	int32_t mono_mix_coef; /**< Gain for channel for mixing, Q1.15 */
+	int32_t sample_rate; /**< Audio sample rate in Hz */
+	int32_t speed_ctrl; /**< Speed Q3.29, allowed range 0.5 to 2.0 */
+	int32_t speed_enum; /**< Speed control value as enum 0-15 */
+	size_t frame_bytes; /**< Number of bytes in an audio frame. */
+	int max_input_frames; /**< Maximum number of input frames per processing call */
+	int max_output_frames; /**< Maximum number of output frames per processing call */
+	int stream_channels; /**< Channels count to consume/produce */
+	int process_channels; /**< Channels count to process. */
+	bool enable; /**< Control processing on/off, off is pass-through */
 };
 
 static inline int phase_vocoder_buffer_samples_without_wrap(struct phase_vocoder_buffer *buffer,
@@ -238,13 +216,9 @@ struct phase_vocoder_proc_fnmap {
 };
 
 /**
- * phase_vocoder_find_proc_func() - Find suitable processing function.
- * @src_fmt: Enum value for PCM format.
- *
- * This function finds the suitable processing function to use for
- * the used PCM format. If not found, return NULL.
- *
- * Return: Pointer to processing function for the requested PCM format.
+ * @brief Find suitable processing function.
+ * @param src_fmt Enum value for PCM format.
+ * @return Pointer to processing function for the requested PCM format, or NULL if not found.
  */
 phase_vocoder_func phase_vocoder_find_proc_func(enum sof_ipc_frame src_fmt);
 

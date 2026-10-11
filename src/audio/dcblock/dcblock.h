@@ -88,11 +88,33 @@ static inline dcblock_func dcblock_find_func(enum sof_ipc_frame src_fmt)
 	return NULL;
 }
 
+/**
+ * @brief Retrieve current DC-blocking filter configuration payload via IPC.
+ * @param mod Pointer to processing module descriptor.
+ * @param fragment Output buffer to receive configuration fragment.
+ * @param fragment_size Size in bytes of output fragment buffer.
+ * @return Number of bytes written, or negative error code.
+ */
 int dcblock_get_ipc_config(struct processing_module *mod,
 			   uint8_t *fragment, size_t fragment_size);
+
+/**
+ * @brief Apply incoming DC-blocking filter configuration payload from host IPC.
+ * @param mod Pointer to processing module descriptor.
+ * @param pos Fragment position (first, intermediate, last, single).
+ * @param data_offset_size Offset or size of incoming data block.
+ * @param fragment Pointer to incoming configuration payload bytes.
+ * @param fragment_size Size in bytes of payload fragment.
+ * @return 0 on success, negative error code on failure.
+ */
 int dcblock_set_ipc_config(struct processing_module *mod,
 			   enum module_cfg_fragment_position pos, uint32_t data_offset_size,
 			   const uint8_t *fragment, size_t fragment_size);
+
+/**
+ * @brief Configure internal DC-blocking high-pass filter parameters for stream sample rate.
+ * @param mod Pointer to processing module descriptor.
+ */
 void dcblock_params(struct processing_module *mod);
 
 #endif /* __SOF_AUDIO_DCBLOCK_DCBLOCK_H__ */

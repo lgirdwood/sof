@@ -8,6 +8,7 @@
 /**
  * \file volume/volume.h
  * \brief Volume component header file
+ * \ingroup audio_components_api
  * \authors Liam Girdwood <liam.r.girdwood@linux.intel.com>\n
  *          Keyon Jie <yang.jie@linux.intel.com>\n
  *          Tomasz Lauda <tomasz.lauda@linux.intel.com>
