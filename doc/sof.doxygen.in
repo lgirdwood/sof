@@ -23,7 +23,8 @@ INPUT            = @top_srcdir@/src/include/ipc \
                    @top_srcdir@/src/debug \
                    @top_srcdir@/xtos/include \
                    @top_srcdir@/zephyr/include \
-                   @top_srcdir@/doc/groups.dox
+                   @top_srcdir@/doc/groups.dox \
+                   @top_srcdir@/doc/mainpage.dox
 # Exclude some 3rd party codec headers with external references
 EXCLUDE		 = @top_srcdir@/src/include/sof/audio/MaxxEffect
 EXCLUDE_PATTERNS = */test/* \
