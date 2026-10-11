@@ -138,6 +138,8 @@ void user_grant_dai_access_all(struct k_thread *thread);
  */
 void user_grant_dma_access_all(struct k_thread *thread);
 
+#else
+
 /**
  * @brief Add access to mailbox.h interface to a user-space thread (no-op stub when CONFIG_USERSPACE is disabled).
  * @param domain Memory domain.

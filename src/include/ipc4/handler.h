@@ -17,6 +17,14 @@ struct ipc4_message_request;
 int ipc4_user_process_module_message(struct ipc4_message_request *ipc4, struct ipc_msg *reply);
 
 /**
+ * \brief Load a dynamically loadable module.
+ * @param[in] drv Component driver.
+ * @param[in] mi SOF_IPC4_MOD_INIT_INSTANCE data
+ */
+int ipc4_user_module_load(const struct comp_driver *drv,
+			  const struct ipc4_module_init_instance *mi);
+
+/**
  * @brief Process MOD_CONFIG_GET or MOD_CONFIG_SET in any execution context.
  * @param[in] ipc4 IPC4 message request.
  * @param[in] set true for CONFIG_SET, false for CONFIG_GET.
@@ -25,19 +33,6 @@ int ipc4_user_process_module_message(struct ipc4_message_request *ipc4, struct i
  */
 int ipc4_process_module_config(struct ipc4_message_request *ipc4,
 			       bool set, uint32_t *reply_ext);
-
-/**
- * @brief Process MOD_LARGE_CONFIG_GET in any execution context.
- * @param[in] ipc4 IPC4 message request.
- * @param[out] reply_ext Receives extension value for reply.
- * @param[out] reply_tx_size Receives TX data size for reply.
- * @param[out] reply_tx_data Receives TX data pointer for reply.
- * @return IPC4 status code (0 on success).
- */
-int ipc4_process_large_config_get(struct ipc4_message_request *ipc4,
-				  uint32_t *reply_ext,
-				  uint32_t *reply_tx_size,
-				  void **reply_tx_data);
 
 /**
  * @brief Process MOD_LARGE_CONFIG_SET in any execution context.
