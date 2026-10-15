@@ -211,6 +211,16 @@ if(NOT "${MWW_TOOLCHAIN_ROOT}" STREQUAL "")
 	list(APPEND MWW_LIBS_PATHS ${MWW_TOOLCHAIN_ROOT}/lib)
 endif()
 
+set(MWW_LLEXT_LIBS mww_tflm_lib)
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+	# expf(), logf() etc. used by the TFLM kernels: the base firmware
+	# doesn't export a libm, so link the needed toolchain libc members
+	# into the module. These aren't built with -mlongcalls, so their
+	# soft-float helper calls must be resolved within the module too,
+	# a direct call can't reach the base firmware.
+	list(APPEND MWW_LLEXT_LIBS c gcc)
+endif()
+
 sof_llext_build("mww"
 	SOURCES
 		../mww.c
@@ -222,7 +232,7 @@ sof_llext_build("mww"
 		${RUY_PATH}
 		${sof_top_dir}/posix/include
 	LIBS
-		mww_tflm_lib
+		${MWW_LLEXT_LIBS}
 	LIBS_PATH
 		${MWW_LIBS_PATHS}
 )
