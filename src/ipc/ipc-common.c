@@ -96,6 +96,7 @@ struct ipc_msg *ipc_msg_w_ext_init(struct k_heap *heap, uint32_t header,
 
 	return msg;
 }
+EXPORT_SYMBOL(ipc_msg_w_ext_init);
 
 int ipc_process_on_core(uint32_t core, bool blocking)
 {
