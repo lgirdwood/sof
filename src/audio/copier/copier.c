@@ -612,6 +612,9 @@ static int copier_module_copy(struct processing_module *mod,
 	struct copier_data *cd = module_get_private_data(mod);
 	struct comp_buffer *src_c;
 	struct comp_copy_limits processed_data;
+	int common_frames = 0;
+	int common_source_bytes = 0;
+	bool have_active_sink = false;
 	int i;
 
 	if (!num_input_buffers || !num_output_buffers)
@@ -621,13 +624,41 @@ static int copier_module_copy(struct processing_module *mod,
 
 	processed_data.source_bytes = 0;
 
+	/* Fanout consumers share one source read pointer, so advance only as far as
+	 * every active sink has room to accept.
+	 */
+	for (i = 0; i < num_output_buffers; i++) {
+		struct comp_buffer *sink_c;
+		struct comp_dev *sink_dev;
+		struct comp_copy_limits sink_limits;
+		int sink_queue_id;
+
+		sink_c = container_of(output_buffers[i].data, struct comp_buffer, stream);
+		sink_dev = comp_buffer_get_sink_component(sink_c);
+		if (sink_dev->state != COMP_STATE_ACTIVE)
+			continue;
+
+		sink_queue_id = IPC4_SRC_QUEUE_ID(buf_get_id(sink_c));
+		if (sink_queue_id >= IPC4_COPIER_MODULE_OUTPUT_PINS_COUNT)
+			return -EINVAL;
+
+		comp_get_copy_limits(src_c, sink_c, &sink_limits);
+		if (!have_active_sink || sink_limits.frames < common_frames) {
+			common_frames = sink_limits.frames;
+			common_source_bytes = sink_limits.source_bytes;
+			have_active_sink = true;
+		}
+	}
+
 	/* convert format and copy to each active sink */
 	for (i = 0; i < num_output_buffers; i++) {
 		struct comp_buffer *sink_c;
 		struct comp_dev *sink_dev;
+		int sink_queue_id;
 
 		sink_c = container_of(output_buffers[i].data, struct comp_buffer, stream);
 		sink_dev = comp_buffer_get_sink_component(sink_c);
+		sink_queue_id = IPC4_SRC_QUEUE_ID(buf_get_id(sink_c));
 		processed_data.sink_bytes = 0;
 		if (sink_dev->state == COMP_STATE_ACTIVE) {
 			/* Bridge the legacy audio_stream buffers into cir_buf descriptors for
@@ -644,7 +675,6 @@ static int copier_module_copy(struct processing_module *mod,
 				.ptr = audio_stream_get_wptr(output_buffers[i].data),
 			};
 			uint32_t source_samples;
-			int sink_queue_id;
 			pcm_converter_func converter;
 
 			/*
@@ -652,12 +682,15 @@ static int copier_module_copy(struct processing_module *mod,
 			 * From the buffer's perspective, copier's sink is the source,
 			 * so we use IPC4_SRC_QUEUE_ID() to get the correct copier sink index.
 			 */
-			sink_queue_id = IPC4_SRC_QUEUE_ID(buf_get_id(sink_c));
 			if (sink_queue_id >= IPC4_COPIER_MODULE_OUTPUT_PINS_COUNT)
 				return -EINVAL;
 			converter = cd->converter[sink_queue_id];
 
 			comp_get_copy_limits(src_c, sink_c, &processed_data);
+			processed_data.frames = common_frames;
+			processed_data.source_bytes = common_source_bytes;
+			processed_data.sink_bytes =
+				common_frames * processed_data.sink_frame_bytes;
 
 			source_samples = processed_data.frames *
 					audio_stream_get_channels(input_buffers[0].data);
@@ -670,7 +703,7 @@ static int copier_module_copy(struct processing_module *mod,
 		}
 	}
 
-	input_buffers[0].consumed = processed_data.source_bytes;
+	input_buffers[0].consumed = have_active_sink ? common_source_bytes : 0;
 
 	return 0;
 }
