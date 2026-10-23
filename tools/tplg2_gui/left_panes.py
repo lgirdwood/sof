@@ -75,16 +75,19 @@ class LeftNavigationPanel(Gtk.Box):
 
         # Pack the 4 vertical sub-panes into nested vertical Gtk.Paned so each is resizable
         vpaned_top = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        vpaned_top.set_wide_handle(True)
         vpaned_top.set_start_child(pane1)
         vpaned_top.set_end_child(pane2)
         vpaned_top.set_position(165)
 
         vpaned_bot = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        vpaned_bot.set_wide_handle(True)
         vpaned_bot.set_start_child(pane3)
         vpaned_bot.set_end_child(pane4)
         vpaned_bot.set_position(185)
 
         vpaned_main = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        vpaned_main.set_wide_handle(True)
         vpaned_main.set_vexpand(True)
         vpaned_main.set_start_child(vpaned_top)
         vpaned_main.set_end_child(vpaned_bot)

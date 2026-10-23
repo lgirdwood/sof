@@ -123,20 +123,30 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _build_main_3panel_layout(self) -> None:
         # Outer horizontal paned: [Left Panel] | [Center + Right Paned]
         self.hpaned_outer = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.hpaned_outer.set_wide_handle(True)
         self.hpaned_outer.set_position(410)
 
         # Inner horizontal paned: [Middle Graph Panel] | [Right Attribute Inspector]
         self.hpaned_inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        self.hpaned_inner.set_wide_handle(True)
         self.hpaned_inner.set_position(740)
 
-        # 1. Left Hand Panel (4 vertical sub-panes)
+        # 1. Left Hand Panel (4 vertical sub-panes) wrapped in high-level panel border
         self.left_panel = LeftNavigationPanel(
             on_item_selected=self._on_left_pane_item_selected,
             on_add_module_requested=self._on_add_module_requested,
         )
+        left_panel_frame = Gtk.Frame()
+        left_panel_frame.add_css_class("high-level-panel")
+        left_panel_frame.set_margin_start(4)
+        left_panel_frame.set_margin_end(2)
+        left_panel_frame.set_margin_top(4)
+        left_panel_frame.set_margin_bottom(4)
+        left_panel_frame.set_child(self.left_panel)
 
         # 2. Middle Horizontal Panel (Graph Canvas + Bottom Testbench/Compiler Drawer)
         center_vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        center_vpaned.set_wide_handle(True)
         center_vpaned.set_vexpand(True)
         center_vpaned.set_hexpand(True)
         center_vpaned.set_position(620)
@@ -145,7 +155,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_selection_changed=self._on_canvas_selection_changed,
             on_graph_modified=self._on_graph_modified,
         )
-        center_vpaned.set_start_child(self.canvas)
+        canvas_frame = Gtk.Frame()
+        canvas_frame.add_css_class("sub-panel-frame")
+        canvas_frame.set_child(self.canvas)
+        center_vpaned.set_start_child(canvas_frame)
 
         # Bottom drawer: Waveform comparison + Compiler/Testbench console log
         bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -160,10 +173,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         # Split bottom drawer horizontally: [WaveformSnapshotWidget] | [Console Log]
         bottom_hpaned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        bottom_hpaned.set_wide_handle(True)
         bottom_hpaned.set_vexpand(True)
         bottom_hpaned.set_position(430)
 
         wf_frame = Gtk.Frame()
+        wf_frame.add_css_class("sub-panel-frame")
         self.waveform_widget = WaveformSnapshotWidget()
         wf_frame.set_child(self.waveform_widget)
         bottom_hpaned.set_start_child(wf_frame)
@@ -177,21 +192,40 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         log_scroll.set_child(self.log_view)
         log_frame = Gtk.Frame()
+        log_frame.add_css_class("sub-panel-frame")
         log_frame.set_child(log_scroll)
         bottom_hpaned.set_end_child(log_frame)
 
         bottom_box.append(bottom_hpaned)
-        center_vpaned.set_end_child(bottom_box)
+        bottom_drawer_frame = Gtk.Frame()
+        bottom_drawer_frame.add_css_class("sub-panel-frame")
+        bottom_drawer_frame.set_child(bottom_box)
+        center_vpaned.set_end_child(bottom_drawer_frame)
+
+        center_panel_frame = Gtk.Frame()
+        center_panel_frame.add_css_class("high-level-panel")
+        center_panel_frame.set_margin_start(2)
+        center_panel_frame.set_margin_end(2)
+        center_panel_frame.set_margin_top(4)
+        center_panel_frame.set_margin_bottom(4)
+        center_panel_frame.set_child(center_vpaned)
 
         # 3. Right Hand Panel (Tree View of Attributes of Selected Graph Node)
         self.right_inspector = RightAttributeInspector(
             on_attribute_edited=self._on_node_attribute_edited,
         )
+        right_panel_frame = Gtk.Frame()
+        right_panel_frame.add_css_class("high-level-panel")
+        right_panel_frame.set_margin_start(2)
+        right_panel_frame.set_margin_end(4)
+        right_panel_frame.set_margin_top(4)
+        right_panel_frame.set_margin_bottom(4)
+        right_panel_frame.set_child(self.right_inspector)
 
-        self.hpaned_inner.set_start_child(center_vpaned)
-        self.hpaned_inner.set_end_child(self.right_inspector)
+        self.hpaned_inner.set_start_child(center_panel_frame)
+        self.hpaned_inner.set_end_child(right_panel_frame)
 
-        self.hpaned_outer.set_start_child(self.left_panel)
+        self.hpaned_outer.set_start_child(left_panel_frame)
         self.hpaned_outer.set_end_child(self.hpaned_inner)
 
         self.set_child(self.hpaned_outer)

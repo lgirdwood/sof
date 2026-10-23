@@ -15,12 +15,35 @@ from .window import Topology2MainWindow
 
 APP_CSS = """
 window {
-    background-color: #14171f;
+    background-color: #10131a;
     color: #e2e8f0;
 }
 .heading {
     font-weight: bold;
     color: #93c5fd;
+}
+.high-level-panel {
+    border: 2px solid #475569;
+    border-radius: 6px;
+    background-color: #141821;
+}
+.high-level-panel > border {
+    border: none;
+}
+.sub-panel-frame, frame {
+    border: 1px solid #334155;
+    border-radius: 4px;
+}
+frame > border {
+    border: none;
+}
+paned > separator {
+    background-color: #334155;
+    min-width: 5px;
+    min-height: 5px;
+}
+paned > separator:hover {
+    background-color: #60a5fa;
 }
 treeview {
     background-color: #181c26;
