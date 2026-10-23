@@ -38,7 +38,10 @@ def layout_graph(vm: GraphViewModel) -> None:
 def _compute_node_geometry(node: GraphNode) -> None:
     num_ports = max(len(node.in_ports), len(node.out_ports), 1)
     badge_extra = 18.0 if node.badges else 0.0
-    node.width = NODE_WIDTH
+    title_w = len(node.title) * 7.6 + 28.0
+    sub_w = len(node.subtitle) * 6.6 + 28.0
+    badge_w = sum(len(b) * 6.5 + 18.0 for b in node.badges[:2]) + 24.0 if node.badges else 0.0
+    node.width = max(NODE_WIDTH, title_w, sub_w, badge_w)
     node.height = max(NODE_BASE_HEIGHT, 54.0 + num_ports * 18.0 + badge_extra)
 
     # Position input ports along left edge
@@ -161,13 +164,15 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     container_sizes: Dict[int, Tuple[float, float]] = {}
     for pid, container in sorted(vm.containers.items()):
         member_ids = by_pipe.get(pid, [])
+        header_txt = f"Pipeline {pid}: {container.class_name} ({container.direction})"
+        min_header_w = len(header_txt) * 7.5 + 34.0
         if not member_ids:
-            container.width = NODE_WIDTH + 2 * CONTAINER_PAD_X
+            container.width = max(NODE_WIDTH + 2 * CONTAINER_PAD_X, min_header_w)
             container.height = NODE_BASE_HEIGHT + CONTAINER_PAD_TOP + CONTAINER_PAD_BOTTOM
             container_sizes[pid] = (container.width, container.height)
             continue
         inner_w, inner_h = _layout_flat_dag(vm, member_ids, start_x=0.0, start_y=0.0)
-        container.width = inner_w + 2 * CONTAINER_PAD_X
+        container.width = max(inner_w + 2 * CONTAINER_PAD_X, min_header_w)
         container.height = inner_h + CONTAINER_PAD_TOP + CONTAINER_PAD_BOTTOM
         container_sizes[pid] = (container.width, container.height)
 

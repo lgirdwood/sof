@@ -369,9 +369,8 @@ class TopologyGraphCanvas(Gtk.Widget):
         bw = 2.2 if is_selected else 1.2
         snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
 
-        # Node Title in header
-        title_str = node.title if len(node.title) <= 25 else (node.title[:23] + "…")
-        title_layout = self._get_pango_layout(title_str, size_pt=9, bold=True)
+        # Node Title in header (full text, node width is sized to fit)
+        title_layout = self._get_pango_layout(node.title, size_pt=9, bold=True)
         snapshot.save()
         pt = Graphene.Point.alloc()
         pt.init(node.x + 10.0, node.y + 5.0)
@@ -379,9 +378,8 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_layout(title_layout, TEXT_WHITE)
         snapshot.restore()
 
-        # Subtitle
-        sub_str = node.subtitle if len(node.subtitle) <= 29 else (node.subtitle[:27] + "…")
-        sub_layout = self._get_pango_layout(sub_str, size_pt=8, bold=False)
+        # Subtitle (full text, node width is sized to fit)
+        sub_layout = self._get_pango_layout(node.subtitle, size_pt=8, bold=False)
         snapshot.save()
         pt.init(node.x + 10.0, node.y + 31.0)
         snapshot.translate(pt)

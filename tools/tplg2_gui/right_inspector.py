@@ -40,12 +40,15 @@ class RightAttributeInspector(Gtk.Box):
 
         self.node_title_lbl = Gtk.Label(label="No Node Selected")
         self.node_title_lbl.set_xalign(0.0)
+        self.node_title_lbl.set_wrap(True)
+        self.node_title_lbl.set_selectable(True)
         self.node_title_lbl.add_css_class("heading")
         hdr_box.append(self.node_title_lbl)
 
         self.node_sub_lbl = Gtk.Label(label="Select a node in the graph to inspect/edit attributes")
         self.node_sub_lbl.set_xalign(0.0)
-        self.node_sub_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.node_sub_lbl.set_wrap(True)
+        self.node_sub_lbl.set_selectable(True)
         hdr_box.append(self.node_sub_lbl)
 
         hdr_frame.set_child(hdr_box)
@@ -93,32 +96,34 @@ class RightAttributeInspector(Gtk.Box):
         self.tree.set_headers_visible(True)
         self.tree.set_enable_tree_lines(True)
 
-        # Column 0: Attribute Name
+        # Column 0: Attribute Name (auto-sized to fit full object/attribute text)
         r_key = Gtk.CellRendererText()
-        r_key.set_property("ellipsize", Pango.EllipsizeMode.END)
+        r_key.set_padding(4, 2)
         col_key = Gtk.TreeViewColumn("Attribute", r_key, text=0)
+        col_key.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         col_key.set_resizable(True)
-        col_key.set_min_width(135)
         self.tree.append_column(col_key)
 
-        # Column 1: Editable Value
+        # Column 1: Editable Value (auto-sized to fit full value text)
         r_val = Gtk.CellRendererText()
-        r_val.set_property("ellipsize", Pango.EllipsizeMode.END)
+        r_val.set_padding(4, 2)
         r_val.connect("edited", self._on_value_cell_edited)
         col_val = Gtk.TreeViewColumn("Value (Dbl-Click Edit)", r_val, text=1, editable=3, foreground=4)
+        col_val.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         col_val.set_resizable(True)
         col_val.set_expand(True)
-        col_val.set_min_width(110)
         self.tree.append_column(col_val)
 
-        # Column 2: Metadata / Constraints / Origin
+        # Column 2: Metadata / Constraints / Origin (auto-sized to fit full constraints text)
         r_meta = Gtk.CellRendererText()
-        r_meta.set_property("ellipsize", Pango.EllipsizeMode.END)
+        r_meta.set_padding(4, 2)
         r_meta.set_property("foreground", "#8fa3bf")
         col_meta = Gtk.TreeViewColumn("Constraints / Origin", r_meta, text=2)
+        col_meta.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         col_meta.set_resizable(True)
-        col_meta.set_min_width(110)
         self.tree.append_column(col_meta)
+
+        self.tree.connect("row-expanded", lambda tv, _it, _path: tv.columns_autosize())
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -155,6 +160,7 @@ class RightAttributeInspector(Gtk.Box):
         for child in self.current_config.children:
             self._append_config_subtree(None, child, flt)
         self.tree.expand_all()
+        self.tree.columns_autosize()
 
     def _node_matches(self, node: ConfigNode, flt: str) -> bool:
         if not flt:
@@ -210,6 +216,7 @@ class RightAttributeInspector(Gtk.Box):
         if it:
             self.store.set_value(it, 1, new_text)
             self.store.set_value(it, 4, "#6ee7b7")
+        self.tree.columns_autosize()
 
         if self.on_attribute_edited and self.current_config:
             self.on_attribute_edited(self.current_config, cnode.key, new_text)

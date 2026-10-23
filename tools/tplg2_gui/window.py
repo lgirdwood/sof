@@ -123,11 +123,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _build_main_3panel_layout(self) -> None:
         # Outer horizontal paned: [Left Panel] | [Center + Right Paned]
         self.hpaned_outer = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        self.hpaned_outer.set_position(330)
+        self.hpaned_outer.set_position(410)
 
         # Inner horizontal paned: [Middle Graph Panel] | [Right Attribute Inspector]
         self.hpaned_inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        self.hpaned_inner.set_position(860)
+        self.hpaned_inner.set_position(740)
 
         # 1. Left Hand Panel (4 vertical sub-panes)
         self.left_panel = LeftNavigationPanel(

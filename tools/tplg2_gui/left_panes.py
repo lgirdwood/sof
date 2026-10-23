@@ -105,23 +105,25 @@ class LeftNavigationPanel(Gtk.Box):
         tree.set_headers_visible(True)
         tree.set_enable_tree_lines(True)
 
-        # Column 0: Name
+        # Column 0: Name (auto-sized to fit full object/class/file text)
         r0 = Gtk.CellRendererText()
-        r0.set_property("ellipsize", Pango.EllipsizeMode.END)
+        r0.set_padding(4, 2)
         c0 = Gtk.TreeViewColumn(col_titles[0], r0, text=0)
+        c0.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         c0.set_resizable(True)
         c0.set_expand(True)
-        c0.set_min_width(140)
         tree.append_column(c0)
 
-        # Column 1: Summary
+        # Column 1: Summary (auto-sized to fit full summary/defines text)
         r1 = Gtk.CellRendererText()
-        r1.set_property("ellipsize", Pango.EllipsizeMode.END)
+        r1.set_padding(4, 2)
         r1.set_property("foreground", "#8fa3bf")
         c1 = Gtk.TreeViewColumn(col_titles[1], r1, text=1)
+        c1.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         c1.set_resizable(True)
-        c1.set_min_width(80)
         tree.append_column(c1)
+
+        tree.connect("row-expanded", lambda tv, _it, _path: tv.columns_autosize())
 
         sel = tree.get_selection()
         sel.set_mode(Gtk.SelectionMode.SINGLE)
@@ -187,6 +189,8 @@ class LeftNavigationPanel(Gtk.Box):
             self._populate_processing_modules()
             self._populate_pipelines()
             self._populate_machine_topologies()
+            for tv in (self.base_tree, self.mod_tree, self.pipe_tree, self.top_tree):
+                tv.columns_autosize()
         finally:
             self._updating_selection = False
 
