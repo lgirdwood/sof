@@ -38,6 +38,55 @@ def layout_graph(vm: GraphViewModel) -> None:
     else:
         _layout_flat_dag(vm, list(vm.nodes.keys()), start_x=60.0, start_y=60.0)
 
+    # 3. Assign distinct source/sink pins to multi-edge nodes ordered top-to-bottom to avoid pin collisions
+    _assign_edge_ports(vm)
+
+
+def _assign_edge_ports(vm: GraphViewModel) -> None:
+    """Assign distinct output/input ports (out0, out1, ... / in0, in1, ...) to audio edges."""
+    out_edges_by_node: Dict[str, List[GraphEdge]] = defaultdict(list)
+    in_edges_by_node: Dict[str, List[GraphEdge]] = defaultdict(list)
+
+    for edge in vm.edges:
+        u = vm.nodes.get(edge.source_node)
+        v = vm.nodes.get(edge.sink_node)
+        if not u or not v or u.class_category == "Control":
+            continue
+        out_edges_by_node[u.id].append(edge)
+        in_edges_by_node[v.id].append(edge)
+
+    for uid, edges in out_edges_by_node.items():
+        u = vm.nodes[uid]
+        if not u.out_ports:
+            continue
+        sorted_out = sorted(
+            edges,
+            key=lambda e: (
+                vm.nodes[e.sink_node].y + vm.nodes[e.sink_node].height / 2.0,
+                vm.nodes[e.sink_node].x,
+                e.id,
+            ),
+        )
+        for idx, edge in enumerate(sorted_out):
+            port_idx = min(idx, len(u.out_ports) - 1)
+            edge.source_port = u.out_ports[port_idx].id
+
+    for vid, edges in in_edges_by_node.items():
+        v = vm.nodes[vid]
+        if not v.in_ports:
+            continue
+        sorted_in = sorted(
+            edges,
+            key=lambda e: (
+                vm.nodes[e.source_node].y + vm.nodes[e.source_node].height / 2.0,
+                vm.nodes[e.source_node].x,
+                e.id,
+            ),
+        )
+        for idx, edge in enumerate(sorted_in):
+            port_idx = min(idx, len(v.in_ports) - 1)
+            edge.sink_port = v.in_ports[port_idx].id
+
 
 def _compute_node_geometry(node: GraphNode) -> None:
     if node.class_category == "Control":

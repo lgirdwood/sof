@@ -607,8 +607,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             snapshot.append_fill(arrow_pb.to_path(), Gsk.FillRule.WINDING, color)
             return
 
-        u_port = u.out_ports[0] if u.out_ports else GraphPort("out0", "out", "out", rel_x=u.width, rel_y=u.height / 2.0)
-        v_port = v.in_ports[0] if v.in_ports else GraphPort("in0", "in", "in", rel_x=0.0, rel_y=v.height / 2.0)
+        u_port, v_port = self._resolve_edge_ports(u, v, edge)
 
         x1 = u.x + u_port.rel_x
         y1 = u.y + u_port.rel_y
@@ -618,6 +617,16 @@ class TopologyGraphCanvas(Gtk.Widget):
         color = EDGE_SELECTED_COLOR if is_sel else (EDGE_INTER_COLOR if edge.is_inter_pipeline else EDGE_INTRA_COLOR)
         width = 3.2 if is_sel else (2.4 if edge.is_inter_pipeline else 2.0)
         self._snapshot_bezier_wire(snapshot, x1, y1, x2, y2, color, width=width, dashed=edge.is_inter_pipeline)
+
+    @staticmethod
+    def _resolve_edge_ports(u: GraphNode, v: GraphNode, edge: GraphEdge) -> Tuple[GraphPort, GraphPort]:
+        u_port = next((p for p in u.out_ports if p.id == edge.source_port), None)
+        if u_port is None:
+            u_port = u.out_ports[0] if u.out_ports else GraphPort("out0", "out", "out", rel_x=u.width, rel_y=u.height / 2.0)
+        v_port = next((p for p in v.in_ports if p.id == edge.sink_port), None)
+        if v_port is None:
+            v_port = v.in_ports[0] if v.in_ports else GraphPort("in0", "in", "in", rel_x=0.0, rel_y=v.height / 2.0)
+        return (u_port, v_port)
 
     def _snapshot_bezier_wire(
         self,
@@ -713,10 +722,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             v = self.vm.nodes.get(edge.sink_node)
             if not u or not v:
                 continue
-            x1 = u.x + (u.out_ports[0].rel_x if u.out_ports else u.width)
-            y1 = u.y + (u.out_ports[0].rel_y if u.out_ports else u.height / 2.0)
-            x2 = v.x + (v.in_ports[0].rel_x if v.in_ports else 0.0)
-            y2 = v.y + (v.in_ports[0].rel_y if v.in_ports else v.height / 2.0)
+            u_port, v_port = self._resolve_edge_ports(u, v, edge)
+            x1 = u.x + u_port.rel_x
+            y1 = u.y + u_port.rel_y
+            x2 = v.x + v_port.rel_x
+            y2 = v.y + v_port.rel_y
             dx = max(45.0, abs(x2 - x1) * 0.48)
             # Sample 16 points along cubic Bezier
             for step in range(17):
@@ -759,7 +769,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             edge = next((e for e in self.vm.edges if e.id == eid), None)
             if edge and self.on_selection_changed:
                 self.on_selection_changed(
-                    f"Route: {edge.source_node} → {edge.sink_node}",
+                    f"Route: {edge.source_node} ({edge.source_port}) → {edge.sink_node} ({edge.sink_port})",
                     edge.config,
                     "Object.Base.route",
                 )
@@ -853,8 +863,9 @@ class TopologyGraphCanvas(Gtk.Widget):
             wy = self._drag_start_world[1] + offset_y / self.zoom
             port_hit = self._hit_test_port(wx, wy, radius=16.0)
             target_nid = port_hit[0] if (port_hit and port_hit[2] == "in") else self._hit_test_node(wx, wy)
+            target_pid = port_hit[1] if (port_hit and port_hit[2] == "in") else None
             if target_nid and target_nid != src_nid:
-                self._create_route_edge(src_nid, target_nid)
+                self._create_route_edge(src_nid, target_nid, src_port=src_pid, snk_port=target_pid)
         self._drag_mode = "none"
         self._wire_source = None
         self.queue_draw()
@@ -921,13 +932,27 @@ class TopologyGraphCanvas(Gtk.Widget):
     # Graph Mutation Operations (Add Node, Wire Route, Delete Selected)
     # -------------------------------------------------------------------------
 
-    def _create_route_edge(self, src_nid: str, snk_nid: str) -> None:
+    def _create_route_edge(
+        self,
+        src_nid: str,
+        snk_nid: str,
+        src_port: Optional[str] = None,
+        snk_port: Optional[str] = None,
+    ) -> None:
         if not self.vm:
             return
         if any(e.source_node == src_nid and e.sink_node == snk_nid for e in self.vm.edges):
             return
         u = self.vm.nodes[src_nid]
         v = self.vm.nodes[snk_nid]
+        if not src_port:
+            used_out = {e.source_port for e in self.vm.edges if e.source_node == src_nid}
+            free_out = next((p.id for p in u.out_ports if p.id not in used_out), None)
+            src_port = free_out or (u.out_ports[0].id if u.out_ports else "out0")
+        if not snk_port:
+            used_in = {e.sink_port for e in self.vm.edges if e.sink_node == snk_nid}
+            free_in = next((p.id for p in v.in_ports if p.id not in used_in), None)
+            snk_port = free_in or (v.in_ports[0].id if v.in_ports else "in0")
         is_inter = (u.pipeline_id is not None and v.pipeline_id is not None and u.pipeline_id != v.pipeline_id)
         edge_cfg = ConfigNode("Object.Base.route", node_type="object")
         edge_cfg.set_scalar("source", src_nid, origin="instance")
@@ -938,6 +963,8 @@ class TopologyGraphCanvas(Gtk.Widget):
             id=f"user_edge_{len(self.vm.edges) + 1}",
             source_node=src_nid,
             sink_node=snk_nid,
+            source_port=src_port,
+            sink_port=snk_port,
             pipeline_id=u.pipeline_id if not is_inter else None,
             is_inter_pipeline=is_inter,
             config=edge_cfg,
