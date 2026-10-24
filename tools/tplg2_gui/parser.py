@@ -1066,8 +1066,9 @@ class Topology2Workspace:
             root_config=ConfigNode(key=title, node_type="object", category_info=subtitle),
         )
 
+        cli_keys: Set[str] = set(variant.defines.keys()) if variant else set()
         search_dirs: List[str] = ["include", "include/common", "include/components", "include/dais", "include/pipelines", "include/pipelines/cavs", "platform", "platform/intel"]
-        expanded_stmts = self._evaluate_topology_file(conf_path, defines, search_dirs)
+        expanded_stmts = self._evaluate_topology_file(conf_path, defines, search_dirs, cli_keys=cli_keys)
 
         # Populate root_config with active Define variables
         def_node = ConfigNode(key="Define (Active Variables)", node_type="define", category_info=f"{len(defines)} vars")
@@ -1163,16 +1164,19 @@ class Topology2Workspace:
         defines: Dict[str, str],
         search_dirs: List[str],
         visited: Optional[Set[str]] = None,
+        cli_keys: Optional[Set[str]] = None,
     ) -> List[AstStmt]:
         if visited is None:
             visited = set()
+        if cli_keys is None:
+            cli_keys = set()
         abs_f = os.path.abspath(fpath)
         if abs_f in visited:
             return []
         visited.add(abs_f)
 
         stmts = self.get_ast(abs_f)
-        return self._evaluate_stmt_list(stmts, defines, search_dirs, abs_f, visited)
+        return self._evaluate_stmt_list(stmts, defines, search_dirs, abs_f, visited, cli_keys)
 
     def _evaluate_stmt_list(
         self,
@@ -1181,6 +1185,7 @@ class Topology2Workspace:
         search_dirs: List[str],
         current_file: str,
         visited: Set[str],
+        cli_keys: Set[str],
     ) -> List[AstStmt]:
         out: List[AstStmt] = []
         for st in stmts:
@@ -1190,15 +1195,15 @@ class Topology2Workspace:
             elif st.stmt_type == "include":
                 inc_path = self.resolve_include(st.key, search_dirs, current_file)
                 if inc_path and not self._is_pure_class_include(inc_path):
-                    out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, visited))
+                    out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, visited, cli_keys))
             elif st.stmt_type == "block" and st.key == "Define":
                 for ch in st.children:
                     if ch.stmt_type == "kv":
-                        # CLI / CMake target defines take precedence over default Define blocks
-                        if not (self._is_target_override(ch.key, defines)):
+                        # CLI / CMake target defines take precedence over .conf Define blocks,
+                        # while later .conf Define blocks override earlier default Define blocks.
+                        if not self._is_target_override(ch.key, defines, cli_keys):
                             defines[ch.key] = self._substitute_vars(str(ch.value), defines)
                         else:
-                            # Still update if not yet set
                             defines.setdefault(ch.key, self._substitute_vars(str(ch.value), defines))
             elif st.stmt_type == "block" and st.key.startswith("IncludeByKey."):
                 parts = split_dotted_key(st.key)
@@ -1212,17 +1217,17 @@ class Topology2Workspace:
                             inc_path = self.resolve_include(inc_file, search_dirs, current_file)
                             if inc_path:
                                 # Allow re-inclusion of parametric files across IncludeByKey blocks
-                                out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, set()))
+                                out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, set(), cli_keys))
                         elif ch.stmt_type == "block":
-                            out.extend(self._evaluate_stmt_list(ch.children, defines, search_dirs, current_file, visited))
+                            out.extend(self._evaluate_stmt_list(ch.children, defines, search_dirs, current_file, visited, cli_keys))
                         break
             else:
                 out.append(st)
         return out
 
     @staticmethod
-    def _is_target_override(key: str, defines: Dict[str, str]) -> bool:
-        return key in defines and defines[key] not in ("", "none")
+    def _is_target_override(key: str, defines: Dict[str, str], cli_keys: Set[str]) -> bool:
+        return key in cli_keys and defines.get(key, "") not in ("", "none")
 
     @staticmethod
     def _key_matches(pattern: str, val: str) -> bool:
