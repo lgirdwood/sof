@@ -14,6 +14,9 @@ CONTROL_WIDTH = 34.0
 CONTROL_MIN_HEIGHT = 86.0
 CTRL_TOP_GAP = 16.0
 CTRL_H_GAP = 7.0
+TB_IO_WIDTH = 224.0
+TB_IO_HEIGHT = 98.0
+TB_IO_GAP = 48.0
 H_GAP = 72.0
 V_GAP = 28.0
 CONTAINER_PAD_X = 26.0
@@ -57,11 +60,53 @@ def layout_graph(vm: GraphViewModel) -> None:
     if vm.containers and vm.view_kind in ("topology", "pipeline"):
         _layout_with_containers(vm)
     else:
-        any_cap = any(_is_node_capture(vm, n) for n in vm.nodes.values() if n.class_category != "Control")
-        _layout_flat_dag(vm, list(vm.nodes.keys()), start_x=60.0, start_y=60.0, is_capture=any_cap)
+        any_cap = any(
+            _is_node_capture(vm, n)
+            for n in vm.nodes.values()
+            if n.class_category not in ("Control", "TestbenchIO")
+        )
+        non_tb_ids = [nid for nid, n in vm.nodes.items() if n.class_category != "TestbenchIO"]
+        has_left_tb = any(
+            n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == "left"
+            for n in vm.nodes.values()
+        )
+        sx = (60.0 + TB_IO_WIDTH + TB_IO_GAP) if has_left_tb else 60.0
+        _layout_flat_dag(vm, non_tb_ids, start_x=sx, start_y=60.0, is_capture=any_cap)
 
-    # 3. Assign distinct source/sink pins to multi-edge nodes ordered top-to-bottom to avoid pin collisions
+    # 3. Position TestbenchIO nodes to the left of host-copiers and right of dai/alh-copiers
+    _position_testbench_io_nodes(vm)
+
+    # 4. Assign distinct source/sink pins to multi-edge nodes ordered top-to-bottom to avoid pin collisions
     _assign_edge_ports(vm)
+
+
+def _position_testbench_io_nodes(vm: GraphViewModel) -> None:
+    """Position TestbenchIO nodes to the left of host-copiers and to the right of dai/alh-copiers."""
+    for node in vm.nodes.values():
+        if node.class_category != "TestbenchIO" or not node.parent_node_id:
+            continue
+        parent = vm.nodes.get(node.parent_node_id)
+        if not parent:
+            continue
+        side = str(node.config.get_scalar("side", "left")).lower()
+        if side == "right":
+            if parent.pipeline_id is not None and parent.pipeline_id in vm.containers:
+                right_anchor = max(
+                    vm.containers[parent.pipeline_id].x + vm.containers[parent.pipeline_id].width,
+                    parent.x + parent.width,
+                )
+            else:
+                right_anchor = parent.x + parent.width
+            node.x = right_anchor + TB_IO_GAP
+            node.y = parent.y + (parent.height - node.height) / 2.0
+        else:
+            if parent.pipeline_id is not None and parent.pipeline_id in vm.containers:
+                left_anchor = min(vm.containers[parent.pipeline_id].x, parent.x)
+            else:
+                left_anchor = parent.x
+            node.x = left_anchor - node.width - TB_IO_GAP
+            node.y = parent.y + (parent.height - node.height) / 2.0
 
 
 def _assign_edge_ports(vm: GraphViewModel) -> None:
@@ -111,6 +156,21 @@ def _assign_edge_ports(vm: GraphViewModel) -> None:
 
 
 def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
+    if node.class_category == "TestbenchIO":
+        hdr_w = len(node.title + "  [ACTIVE]") * 7.2 + 36.0
+        node.width = max(TB_IO_WIDTH, hdr_w)
+        node.height = TB_IO_HEIGHT
+        side = str(node.config.get_scalar("side", "left")).lower()
+        # Left TestbenchIO (host-copier) connects on its right edge; Right TestbenchIO (dai/alh-copier) connects on its left edge
+        port_x = 0.0 if side == "right" else node.width
+        for port in node.out_ports:
+            port.rel_x = port_x
+            port.rel_y = node.height / 2.0
+        for port in node.in_ports:
+            port.rel_x = port_x
+            port.rel_y = node.height / 2.0
+        return
+
     if node.class_category == "Control":
         node.width = CONTROL_WIDTH
         node.height = max(CONTROL_MIN_HEIGHT, min(175.0, len(node.title) * 6.0 + 30.0))
@@ -209,9 +269,9 @@ def _layout_flat_dag(
 
     for nid in node_ids:
         node = vm.nodes[nid]
-        if node.parent_node_id and node.parent_node_id in id_set:
+        if node.class_category == "Control" and node.parent_node_id and node.parent_node_id in id_set:
             ctrl_by_parent[node.parent_node_id].append(nid)
-        else:
+        elif node.class_category != "TestbenchIO":
             main_ids.append(nid)
 
     if not main_ids:
@@ -303,6 +363,8 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     orphan_ids: List[str] = []
 
     for nid, node in vm.nodes.items():
+        if node.class_category == "TestbenchIO":
+            continue
         if node.pipeline_id is not None and node.pipeline_id in vm.containers:
             by_pipe[node.pipeline_id].append(nid)
         else:
@@ -399,6 +461,8 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
         if len(comp) == 1 and pipe_has_dai(comp[0]) and not pipe_has_host(comp[0]):
             pipe_col[comp[0]] = 1
 
+    has_tb_io = any(n.class_category == "TestbenchIO" for n in vm.nodes.values())
+    base_col_x = (50.0 + TB_IO_WIDTH + TB_IO_GAP) if has_tb_io else 50.0
     default_col0_w = max(
         (vm.containers[p].width for p in pipe_ids if pipe_col[p] == 0),
         default=440.0,
@@ -411,7 +475,7 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
             cols[pipe_col[pid]].append(pid)
 
         max_comp_h = 0.0
-        col_x = 50.0
+        col_x = base_col_x
         if 0 not in cols and max(cols.keys(), default=0) >= 1:
             col_x += default_col0_w + CONTAINER_GAP_X
         for c_idx in sorted(cols.keys()):

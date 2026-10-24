@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 import math
-from typing import Callable, Dict, List, Optional, Tuple
+import os
+import subprocess
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Gdk, GObject, Graphene, Gsk, Gtk, Pango
+from gi.repository import Gdk, Gio, GObject, Graphene, Gsk, Gtk, Pango
 
 from .layout import (
     CTRL_H_GAP,
@@ -45,6 +47,7 @@ CATEGORY_COLORS: Dict[str, Tuple[Gdk.RGBA, Gdk.RGBA]] = {
     "control_enum": (rgba(0.86, 0.24, 0.42, 1.0), rgba(0.24, 0.11, 0.16, 0.96)),
     "base": (rgba(0.36, 0.44, 0.54, 1.0), rgba(0.14, 0.16, 0.20, 0.96)),
     "pipeline": (rgba(0.25, 0.48, 0.72, 1.0), rgba(0.12, 0.17, 0.23, 0.96)),
+    "testbench_io": (rgba(0.15, 0.62, 0.42, 1.0), rgba(0.11, 0.18, 0.16, 0.97)),
 }
 
 BG_COLOR = rgba(0.08, 0.09, 0.12, 1.0)
@@ -359,6 +362,43 @@ class TopologyGraphCanvas(Gtk.Widget):
         stroke = Gsk.Stroke.new(1.0)
         snapshot.append_stroke(path, stroke, GRID_COLOR)
 
+    @staticmethod
+    def _parse_pipe_ids(pipes_str: str) -> Set[int]:
+        pids: Set[int] = set()
+        for token in pipes_str.replace("→", " ").replace(",", " ").split():
+            if token.lstrip("-").isdigit():
+                pids.add(int(token))
+        return pids
+
+    def _get_enabled_tb_pipelines(self) -> Set[int]:
+        """Return the set of pipeline IDs enabled by active TestbenchIO radio selections."""
+        enabled_pids: Set[int] = set()
+        if not self.vm:
+            return enabled_pids
+        left_enabled = [
+            n for n in self.vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == "left"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        right_enabled = [
+            n for n in self.vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == "right"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        if left_enabled:
+            for node in left_enabled:
+                enabled_pids.update(self._parse_pipe_ids(str(node.config.get_scalar("target_pipelines", ""))))
+            for node in right_enabled:
+                parent = self.vm.nodes.get(node.parent_node_id or "")
+                if parent and parent.pipeline_id is not None:
+                    enabled_pids.add(parent.pipeline_id)
+        else:
+            for node in right_enabled:
+                enabled_pids.update(self._parse_pipe_ids(str(node.config.get_scalar("target_pipelines", ""))))
+        return enabled_pids
+
     def _snapshot_container(self, snapshot: Gtk.Snapshot, pid: int, cont: PipelineContainer) -> None:
         rect = Graphene.Rect.alloc()
         rect.init(cont.x, cont.y, cont.width, cont.height)
@@ -366,22 +406,28 @@ class TopologyGraphCanvas(Gtk.Widget):
         rrect.init_from_rect(rect, 12.0)
 
         is_cap = "capture" in cont.direction.lower()
+        is_tb_enabled = pid in self._get_enabled_tb_pipelines()
         fill_col = CONTAINER_FILL_CAP if is_cap else CONTAINER_FILL_PB
         border_col = (
             NODE_BORDER_SELECTED
             if self.selected_container_id == pid
-            else (CONTAINER_BORDER_CAP if is_cap else CONTAINER_BORDER_PB)
+            else (
+                rgba(0.28, 0.86, 0.56, 0.78)
+                if is_tb_enabled
+                else (CONTAINER_BORDER_CAP if is_cap else CONTAINER_BORDER_PB)
+            )
         )
 
         snapshot.push_rounded_clip(rrect)
         snapshot.append_color(fill_col, rect)
         snapshot.pop()
 
-        bw = 2.2 if self.selected_container_id == pid else 1.4
+        bw = 2.2 if (self.selected_container_id == pid or is_tb_enabled) else 1.4
         snapshot.append_border(rrect, [bw, bw, bw, bw], [border_col, border_col, border_col, border_col])
 
         # Container header text
-        header_txt = f"Pipeline {pid}: {cont.class_name} ({cont.direction})"
+        tb_tag = "  •  [TB Active]" if is_tb_enabled else ""
+        header_txt = f"Pipeline {pid}: {cont.class_name} ({cont.direction}){tb_tag}"
         layout = self._get_pango_layout(header_txt, size_pt=9, bold=True)
         snapshot.save()
         pt = Graphene.Point.alloc()
@@ -455,6 +501,10 @@ class TopologyGraphCanvas(Gtk.Widget):
                 px = node.x + port.rel_x
                 py = node.y + port.rel_y
                 self._snapshot_port_circle(snapshot, px, py, header_col, radius=3.6)
+            return
+
+        if node.class_category == "TestbenchIO":
+            self._snapshot_testbench_io_node(snapshot, node, rect, rrect, is_selected)
             return
 
         # Clip rounded node card
@@ -565,6 +615,142 @@ class TopologyGraphCanvas(Gtk.Widget):
             py = node.y + port.rel_y
             is_hov = self.hovered_port == (node.id, port.id, "out")
             self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_OUT_COLOR, radius=6.5 if is_hov else 5.0)
+
+    def _snapshot_testbench_io_node(
+        self,
+        snapshot: Gtk.Snapshot,
+        node: GraphNode,
+        rect: Graphene.Rect,
+        rrect: Gsk.RoundedRect,
+        is_selected: bool,
+    ) -> None:
+        """Render interactive Testbench Host Source/Sink card with pipeline radio and File/ALSA selector."""
+        is_enabled = str(node.config.get_scalar("enabled", "false")).lower() == "true"
+        io_type = str(node.config.get_scalar("io_type", "file")).lower()
+        file_path = str(node.config.get_scalar("file_path", "audio.wav"))
+        alsa_pcm = str(node.config.get_scalar("alsa_pcm", "default"))
+        pipes_str = str(node.config.get_scalar("target_pipelines", ""))
+
+        header_col = rgba(0.14, 0.58, 0.38, 1.0) if is_enabled else rgba(0.24, 0.29, 0.38, 1.0)
+        body_col = rgba(0.10, 0.16, 0.15, 0.97) if is_enabled else rgba(0.12, 0.14, 0.18, 0.96)
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(body_col, rect)
+
+        # Header bar with Radio Button
+        hdr_rect = Graphene.Rect.alloc()
+        hdr_rect.init(node.x, node.y, node.width, 26.0)
+        snapshot.append_color(header_col, hdr_rect)
+
+        # Radio outer circle & inner dot at (node.x + 14, node.y + 13)
+        rcx = node.x + 14.0
+        rcy = node.y + 13.0
+        self._snapshot_port_circle(snapshot, rcx, rcy, TEXT_WHITE, radius=6.5)
+        self._snapshot_port_circle(snapshot, rcx, rcy, header_col, radius=4.8)
+        if is_enabled:
+            self._snapshot_port_circle(snapshot, rcx, rcy, rgba(0.45, 1.0, 0.72, 1.0), radius=3.2)
+
+        # Header title + ACTIVE/OFF status
+        status_txt = "ACTIVE" if is_enabled else "OFF"
+        title_layout = self._get_pango_layout(f"{node.title}  [{status_txt}]", size_pt=8, bold=True)
+        pt = Graphene.Point.alloc()
+        snapshot.save()
+        pt.init(node.x + 26.0, node.y + 6.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(title_layout, TEXT_WHITE)
+        snapshot.restore()
+
+        # Row 1: Mode radio pills ([ ● File ]  [ ○ ALSA PCM ])
+        pill_y = node.y + 31.0
+        pill_h = 19.0
+        avail_w = node.width - 26.0
+        file_pw = round(avail_w * 0.46, 1)
+        alsa_pw = round(avail_w - file_pw, 1)
+        for mode_key, label_txt, px_off, pw in (
+            ("file", "File", 10.0, file_pw),
+            ("alsa_pcm", "ALSA PCM", 16.0 + file_pw, alsa_pw),
+        ):
+            active_mode = io_type == mode_key
+            p_rect = Graphene.Rect.alloc()
+            p_rect.init(node.x + px_off, pill_y, pw, pill_h)
+            p_rr = Gsk.RoundedRect()
+            p_rr.init_from_rect(p_rect, 4.5)
+            p_bg = rgba(0.20, 0.48, 0.72, 0.95) if active_mode else rgba(0.17, 0.20, 0.26, 0.92)
+            snapshot.push_rounded_clip(p_rr)
+            snapshot.append_color(p_bg, p_rect)
+            snapshot.pop()
+            p_bcol = rgba(0.42, 0.76, 1.0, 0.95) if active_mode else rgba(0.28, 0.33, 0.42, 0.85)
+            snapshot.append_border(p_rr, [1.0, 1.0, 1.0, 1.0], [p_bcol, p_bcol, p_bcol, p_bcol])
+
+            dot_prefix = "● " if active_mode else "○ "
+            m_layout = self._get_pango_layout(dot_prefix + label_txt, size_pt=7, bold=active_mode)
+            snapshot.save()
+            pt.init(node.x + px_off + 7.0, pill_y + 3.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(m_layout, TEXT_WHITE if active_mode else TEXT_MUTED)
+            snapshot.restore()
+
+        # Row 2: Clickable File / ALSA PCM selector box
+        sel_y = node.y + 54.0
+        sel_h = 20.0
+        sel_rect = Graphene.Rect.alloc()
+        sel_rect.init(node.x + 10.0, sel_y, node.width - 20.0, sel_h)
+        sel_rr = Gsk.RoundedRect()
+        sel_rr.init_from_rect(sel_rect, 4.5)
+        snapshot.push_rounded_clip(sel_rr)
+        snapshot.append_color(rgba(0.08, 0.10, 0.14, 0.95), sel_rect)
+        snapshot.pop()
+        sel_bcol = rgba(0.34, 0.44, 0.58, 0.95)
+        snapshot.append_border(sel_rr, [1.0, 1.0, 1.0, 1.0], [sel_bcol, sel_bcol, sel_bcol, sel_bcol])
+
+        if io_type == "file":
+            disp_val = os.path.basename(file_path) or file_path
+            sel_txt = f"File: {disp_val}"
+        else:
+            sel_txt = f"PCM: {alsa_pcm}"
+        if len(sel_txt) > 26:
+            sel_txt = sel_txt[:24] + "…"
+        sel_layout = self._get_pango_layout(sel_txt, size_pt=7, bold=False)
+        snapshot.save()
+        pt.init(node.x + 16.0, sel_y + 3.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(sel_layout, BADGE_FG)
+        snapshot.restore()
+
+        caret_layout = self._get_pango_layout("▾", size_pt=7, bold=True)
+        snapshot.save()
+        pt.init(node.x + node.width - 22.0, sel_y + 3.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(caret_layout, TEXT_MUTED)
+        snapshot.restore()
+
+        # Row 3: Downstream/upstream pipelines badge
+        foot_txt = f"Enable Pipes: {pipes_str}" if pipes_str else node.subtitle
+        foot_layout = self._get_pango_layout(foot_txt, size_pt=7, bold=True)
+        snapshot.save()
+        pt.init(node.x + 12.0, node.y + 78.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(foot_layout, rgba(0.55, 0.94, 0.74, 1.0) if is_enabled else TEXT_MUTED)
+        snapshot.restore()
+
+        snapshot.pop()
+
+        bcol = (
+            NODE_BORDER_SELECTED
+            if is_selected
+            else (rgba(0.28, 0.84, 0.56, 0.95) if is_enabled else NODE_BORDER_NORMAL)
+        )
+        bw = 2.2 if (is_selected or is_enabled) else 1.2
+        snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
+
+        for port in node.in_ports:
+            px = node.x + port.rel_x
+            py = node.y + port.rel_y
+            self._snapshot_port_circle(snapshot, px, py, PORT_IN_COLOR, radius=5.0)
+        for port in node.out_ports:
+            px = node.x + port.rel_x
+            py = node.y + port.rel_y
+            self._snapshot_port_circle(snapshot, px, py, PORT_OUT_COLOR, radius=5.0)
 
     def _snapshot_port_circle(self, snapshot: Gtk.Snapshot, cx: float, cy: float, color: Gdk.RGBA, radius: float = 5.0) -> None:
         rect = Graphene.Rect.alloc()
@@ -760,7 +946,43 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         nid = self._hit_test_node(wx, wy)
         if nid:
+            node = self.vm.nodes[nid]
             self.select_node(nid)
+            if node.class_category == "TestbenchIO":
+                lx = wx - node.x
+                ly = wy - node.y
+                # Header / Radio button click -> enable this TestbenchIO pipeline chain
+                if 0.0 <= ly <= 26.0:
+                    self.select_testbench_io_radio(nid)
+                    return
+                # Row 1: [ File ] vs [ ALSA PCM ] mode pills
+                if 30.0 <= ly <= 51.0:
+                    avail_w = node.width - 26.0
+                    file_pw = round(avail_w * 0.46, 1)
+                    if 10.0 <= lx <= 10.0 + file_pw:
+                        node.config.set_scalar("io_type", "file", origin="instance")
+                        self.vm.dirty = True
+                        self.select_node(nid)
+                        if self.on_graph_modified:
+                            self.on_graph_modified()
+                        self.queue_draw()
+                        return
+                    if 16.0 + file_pw <= lx <= node.width - 10.0:
+                        node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
+                        self.vm.dirty = True
+                        self.select_node(nid)
+                        if self.on_graph_modified:
+                            self.on_graph_modified()
+                        self.queue_draw()
+                        return
+                # Row 2: Selector box click -> open FileChooser or ALSA PCM popover
+                if 53.0 <= ly <= 75.0 and 10.0 <= lx <= node.width - 10.0:
+                    io_type = (node.config.get_scalar("io_type") or "file").strip().lower()
+                    if io_type == "alsa_pcm":
+                        self._open_tb_alsa_popover(node, sx, sy)
+                    else:
+                        self._open_tb_file_chooser(node)
+                    return
             return
 
         eid = self._hit_test_edge(wx, wy)
@@ -1033,7 +1255,20 @@ class TopologyGraphCanvas(Gtk.Widget):
         node.y = wy - node.height / 2.0
         self.vm.nodes[node.id] = node
         self.workspace.attach_widget_kcontrol_nodes(self.vm, node)
-        ctrls = [cnode for cnode in self.vm.nodes.values() if cnode.parent_node_id == node.id]
+        if node.class_name in ("host-copier", "dai-copier", "alh-copier"):
+            self.workspace.attach_host_copier_io_nodes(self.vm)
+            tb_node = self.vm.nodes.get(f"tb_io.{node.id}")
+            if tb_node is not None:
+                _compute_node_geometry(tb_node)
+                if node.class_name == "host-copier":
+                    tb_node.x = node.x - tb_node.width - 48.0
+                else:
+                    tb_node.x = node.x + node.width + 48.0
+                tb_node.y = node.y + (node.height - tb_node.height) / 2.0
+        ctrls = [
+            cnode for cnode in self.vm.nodes.values()
+            if cnode.parent_node_id == node.id and cnode.class_category != "TestbenchIO"
+        ]
         if ctrls:
             for cnode in ctrls:
                 _compute_node_geometry(cnode)
@@ -1051,6 +1286,173 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.on_graph_modified()
         self.queue_draw()
         return node.id
+
+    # -------------------------------------------------------------------------
+    # Testbench IO Node Radio Selection & File / ALSA PCM Pickers
+    # -------------------------------------------------------------------------
+
+    def select_testbench_io_radio(self, active_nid: str) -> None:
+        """Select a TestbenchIO node in the radio group to enable its downstream/upstream pipelines."""
+        if not self.vm or active_nid not in self.vm.nodes:
+            return
+        active_node = self.vm.nodes[active_nid]
+        active_side = str(active_node.config.get_scalar("side", "left")).lower()
+        active_pids = self._parse_pipe_ids(str(active_node.config.get_scalar("target_pipelines", "")))
+
+        # 1. Enable only active_nid on active_side
+        for nid, n in self.vm.nodes.items():
+            if n.class_category == "TestbenchIO" and str(n.config.get_scalar("side", "left")).lower() == active_side:
+                n.config.set_scalar("enabled", "true" if nid == active_nid else "false", origin="instance")
+
+        # 2. Synchronize connected TestbenchIO endpoint(s) on the opposite side
+        opp_side = "right" if active_side == "left" else "left"
+        opp_nodes = [
+            n for n in self.vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == opp_side
+        ]
+        for n in opp_nodes:
+            parent = self.vm.nodes.get(n.parent_node_id or "")
+            parent_pid = parent.pipeline_id if parent else None
+            is_connected = parent_pid in active_pids if parent_pid is not None else bool(
+                self._parse_pipe_ids(str(n.config.get_scalar("target_pipelines", ""))) & active_pids
+            )
+            n.config.set_scalar("enabled", "true" if is_connected else "false", origin="instance")
+
+        self.vm.dirty = True
+        self.select_node(active_nid)
+        if self.on_graph_modified:
+            self.on_graph_modified()
+        self.queue_draw()
+
+    @staticmethod
+    def _discover_alsa_pcms(role: str) -> List[str]:
+        """Discover available ALSA PCM device names for source (playback) or sink (capture)."""
+        devices: List[str] = ["default", "hw:0,0", "plughw:0,0", "sysdefault", "null"]
+        cmd = "arecord" if "sink" in role.lower() else "aplay"
+        try:
+            proc = subprocess.run(
+                [cmd, "-L"],
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                for line in proc.stdout.splitlines():
+                    if line and not line[0].isspace():
+                        dev = line.strip()
+                        if dev and dev not in devices:
+                            devices.append(dev)
+        except Exception:
+            pass
+        return devices[:24]
+
+    def _open_tb_file_chooser(self, node: GraphNode) -> None:
+        """Open a GTK4 FileDialog to choose a source or sink audio file for a TestbenchIO node."""
+        role = (node.config.get_scalar("role") or "Playback Source").strip().lower()
+        is_sink = "sink" in role or node.class_name == "testbench-sink"
+        dialog = Gtk.FileDialog.new()
+        curr_path = (node.config.get_scalar("file_path") or "").strip()
+        if curr_path:
+            parent_dir = os.path.dirname(os.path.abspath(curr_path))
+            if os.path.isdir(parent_dir):
+                dialog.set_initial_folder(Gio.File.new_for_path(parent_dir))
+            if os.path.basename(curr_path):
+                dialog.set_initial_name(os.path.basename(curr_path))
+
+        root = self.get_root()
+        win = root if isinstance(root, Gtk.Window) else None
+
+        def _on_done(dlg: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                gfile = dlg.save_finish(res) if is_sink else dlg.open_finish(res)
+                if gfile and gfile.get_path():
+                    node.config.set_scalar("file_path", gfile.get_path(), origin="instance")
+                    node.config.set_scalar("io_type", "file", origin="instance")
+                    if self.vm:
+                        self.vm.dirty = True
+                    self.select_node(node.id)
+                    if self.on_graph_modified:
+                        self.on_graph_modified()
+                    self.queue_draw()
+            except Exception:
+                pass
+
+        if is_sink:
+            dialog.set_title(f"Select Testbench Sink Output File ({node.title})")
+            dialog.save(win, None, _on_done)
+        else:
+            dialog.set_title(f"Select Testbench Source Input File ({node.title})")
+            dialog.open(win, None, _on_done)
+
+    def _open_tb_alsa_popover(self, node: GraphNode, sx: float, sy: float) -> None:
+        """Open a GTK4 Popover at (sx, sy) to pick or enter an ALSA PCM device or file path."""
+        role = (node.config.get_scalar("role") or "Playback Source").strip().lower()
+        is_sink = "sink" in role or node.class_name == "testbench-sink"
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x = int(sx)
+        rect.y = int(sy)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(8)
+        box.set_margin_bottom(8)
+        box.set_margin_start(8)
+        box.set_margin_end(8)
+
+        title = Gtk.Label(
+            label=f"ALSA PCM {'Sink (Capture Output)' if is_sink else 'Source (Playback Input)'} Device",
+            xalign=0.0,
+        )
+        title.add_css_class("heading")
+        box.append(title)
+
+        entry = Gtk.Entry()
+        entry.set_text(node.config.get_scalar("alsa_pcm") or "default")
+        entry.set_width_chars(24)
+        box.append(entry)
+
+        devices = self._discover_alsa_pcms(role)
+        dd = Gtk.DropDown.new_from_strings(devices)
+        curr_pcm = node.config.get_scalar("alsa_pcm") or "default"
+        if curr_pcm in devices:
+            dd.set_selected(devices.index(curr_pcm))
+
+        def _on_dd_changed(dropdown: Gtk.DropDown, _pspec: object) -> None:
+            idx = dropdown.get_selected()
+            if 0 <= idx < len(devices):
+                entry.set_text(devices[idx])
+
+        dd.connect("notify::selected", _on_dd_changed)
+        box.append(dd)
+
+        apply_btn = Gtk.Button(label="Apply ALSA PCM")
+        apply_btn.add_css_class("suggested-action")
+
+        def _apply(_w: Gtk.Widget) -> None:
+            val = entry.get_text().strip() or "default"
+            node.config.set_scalar("alsa_pcm", val, origin="instance")
+            node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
+            if self.vm:
+                self.vm.dirty = True
+            self.select_node(node.id)
+            if self.on_graph_modified:
+                self.on_graph_modified()
+            self.queue_draw()
+            pop.popdown()
+
+        entry.connect("activate", _apply)
+        apply_btn.connect("clicked", _apply)
+        box.append(apply_btn)
+
+        pop.set_child(box)
+        pop.connect("closed", lambda p: p.unparent())
+        pop.popup()
 
     def _on_drop_item(self, target: Gtk.DropTarget, value: str, x: float, y: float) -> bool:
         if not value:

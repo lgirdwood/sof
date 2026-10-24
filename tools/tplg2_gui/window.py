@@ -351,8 +351,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         # Update node input/output format badges and geometry if format or stream_name changed
         if self.canvas.selected_node_id and self.canvas.selected_node_id in self.canvas.vm.nodes:
             node = self.canvas.vm.nodes[self.canvas.selected_node_id]
-            node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
-            node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
+            if node.class_category == "TestbenchIO":
+                if key == "enabled" and new_val.strip().lower() in ("true", "1", "yes"):
+                    self.canvas.select_testbench_io_radio(node.id)
+            else:
+                node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
+                node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
             _compute_node_geometry(node)
         self.canvas.queue_draw()
         self.status_lbl.set_text(f"Updated attribute '{key}' = '{new_val}'")

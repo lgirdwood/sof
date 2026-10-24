@@ -935,6 +935,7 @@ class Topology2Workspace:
         )
         vm.nodes[node_id] = main_node
         self.attach_widget_kcontrol_nodes(vm, main_node)
+        self.attach_host_copier_io_nodes(vm)
         return vm
 
     def build_graph_for_pipeline(self, pipeline_name: str, index: int = 1) -> GraphViewModel:
@@ -1030,6 +1031,7 @@ class Topology2Workspace:
                         )
                     )
 
+        self.attach_host_copier_io_nodes(vm)
         return vm
 
     def build_graph_for_topology(
@@ -1227,6 +1229,7 @@ class Topology2Workspace:
                     )
                 )
 
+        self.attach_host_copier_io_nodes(vm)
         return vm
 
     def _evaluate_topology_file(
@@ -1826,6 +1829,337 @@ class Topology2Workspace:
                     sink_port="ctl_in",
                     control=ctype,
                     pipeline_id=parent_node.pipeline_id,
+                )
+            )
+
+    def attach_host_copier_io_nodes(self, vm: GraphViewModel) -> None:
+        """Attach left-hand Testbench I/O nodes to host-copiers and right-hand Testbench I/O nodes to dai/alh-copiers."""
+        from collections import deque
+
+        hc_nodes = sorted(
+            [
+                n for n in list(vm.nodes.values())
+                if "host-copier" in n.class_name and n.class_category == "Widget"
+            ],
+            key=lambda n: (n.pipeline_id if n.pipeline_id is not None else 9999, n.id),
+        )
+        dc_nodes = sorted(
+            [
+                n for n in list(vm.nodes.values())
+                if ("dai-copier" in n.class_name or "alh-copier" in n.class_name) and n.class_category == "Widget"
+            ],
+            key=lambda n: (n.pipeline_id if n.pipeline_id is not None else 9999, n.id),
+        )
+        if not hc_nodes and not dc_nodes:
+            return
+
+        def _is_copier_capture(node: GraphNode) -> bool:
+            wdir = str(node.config.get_scalar("direction", "")).lower()
+            wtype = str(node.config.get_scalar("type", "")).lower()
+            return (
+                "capture" in node.id.lower()
+                or wdir == "capture"
+                or wtype == "dai_out"
+                or (
+                    node.pipeline_id in vm.containers
+                    and "capture" in vm.containers[node.pipeline_id].direction.lower()
+                )
+            )
+
+        def _trace_pipeline_chain(start_node: GraphNode, walk_upstream: bool) -> List[int]:
+            visited_nids: Set[str] = {start_node.id}
+            chain_pids: List[int] = []
+            if start_node.pipeline_id is not None:
+                chain_pids.append(start_node.pipeline_id)
+            dq = deque([start_node.id])
+            while dq:
+                cur_id = dq.popleft()
+                for e in vm.edges:
+                    if walk_upstream:
+                        if e.sink_node != cur_id:
+                            continue
+                        nxt_id = e.source_node
+                    else:
+                        if e.source_node != cur_id:
+                            continue
+                        nxt_id = e.sink_node
+                    nxt_node = vm.nodes.get(nxt_id)
+                    if not nxt_node or nxt_node.class_category in ("Control", "TestbenchIO"):
+                        continue
+                    if nxt_id not in visited_nids:
+                        visited_nids.add(nxt_id)
+                        if nxt_node.pipeline_id is not None and nxt_node.pipeline_id not in chain_pids:
+                            chain_pids.append(nxt_node.pipeline_id)
+                        dq.append(nxt_id)
+            if walk_upstream and len(chain_pids) > 1:
+                chain_pids = list(reversed(chain_pids))
+            return chain_pids
+
+        has_left_enabled = any(
+            n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == "left"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+            for n in vm.nodes.values()
+        )
+        enabled_chain_pids: Set[int] = set()
+
+        # 1. Left-hand Testbench I/O nodes for every host-copier
+        for hc_node in hc_nodes:
+            tb_id = f"tb_io.{hc_node.id}"
+            if tb_id in vm.nodes:
+                continue
+
+            is_cap = _is_copier_capture(hc_node)
+            chain_pids = _trace_pipeline_chain(hc_node, walk_upstream=is_cap)
+            pipes_str = " → ".join(str(p) for p in chain_pids) if chain_pids else str(hc_node.pipeline_id or 1)
+
+            pcm_id = str(hc_node.config.get_scalar("pcm_id", hc_node.instance_id) or "0")
+            is_enabled = not has_left_enabled
+            if is_enabled:
+                has_left_enabled = True
+                enabled_chain_pids.update(chain_pids)
+
+            tb_cfg = ConfigNode(
+                key=f"Testbench.HostIO ({hc_node.id})",
+                node_type="object",
+                category_info="Testbench Host Endpoint",
+            )
+            tb_cfg.set_scalar(
+                "enabled",
+                "true" if is_enabled else "false",
+                category_info="Radio: enable downstream/upstream pipelines in next testbench run",
+                origin="instance",
+                valid_values=["true", "false"],
+            )
+            tb_cfg.set_scalar(
+                "side",
+                "left",
+                category_info="Graph placement side",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "role",
+                "Capture Sink" if is_cap else "Playback Source",
+                category_info="Endpoint direction",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "host_copier",
+                hc_node.id,
+                category_info="Connected Host Copier",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "pcm_id",
+                pcm_id,
+                category_info="Host PCM ID",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "target_pipelines",
+                pipes_str,
+                category_info="Downstream/upstream pipelines enabled for testbench",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "io_type",
+                "file",
+                category_info="Select Audio File or ALSA PCM",
+                origin="instance",
+                valid_values=["file", "alsa_pcm"],
+            )
+            tb_cfg.set_scalar(
+                "file_path",
+                f"capture_pcm{pcm_id}.wav" if is_cap else f"playback_pcm{pcm_id}.wav",
+                category_info="Source/Sink audio file path",
+                origin="instance",
+            )
+            tb_cfg.set_scalar(
+                "alsa_pcm",
+                "default",
+                category_info="Source/Sink ALSA PCM device",
+                origin="instance",
+                valid_values=["default", "hw:0,0", "plughw:0,0", "hw:1,0", "plughw:1,0"],
+            )
+
+            tb_node = GraphNode(
+                id=tb_id,
+                title=f"PCM {pcm_id} {'Sink' if is_cap else 'Source'}",
+                subtitle=f"{'Sink ←' if is_cap else 'Source →'} {hc_node.id}",
+                category="testbench_io",
+                class_category="TestbenchIO",
+                class_name="testbench-sink" if is_cap else "testbench-source",
+                instance_id=pcm_id,
+                pipeline_id=None,
+                parent_node_id=hc_node.id,
+                in_ports=[GraphPort("in0", "in.0", "in", "host")] if is_cap else [],
+                out_ports=[] if is_cap else [GraphPort("out0", "out.0", "out", "host")],
+                badges=[f"Pipes: {pipes_str}"],
+                config=tb_cfg,
+                source_file=hc_node.source_file,
+            )
+            vm.nodes[tb_id] = tb_node
+
+            edge_cfg = ConfigNode("Testbench.HostRoute", node_type="object")
+            edge_cfg.set_scalar("source", hc_node.id if is_cap else tb_id, origin="instance")
+            edge_cfg.set_scalar("sink", tb_id if is_cap else hc_node.id, origin="instance")
+            vm.edges.append(
+                GraphEdge(
+                    id=f"tb_edge_{hc_node.id}",
+                    source_node=hc_node.id if is_cap else tb_id,
+                    sink_node=tb_id if is_cap else hc_node.id,
+                    source_port="out0",
+                    sink_port="in0",
+                    is_inter_pipeline=True,
+                    config=edge_cfg,
+                )
+            )
+
+        # 2. Right-hand Testbench I/O nodes for every dai-copier and alh-copier
+        has_right_enabled = any(
+            n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == "right"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+            for n in vm.nodes.values()
+        )
+
+        for dc_node in dc_nodes:
+            tb_id = f"tb_io.{dc_node.id}"
+            if tb_id in vm.nodes:
+                continue
+
+            is_cap = _is_copier_capture(dc_node)
+            # For DAI/ALH copiers on the right:
+            # - Playback DAI/ALH is a Sink at the end of an upstream playback chain (walk_upstream=True)
+            # - Capture DAI/ALH is a Source at the start of a downstream capture chain (walk_upstream=False)
+            chain_pids = _trace_pipeline_chain(dc_node, walk_upstream=not is_cap)
+            pipes_str = " → ".join(str(p) for p in chain_pids) if chain_pids else str(dc_node.pipeline_id or 1)
+
+            parts = dc_node.id.split(".")
+            if len(parts) >= 3 and parts[0] == "dai-copier":
+                if parts[2].upper().startswith(parts[1].upper()):
+                    dai_label = parts[2]
+                else:
+                    dai_label = f"{parts[1]}.{parts[2]}"
+            elif len(parts) >= 2:
+                dai_label = parts[1]
+            else:
+                dai_label = dc_node.instance_id or "DAI"
+            safe_dai = re.sub(r"[^a-zA-Z0-9_-]+", "_", dai_label).strip("_").lower() or "dai"
+
+            if not has_right_enabled:
+                if enabled_chain_pids:
+                    is_enabled = (dc_node.pipeline_id in enabled_chain_pids) or bool(set(chain_pids) & enabled_chain_pids)
+                else:
+                    is_enabled = True
+                if is_enabled:
+                    has_right_enabled = True
+            else:
+                is_enabled = False
+
+            tb_cfg = ConfigNode(
+                key=f"Testbench.DaiIO ({dc_node.id})",
+                node_type="object",
+                category_info="Testbench DAI/ALH Endpoint",
+            )
+            tb_cfg.set_scalar(
+                "enabled",
+                "true" if is_enabled else "false",
+                category_info="Radio: enable downstream/upstream pipelines in next testbench run",
+                origin="instance",
+                valid_values=["true", "false"],
+            )
+            tb_cfg.set_scalar(
+                "side",
+                "right",
+                category_info="Graph placement side",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "role",
+                "Capture Source" if is_cap else "Playback Sink",
+                category_info="Endpoint direction",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "dai_copier",
+                dc_node.id,
+                category_info="Connected DAI/ALH Copier",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "dai_name",
+                dai_label,
+                category_info="DAI/ALH Stream Identifier",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "target_pipelines",
+                pipes_str,
+                category_info="Downstream/upstream pipelines enabled for testbench",
+                origin="default",
+                is_immutable=True,
+            )
+            tb_cfg.set_scalar(
+                "io_type",
+                "file",
+                category_info="Select Audio File or ALSA PCM",
+                origin="instance",
+                valid_values=["file", "alsa_pcm"],
+            )
+            tb_cfg.set_scalar(
+                "file_path",
+                f"capture_{safe_dai}.wav" if is_cap else f"playback_{safe_dai}.wav",
+                category_info="Source/Sink audio file path",
+                origin="instance",
+            )
+            tb_cfg.set_scalar(
+                "alsa_pcm",
+                "default",
+                category_info="Source/Sink ALSA PCM device",
+                origin="instance",
+                valid_values=["default", "hw:0,0", "plughw:0,0", "hw:1,0", "plughw:1,0"],
+            )
+
+            tb_node = GraphNode(
+                id=tb_id,
+                title=f"{dai_label} {'Source' if is_cap else 'Sink'}",
+                subtitle=f"{'← Source' if is_cap else '→ Sink'} {dc_node.id}",
+                category="testbench_io",
+                class_category="TestbenchIO",
+                class_name="testbench-source" if is_cap else "testbench-sink",
+                instance_id=dai_label,
+                pipeline_id=None,
+                parent_node_id=dc_node.id,
+                in_ports=[] if is_cap else [GraphPort("in0", "in.0", "in", "dai")],
+                out_ports=[GraphPort("out0", "out.0", "out", "dai")] if is_cap else [],
+                badges=[f"Pipes: {pipes_str}"],
+                config=tb_cfg,
+                source_file=dc_node.source_file,
+            )
+            vm.nodes[tb_id] = tb_node
+
+            edge_cfg = ConfigNode("Testbench.DaiRoute", node_type="object")
+            edge_cfg.set_scalar("source", tb_id if is_cap else dc_node.id, origin="instance")
+            edge_cfg.set_scalar("sink", dc_node.id if is_cap else tb_id, origin="instance")
+            vm.edges.append(
+                GraphEdge(
+                    id=f"tb_edge_{dc_node.id}",
+                    source_node=tb_id if is_cap else dc_node.id,
+                    sink_node=dc_node.id if is_cap else tb_id,
+                    source_port="out0",
+                    sink_port="in0",
+                    is_inter_pipeline=True,
+                    config=edge_cfg,
                 )
             )
 
