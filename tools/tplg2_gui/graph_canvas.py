@@ -107,6 +107,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.selected_edge_id: Optional[str] = None
         self.selected_container_id: Optional[int] = None
         self.hovered_port: Optional[Tuple[str, str, str]] = None  # (node_id, port_id, direction)
+        self.hovered_warning_pid: Optional[int] = None
 
         # Interaction state
         self._drag_mode: str = "none"  # "none", "pan", "node", "wire"
@@ -172,6 +173,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.selected_node_id = None
         self.selected_edge_id = None
         self.selected_container_id = None
+        self.hovered_warning_pid = None
         self._layout_cache.clear()
         layout_graph(vm)
         self.fit_to_view()
@@ -341,6 +343,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         # 8. Draw HUD overlay (title, zoom badge, interaction hint)
         self._snapshot_hud(snapshot, w, h)
 
+        # 9. Draw floating hover card when hovering a pipeline yellow warning bang
+        if self.hovered_warning_pid is not None and self.hovered_warning_pid in self.vm.containers:
+            self._snapshot_warning_tooltip(snapshot, w, h, self.vm.containers[self.hovered_warning_pid])
+
     def _snapshot_grid(self, snapshot: Gtk.Snapshot, w: float, h: float) -> None:
         step = max(18.0, 32.0 * self.zoom)
         pb = Gsk.PathBuilder.new()
@@ -407,14 +413,23 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         is_cap = "capture" in cont.direction.lower()
         is_tb_enabled = pid in self._get_enabled_tb_pipelines()
-        fill_col = CONTAINER_FILL_CAP if is_cap else CONTAINER_FILL_PB
+        has_warn = bool(cont.warning_text)
+        fill_col = (
+            rgba(0.36, 0.28, 0.10, 0.24)
+            if has_warn
+            else (CONTAINER_FILL_CAP if is_cap else CONTAINER_FILL_PB)
+        )
         border_col = (
             NODE_BORDER_SELECTED
             if self.selected_container_id == pid
             else (
-                rgba(0.28, 0.86, 0.56, 0.78)
-                if is_tb_enabled
-                else (CONTAINER_BORDER_CAP if is_cap else CONTAINER_BORDER_PB)
+                rgba(0.98, 0.78, 0.16, 0.92)
+                if has_warn
+                else (
+                    rgba(0.28, 0.86, 0.56, 0.78)
+                    if is_tb_enabled
+                    else (CONTAINER_BORDER_CAP if is_cap else CONTAINER_BORDER_PB)
+                )
             )
         )
 
@@ -422,8 +437,32 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_color(fill_col, rect)
         snapshot.pop()
 
-        bw = 2.2 if (self.selected_container_id == pid or is_tb_enabled) else 1.4
+        bw = 2.2 if (self.selected_container_id == pid or is_tb_enabled or has_warn) else 1.4
         snapshot.append_border(rrect, [bw, bw, bw, bw], [border_col, border_col, border_col, border_col])
+
+        text_x = cont.x + 14.0
+        if has_warn:
+            # Render yellow warning bang badge [ ⚠ ] in container header
+            bang_rect = Graphene.Rect.alloc()
+            bang_rect.init(cont.x + 12.0, cont.y + 8.0, 24.0, 20.0)
+            bang_rr = Gsk.RoundedRect()
+            bang_rr.init_from_rect(bang_rect, 5.0)
+            is_hov_warn = self.hovered_warning_pid == pid
+            bang_bg = rgba(1.0, 0.84, 0.18, 1.0) if is_hov_warn else rgba(0.95, 0.74, 0.10, 0.96)
+            snapshot.push_rounded_clip(bang_rr)
+            snapshot.append_color(bang_bg, bang_rect)
+            snapshot.pop()
+            bang_bcol = rgba(1.0, 0.95, 0.55, 1.0)
+            snapshot.append_border(bang_rr, [1.2, 1.2, 1.2, 1.2], [bang_bcol, bang_bcol, bang_bcol, bang_bcol])
+
+            bang_layout = self._get_pango_layout("⚠", size_pt=9, bold=True)
+            snapshot.save()
+            bpt = Graphene.Point.alloc()
+            bpt.init(cont.x + 17.5, cont.y + 9.0)
+            snapshot.translate(bpt)
+            snapshot.append_layout(bang_layout, rgba(0.08, 0.08, 0.08, 1.0))
+            snapshot.restore()
+            text_x = cont.x + 42.0
 
         # Container header text
         tb_tag = "  •  [TB Active]" if is_tb_enabled else ""
@@ -431,10 +470,69 @@ class TopologyGraphCanvas(Gtk.Widget):
         layout = self._get_pango_layout(header_txt, size_pt=9, bold=True)
         snapshot.save()
         pt = Graphene.Point.alloc()
-        pt.init(cont.x + 14.0, cont.y + 10.0)
+        pt.init(text_x, cont.y + 10.0)
         snapshot.translate(pt)
-        snapshot.append_layout(layout, TEXT_WHITE)
+        snapshot.append_layout(layout, rgba(1.0, 0.92, 0.55, 1.0) if has_warn else TEXT_WHITE)
         snapshot.restore()
+
+    def _snapshot_warning_tooltip(
+        self,
+        snapshot: Gtk.Snapshot,
+        canvas_w: float,
+        canvas_h: float,
+        cont: PipelineContainer,
+    ) -> None:
+        """Render a high-contrast floating overlay explaining why a pipeline has a yellow bang and how it was enabled."""
+        lines = [ln for ln in cont.warning_text.splitlines() if ln.strip()]
+        if not lines:
+            return
+
+        layouts: List[Tuple[Pango.Layout, Gdk.RGBA]] = []
+        max_lw = 0.0
+        total_lh = 0.0
+        for idx, ln in enumerate(lines):
+            is_hdr = idx == 0
+            lyt = self._get_pango_layout(ln, size_pt=9 if is_hdr else 8, bold=is_hdr)
+            _, ext = lyt.get_pixel_extents()
+            max_lw = max(max_lw, float(ext.width))
+            total_lh += float(ext.height) + (6.0 if is_hdr else 4.0)
+            col = rgba(1.0, 0.86, 0.28, 1.0) if is_hdr else TEXT_WHITE
+            layouts.append((lyt, col))
+
+        box_w = max_lw + 28.0
+        box_h = total_lh + 18.0
+
+        if self._pointer_pos is not None:
+            px, py = self._pointer_pos
+            tx = min(max(12.0, px + 16.0), max(12.0, canvas_w - box_w - 12.0))
+            ty = min(max(12.0, py + 18.0), max(12.0, canvas_h - box_h - 12.0))
+        else:
+            sx, sy = self.world_to_screen(cont.x + 12.0, cont.y + 34.0)
+            tx = min(max(12.0, sx), max(12.0, canvas_w - box_w - 12.0))
+            ty = min(max(12.0, sy), max(12.0, canvas_h - box_h - 12.0))
+
+        rect = Graphene.Rect.alloc()
+        rect.init(tx, ty, box_w, box_h)
+        rrect = Gsk.RoundedRect()
+        rrect.init_from_rect(rect, 8.0)
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(rgba(0.24, 0.19, 0.06, 0.97), rect)
+        snapshot.pop()
+
+        bcol = rgba(0.98, 0.78, 0.16, 0.96)
+        snapshot.append_border(rrect, [1.8, 1.8, 1.8, 1.8], [bcol, bcol, bcol, bcol])
+
+        cy = ty + 10.0
+        pt = Graphene.Point.alloc()
+        for idx, (lyt, col) in enumerate(layouts):
+            _, ext = lyt.get_pixel_extents()
+            snapshot.save()
+            pt.init(tx + 14.0, cy)
+            snapshot.translate(pt)
+            snapshot.append_layout(lyt, col)
+            snapshot.restore()
+            cy += float(ext.height) + (6.0 if idx == 0 else 4.0)
 
     def _snapshot_node(self, snapshot: Gtk.Snapshot, node: GraphNode, is_selected: bool) -> None:
         rect = Graphene.Rect.alloc()
@@ -1114,8 +1212,24 @@ class TopologyGraphCanvas(Gtk.Widget):
         wx, wy = self.screen_to_world(sx, sy)
         hit = self._hit_test_port(wx, wy)
         new_hov = (hit[0], hit[1], hit[2]) if hit else None
+
+        # Check if hovering over the yellow warning bang / header bar of a pipeline container with a warning
+        new_warn_pid: Optional[int] = None
+        for pid, cont in self.vm.containers.items():
+            if cont.warning_text and cont.x <= wx <= cont.x + cont.width and cont.y <= wy <= cont.y + 38.0:
+                new_warn_pid = pid
+                break
+
+        needs_redraw = False
         if new_hov != self.hovered_port:
             self.hovered_port = new_hov
+            needs_redraw = True
+        if new_warn_pid != self.hovered_warning_pid:
+            self.hovered_warning_pid = new_warn_pid
+            needs_redraw = True
+        elif new_warn_pid is not None:
+            needs_redraw = True
+        if needs_redraw:
             self.queue_draw()
 
     def _on_scroll(self, controller: Gtk.EventControllerScroll, dx: float, dy: float) -> bool:

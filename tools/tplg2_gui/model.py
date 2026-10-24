@@ -210,6 +210,8 @@ class PipelineContainer:
     y: float = 0.0
     width: float = 300.0
     height: float = 160.0
+    enabled_by: str = ""
+    warning_text: str = ""
     config: ConfigNode = field(default_factory=lambda: ConfigNode("pipeline", node_type="object"))
 
 

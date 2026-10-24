@@ -100,6 +100,7 @@ class AstStmt:
         self.children: List["AstStmt"] = children if children is not None else []
         self.doxy = doxy
         self.source_file = source_file
+        self.provenance: str = ""
 
 
 class TokenStream:
@@ -1070,7 +1071,14 @@ class Topology2Workspace:
 
         cli_keys: Set[str] = set(variant.defines.keys()) if variant else set()
         search_dirs: List[str] = ["include", "include/common", "include/components", "include/dais", "include/pipelines", "include/pipelines/cavs", "platform", "platform/intel"]
-        expanded_stmts = self._evaluate_topology_file(conf_path, defines, search_dirs, cli_keys=cli_keys)
+        skipped_branches: List[Tuple[str, str, str, AstStmt, str]] = []
+        expanded_stmts = self._evaluate_topology_file(
+            conf_path,
+            defines,
+            search_dirs,
+            cli_keys=cli_keys,
+            skipped_branches=skipped_branches,
+        )
 
         # Populate root_config with active Define variables
         def_node = ConfigNode(key="Define (Active Variables)", node_type="define", category_info=f"{len(defines)} vars")
@@ -1108,6 +1116,7 @@ class Topology2Workspace:
         for wclass, winst, wstmts in top_widgets:
             if wclass != "pipeline":
                 continue
+            prov = next((s.provenance for s in wstmts if s.provenance), "")
             expanded_wstmts = self._expand_inner_include_by_key(wstmts, defines, search_dirs, conf_path)
             p_idx: Optional[int] = None
             for ch in expanded_wstmts:
@@ -1123,10 +1132,13 @@ class Topology2Workspace:
                 pdef_base = self.processing_modules.get("pipeline")
                 pcfg = pdef_base.config_tree.clone() if pdef_base else ConfigNode("Object.Widget.pipeline", node_type="object")
                 pcfg.set_scalar("index", str(p_idx), origin="instance", is_constructor=True)
+                en_by = prov or f"Defined in {rel_path}"
+                pcfg.set_scalar("enabled_by", en_by, category_info="IncludeByKey Provenance", origin="default", is_immutable=True)
                 vm.containers[p_idx] = PipelineContainer(
                     pipeline_id=p_idx,
                     class_name="io-gateway",
                     direction="playback",
+                    enabled_by=en_by,
                     config=pcfg,
                 )
                 custom_pipe_ids.add(p_idx)
@@ -1168,12 +1180,16 @@ class Topology2Workspace:
                 p_idx = int(winst)
 
             if p_idx is not None and p_idx not in vm.containers:
+                prov = next((s.provenance for s in wstmts if s.provenance), "")
+                en_by = prov or f"Defined in {rel_path}"
                 pcfg = ConfigNode(f"Pipeline.{p_idx}", node_type="object")
                 pcfg.set_scalar("index", str(p_idx), origin="instance", is_constructor=True)
+                pcfg.set_scalar("enabled_by", en_by, category_info="IncludeByKey Provenance", origin="default", is_immutable=True)
                 vm.containers[p_idx] = PipelineContainer(
                     pipeline_id=p_idx,
                     class_name="io-gateway",
                     direction="playback",
+                    enabled_by=en_by,
                     config=pcfg,
                 )
                 custom_pipe_ids.add(p_idx)
@@ -1229,6 +1245,7 @@ class Topology2Workspace:
                     )
                 )
 
+        self._analyze_unconnected_pipelines(vm, conf_path, defines, search_dirs, skipped_branches)
         self.attach_host_copier_io_nodes(vm)
         return vm
 
@@ -1239,6 +1256,8 @@ class Topology2Workspace:
         search_dirs: List[str],
         visited: Optional[Set[str]] = None,
         cli_keys: Optional[Set[str]] = None,
+        active_conditions: Tuple[str, ...] = (),
+        skipped_branches: Optional[List[Tuple[str, str, str, AstStmt, str]]] = None,
     ) -> List[AstStmt]:
         if visited is None:
             visited = set()
@@ -1250,7 +1269,16 @@ class Topology2Workspace:
         visited.add(abs_f)
 
         stmts = self.get_ast(abs_f)
-        return self._evaluate_stmt_list(stmts, defines, search_dirs, abs_f, visited, cli_keys)
+        return self._evaluate_stmt_list(
+            stmts,
+            defines,
+            search_dirs,
+            abs_f,
+            visited,
+            cli_keys,
+            active_conditions=active_conditions,
+            skipped_branches=skipped_branches,
+        )
 
     def _evaluate_stmt_list(
         self,
@@ -1260,6 +1288,8 @@ class Topology2Workspace:
         current_file: str,
         visited: Set[str],
         cli_keys: Set[str],
+        active_conditions: Tuple[str, ...] = (),
+        skipped_branches: Optional[List[Tuple[str, str, str, AstStmt, str]]] = None,
     ) -> List[AstStmt]:
         out: List[AstStmt] = []
         for st in stmts:
@@ -1269,7 +1299,17 @@ class Topology2Workspace:
             elif st.stmt_type == "include":
                 inc_path = self.resolve_include(st.key, search_dirs, current_file)
                 if inc_path and not self._is_pure_class_include(inc_path):
-                    out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, visited, cli_keys))
+                    out.extend(
+                        self._evaluate_topology_file(
+                            inc_path,
+                            defines,
+                            search_dirs,
+                            visited,
+                            cli_keys,
+                            active_conditions=active_conditions,
+                            skipped_branches=skipped_branches,
+                        )
+                    )
             elif st.stmt_type == "block" and st.key == "Define":
                 for ch in st.children:
                     if ch.stmt_type == "kv":
@@ -1283,19 +1323,48 @@ class Topology2Workspace:
                 parts = split_dotted_key(st.key)
                 var_name = parts[1] if len(parts) > 1 else ""
                 var_val = str(defines.get(var_name, ""))
+                matched_ch: Optional[AstStmt] = None
+                matched_pattern: str = ""
                 for ch in st.children:
                     pattern = strip_quotes(ch.key)
-                    if self._key_matches(pattern, var_val):
-                        if ch.stmt_type == "kv" and ch.value:
-                            inc_file = self._substitute_vars(str(ch.value), defines)
-                            inc_path = self.resolve_include(inc_file, search_dirs, current_file)
-                            if inc_path:
-                                # Allow re-inclusion of parametric files across IncludeByKey blocks
-                                out.extend(self._evaluate_topology_file(inc_path, defines, search_dirs, set(), cli_keys))
-                        elif ch.stmt_type == "block":
-                            out.extend(self._evaluate_stmt_list(ch.children, defines, search_dirs, current_file, visited, cli_keys))
-                        break
+                    if matched_ch is None and self._key_matches(pattern, var_val):
+                        matched_ch = ch
+                        matched_pattern = pattern
+                    elif skipped_branches is not None:
+                        skipped_branches.append((var_name, var_val, pattern, ch, current_file))
+                if matched_ch is not None:
+                    if matched_ch.stmt_type == "kv" and matched_ch.value:
+                        inc_file = self._substitute_vars(str(matched_ch.value), defines)
+                        inc_path = self.resolve_include(inc_file, search_dirs, current_file)
+                        if inc_path:
+                            cond = f'{var_name} = "{var_val}" → {inc_file}'
+                            out.extend(
+                                self._evaluate_topology_file(
+                                    inc_path,
+                                    defines,
+                                    search_dirs,
+                                    set(),
+                                    cli_keys,
+                                    active_conditions=active_conditions + (cond,),
+                                    skipped_branches=skipped_branches,
+                                )
+                            )
+                    elif matched_ch.stmt_type == "block":
+                        cond = f'{var_name} = "{var_val}" (matches "{matched_pattern}")'
+                        out.extend(
+                            self._evaluate_stmt_list(
+                                matched_ch.children,
+                                defines,
+                                search_dirs,
+                                current_file,
+                                visited,
+                                cli_keys,
+                                active_conditions=active_conditions + (cond,),
+                                skipped_branches=skipped_branches,
+                            )
+                        )
             else:
+                st.provenance = "  ▸  ".join(active_conditions)
                 out.append(st)
         return out
 
@@ -1329,6 +1398,7 @@ class Topology2Workspace:
         # 1) Object.Pipeline { class_name [ { index 1 ... } ] }
         # 2) Object.Pipeline.class_name [ { index 1 ... } ]
         # 3) Object.Pipeline.class_name."1" { ... }
+        prov = st.provenance
         if len(parts) == 2 and st.stmt_type == "block":
             for pch in st.children:
                 pparts = split_dotted_key(pch.key)
@@ -1336,19 +1406,19 @@ class Topology2Workspace:
                 if pch.stmt_type == "array":
                     for item in pch.children:
                         if item.stmt_type == "block":
-                            self._instantiate_pipeline_in_topology(pclass, None, item.children, vm, defines, raw_routes, source_file)
+                            self._instantiate_pipeline_in_topology(pclass, None, item.children, vm, defines, raw_routes, source_file, provenance=prov)
                 elif pch.stmt_type == "block":
                     pidx_str = pparts[1] if len(pparts) > 1 else None
-                    self._instantiate_pipeline_in_topology(pclass, pidx_str, pch.children, vm, defines, raw_routes, source_file)
+                    self._instantiate_pipeline_in_topology(pclass, pidx_str, pch.children, vm, defines, raw_routes, source_file, provenance=prov)
         elif len(parts) == 3 and st.stmt_type == "array":
             pclass = parts[2]
             for item in st.children:
                 if item.stmt_type == "block":
-                    self._instantiate_pipeline_in_topology(pclass, None, item.children, vm, defines, raw_routes, source_file)
+                    self._instantiate_pipeline_in_topology(pclass, None, item.children, vm, defines, raw_routes, source_file, provenance=prov)
         elif len(parts) >= 3 and st.stmt_type == "block":
             pclass = parts[2]
             pidx_str = parts[3] if len(parts) > 3 else None
-            self._instantiate_pipeline_in_topology(pclass, pidx_str, st.children, vm, defines, raw_routes, source_file)
+            self._instantiate_pipeline_in_topology(pclass, pidx_str, st.children, vm, defines, raw_routes, source_file, provenance=prov)
 
     def _instantiate_pipeline_in_topology(
         self,
@@ -1359,6 +1429,7 @@ class Topology2Workspace:
         defines: Dict[str, str],
         raw_routes: List[Tuple[Dict[str, str], Optional[int]]],
         source_file: str,
+        provenance: str = "",
     ) -> None:
         # Determine pipeline index
         p_idx = 0
@@ -1381,8 +1452,11 @@ class Topology2Workspace:
             if ch.stmt_type == "kv" and ch.key == "direction":
                 direction = self._substitute_vars(str(ch.value), local_defs)
 
+        rel_src = os.path.relpath(source_file, self.root_dir)
+        en_by = provenance or f"Defined in {rel_src}"
         container_cfg = pdef.config_tree.clone() if pdef else ConfigNode(f"Pipeline.{pclass}", node_type="object")
         container_cfg.set_scalar("index", str(p_idx), origin="instance", is_constructor=True)
+        container_cfg.set_scalar("enabled_by", en_by, category_info="IncludeByKey Provenance", origin="default", is_immutable=True)
 
         # Collect instance-level widget overrides inside this Object.Pipeline block
         widget_overrides: Dict[Tuple[str, str], List[AstStmt]] = {}
@@ -1406,6 +1480,7 @@ class Topology2Workspace:
             pipeline_id=p_idx,
             class_name=pclass,
             direction=direction,
+            enabled_by=en_by,
             config=container_cfg,
         )
         vm.containers[p_idx] = container
@@ -1496,12 +1571,17 @@ class Topology2Workspace:
         top_widgets: List[Tuple[str, str, List[AstStmt]]],
         default_index: Optional[int] = None,
     ) -> None:
+        prov = st.provenance
+
         def with_default_idx(children: List[AstStmt]) -> List[AstStmt]:
-            if default_index is None:
-                return children
-            if any(ch.stmt_type == "kv" and ch.key == "index" for ch in children):
-                return children
-            return [AstStmt(stmt_type="kv", key="index", value=str(default_index))] + list(children)
+            res = list(children)
+            if default_index is not None and not any(ch.stmt_type == "kv" and ch.key == "index" for ch in res):
+                res = [AstStmt(stmt_type="kv", key="index", value=str(default_index))] + res
+            if prov:
+                for ch in res:
+                    if not ch.provenance:
+                        ch.provenance = prov
+            return res
 
         if len(parts) == 2 and st.stmt_type == "block":
             for wch in st.children:
@@ -1523,6 +1603,136 @@ class Topology2Workspace:
             elif st.stmt_type == "block":
                 wi = parts[3] if len(parts) > 3 else "1"
                 top_widgets.append((wc, wi, with_default_idx(st.children)))
+
+    def _analyze_unconnected_pipelines(
+        self,
+        vm: GraphViewModel,
+        conf_path: str,
+        defines: Dict[str, str],
+        search_dirs: List[str],
+        skipped_branches: List[Tuple[str, str, str, AstStmt, str]],
+    ) -> None:
+        """Detect pipelines with missing routes and explain how they were enabled and how to connect them."""
+        if not vm.containers:
+            return
+
+        # 1. Extract routes inside skipped IncludeByKey branches so we can tell the user how to enable them
+        skipped_routes: List[Tuple[str, str, str, str, str, str]] = []
+        for var_name, cur_val, req_pattern, ch, cur_file in skipped_branches:
+            branch_routes: List[Tuple[Dict[str, str], Optional[int]]] = []
+            inc_label = ""
+            if ch.stmt_type == "kv" and ch.value:
+                inc_file = self._substitute_vars(str(ch.value), defines)
+                inc_label = inc_file
+                inc_path = self.resolve_include(inc_file, search_dirs, cur_file)
+                if inc_path:
+                    for sst in self.get_ast(inc_path):
+                        if sst.key.startswith("Object.Base"):
+                            self._collect_topology_route_stmt(sst, split_dotted_key(sst.key), defines, branch_routes)
+            elif ch.stmt_type == "block":
+                for sst in ch.children:
+                    if sst.key.startswith("Object.Base"):
+                        self._collect_topology_route_stmt(sst, split_dotted_key(sst.key), defines, branch_routes)
+            for rdict, _ in branch_routes:
+                src_s = self._substitute_vars(rdict.get("source", ""), defines)
+                snk_s = self._substitute_vars(rdict.get("sink", ""), defines)
+                if src_s and snk_s:
+                    skipped_routes.append((src_s, snk_s, var_name, cur_val, req_pattern, inc_label))
+
+        # Find CMake variants for this topology so we can suggest matching targets
+        topo_variants: List[CMakeTargetVariant] = []
+        for entry in self.machine_topologies:
+            if os.path.abspath(entry.conf_path) == os.path.abspath(conf_path):
+                topo_variants = entry.variants
+                break
+
+        # 2. Check each pipeline container for widgets missing their upstream/downstream route
+        for pid, cont in vm.containers.items():
+            p_nodes = [
+                n for n in vm.nodes.values()
+                if n.pipeline_id == pid and n.class_category == "Widget"
+            ]
+            if not p_nodes:
+                continue
+
+            warnings: List[str] = []
+            for n in p_nodes:
+                real_in = [
+                    e for e in vm.edges
+                    if e.sink_node == n.id
+                    and e.source_node in vm.nodes
+                    and vm.nodes[e.source_node].class_category == "Widget"
+                ]
+                real_out = [
+                    e for e in vm.edges
+                    if e.source_node == n.id
+                    and e.sink_node in vm.nodes
+                    and vm.nodes[e.sink_node].class_category == "Widget"
+                ]
+                is_cap = (
+                    "capture" in cont.direction.lower()
+                    or "capture" in n.id.lower()
+                    or str(n.config.get_scalar("direction", "")).lower() == "capture"
+                    or str(n.config.get_scalar("type", "")).lower() == "dai_out"
+                )
+
+                missing_desc = ""
+                if "host-copier" in n.class_name:
+                    if is_cap and not real_in:
+                        missing_desc = "has no upstream capture source route"
+                    elif not is_cap and not real_out:
+                        missing_desc = "has no downstream playback sink route"
+                elif "dai-copier" in n.class_name or "alh-copier" in n.class_name:
+                    if is_cap and not real_out:
+                        missing_desc = "has no downstream capture route (left port unconnected)"
+                    elif not is_cap and not real_in:
+                        missing_desc = "has no upstream playback route (left port unconnected)"
+                elif n.class_name not in ("kpb", "siggen"):
+                    if not real_in and not real_out:
+                        missing_desc = "has no input or output routes"
+                    elif not real_in:
+                        missing_desc = "has no input route"
+                    elif not real_out:
+                        missing_desc = "has no output route"
+
+                if not missing_desc:
+                    continue
+
+                lines = [
+                    f"⚠ Pipeline {pid} ({cont.class_name}): '{n.id}' {missing_desc}",
+                    f"• Pipeline enabled by: {cont.enabled_by or 'Top-level topology definition'}",
+                ]
+
+                # Check if any skipped IncludeByKey branch connects this widget
+                matched_hints: List[str] = []
+                for src_s, snk_s, var_name, cur_val, req_pattern, inc_label in skipped_routes:
+                    if src_s == n.id or snk_s == n.id:
+                        inc_part = f" → {inc_label}" if inc_label else ""
+                        matching_vars = [
+                            v.output_name for v in topo_variants
+                            if self._key_matches(req_pattern, str(v.defines.get(var_name, "")))
+                        ]
+                        var_hint = f" (e.g. target '{matching_vars[0]}')" if matching_vars else ""
+                        matched_hints.append(
+                            f"• Connected when: IncludeByKey.{var_name} matches \"{req_pattern}\" "
+                            f"(currently \"{cur_val}\"){inc_part}\n"
+                            f"  Routes: {src_s} → {snk_s}{var_hint}"
+                        )
+                if matched_hints:
+                    lines.extend(matched_hints[:2])
+                else:
+                    lines.append(f"• No Object.Base.route in active Define configuration connects '{n.id}'.")
+                warnings.append("\n".join(lines))
+
+            if warnings:
+                cont.warning_text = "\n\n".join(warnings)
+                cont.config.set_scalar(
+                    "warning",
+                    cont.warning_text.replace("\n", "  |  "),
+                    category_info="Unconnected Pipeline Diagnostic",
+                    origin="default",
+                    is_immutable=True,
+                )
 
     def _collect_topology_route_stmt(
         self,

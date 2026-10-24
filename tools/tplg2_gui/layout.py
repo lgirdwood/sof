@@ -375,7 +375,8 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     for pid, container in sorted(vm.containers.items()):
         member_ids = by_pipe.get(pid, [])
         header_txt = f"Pipeline {pid}: {container.class_name} ({container.direction})"
-        min_header_w = len(header_txt) * 7.5 + 34.0
+        warn_extra = 42.0 if container.warning_text else 0.0
+        min_header_w = len(header_txt) * 7.5 + 34.0 + warn_extra
         if not member_ids:
             container.width = max(NODE_WIDTH + 2 * CONTAINER_PAD_X, min_header_w)
             container.height = NODE_BASE_HEIGHT + CONTAINER_PAD_TOP + CONTAINER_PAD_BOTTOM
