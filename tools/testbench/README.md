@@ -4,6 +4,13 @@
 
  * Simulate IPC3 and IPC4 SOF versions with run of set of processing
    components based on desired topology.
+ * Supports arbitrary multi-pipeline DAG topologies, including linear chains,
+   1-to-N fan-out (e.g., crossover), N-to-1 fan-in (e.g., AEC reference + mic,
+   deepbuffer + main playback mixing), diamond graphs, `module-copier`
+   (`SND_SOC_TPLG_DAPM_BUFFER`), and concurrent multi-PCM playback and capture.
+ * Multi-core and multi-threaded execution on host CPUs (`pthread` +
+   `pthread_setaffinity_np`) honoring topology `core` / `core_id` assignments
+   for both Low Latency (LL) pipelines and Data Processing (DP) modules.
  * Replaces host and dai components with file I/O with raw binary
    S16_LE/S24_LE/S32_LE or text format files for audio waveforms.
  * Much faster than real-time execution in native build, e.g. x86 on
@@ -13,6 +20,66 @@
    accuracy.
  * Allows easy use of conventional debugger, profiler, leak and memory check
    tools usage for DSP firmware code.
+
+### Architecture
+
+#### Multi-Pipeline Graphs & Multi-Pin Binding
+
+`sof-testbench4` parses the full topology widget, route, and PCM lists and constructs the active subgraph selected via `-p <pipeline1,pipeline2,...>`:
+
+ * **Multi-Source / Multi-Sink Discovery**: Automatically discovers all active `AIF_IN` (playback host), `AIF_OUT` (capture host), `DAI_IN` (playback DAI), and `DAI_OUT` (capture DAI) endpoints across enabled pipelines and binds them in order to the comma-separated `-i` input files and `-o` output files.
+ * **Pin Binding & Sink Formats**: Parses `SOF_TKN_COMP_INPUT_PIN_BINDING_WNAME` and `SOF_TKN_COMP_OUTPUT_PIN_BINDING_WNAME` tuples to assign exact source and destination queue IDs (`src_queue_id`, `dst_queue_id`) for multi-pin modules (such as `crossover`, `mixin`/`mixout`, `google-rtc-audio-processing`, and multi-sink `copier`s), and sends `SOF_IPC4_COPIER_MODULE_CFG_PARAM_SET_SINK_FORMAT` IPCs for non-zero output pins.
+ * **DAG Traversal**: Prepares, sets up, binds, triggers, and tears down branching and merging pipeline graphs without duplicate widget initialization or double unbinding.
+
+#### Multi-Core LL & DP Thread Scheduling
+
+`sof-testbench4` supports up to `CONFIG_CORE_COUNT=8` virtual DSP cores (`CONFIG_CROSS_CORE_STREAM=y`) mapped onto host CPU cores via `sched_getaffinity` and `pthread_setaffinity_np`:
+
+ * **Topology Core Assignment**:
+   * Pipelines (`SND_SOC_TPLG_DAPM_SCHEDULER`) use `SOF_TKN_SCHED_CORE` (`core`) and `SOF_TKN_SCHED_PRIORITY` (`priority`), propagated via `SOF_IPC4_GLB_CREATE_PIPELINE`.
+   * Widgets use `SOF_TKN_COMP_CORE_ID` (`core_id`) and `SOF_TKN_COMP_SCHED_DOMAIN` (`LL` vs. `DP`), propagated via `SOF_IPC4_MOD_INIT_INSTANCE`. LL widgets inherit their parent pipeline's `core_id`, while DP widgets can reside on any DSP core independent of their parent LL pipeline.
+ * **Per-Core LL Worker Threads (`ll_schedule_pthread.c`)**:
+   * Each active DSP core `c` (`0 .. CONFIG_CORE_COUNT - 1`) spawns a dedicated persistent `pthread` worker pinned to host CPU `c % num_allowed_host_cpus` with thread-local `cpu_get_id() == c`.
+   * On each 1 ms tick (`schedule_ll_run_tasks()`), all active LL core worker threads run their core's queued LL pipeline tasks concurrently in parallel across host CPU cores and synchronize at the end of the LL cycle before triggering the DP scheduler.
+ * **Per-Module DP Worker Threads (`dp_schedule_pthread.c`)**:
+   * Each Data Processing (DP) module (`COMP_PROCESSING_DOMAIN_DP`) runs in its own dedicated `pthread` pinned to the host CPU core corresponding to the module's topology `core_id`.
+   * Cross-core and same-core LL-to-DP and DP-to-LL connections communicate through lock-free single-producer single-consumer (SPSC) shared `ring_buffer` instances.
+ * **Xtensa Simulator & Single-Threaded C Library Partitioning (`ll_schedule.c` / `dp_schedule.c`)**:
+   * When built for the Xtensa simulator (`xt-run` via `scripts/rebuild-testbench.sh -p <platform>`, or manually with `-DTESTBENCH_XTENSA_SIM=ON`), CMake automatically selects the pure standard-C cooperative schedulers (`ll_schedule.c` and `dp_schedule.c`) instead of `ll_schedule_pthread.c` and `dp_schedule_pthread.c`.
+   * This eliminates dependencies on `<pthread.h>`, `-lpthread`, `<sched.h>`, and `clock_gettime` that are unavailable in the Xtensa newlib (`-mlsp=sim`) runtime, while executing DP modules synchronously inside `scheduler_dp_ll_tick()` so their instruction cycles are included in `XT_RSR_CCOUNT()` profiling.
+
+### Command-Line Options
+
+```
+Usage: sof-testbench4 <options> -i <input_file1,input_file2,...> -o <output_file1,output_file2,...>
+
+Options for processing:
+  -t <topology file>
+  -i <input_file1,input_file2,...>  (up to 16 comma-separated input files)
+  -o <output_file1,output_file2,...> (up to 16 comma-separated output files)
+
+Options to control test:
+  -d <level> Sets the traces print level:
+     0 all traces are suppressed
+     1 shows error traces
+     2 shows warning traces and previous
+     3 shows info traces and previous
+     4 shows debug traces and previous, plus other testbench debug messages
+  -p <pipeline1,pipeline2,...> (up to 16 comma-separated pipeline IDs, default: 1)
+  -C <number of copy() iterations>
+  -P <number of dynamic pipeline iterations>
+  -s <script file to set controls, with amixer and sleep commands>
+
+Options for input and output format override:
+  -b <input_format>, S16_LE, S24_LE, or S32_LE
+  -c <input channels>
+  -n <output channels>
+  -r <input rate>
+  -R <output rate>
+
+Help:
+  -h
+```
 
 ### Prerequisites
 
@@ -63,6 +130,30 @@ To test capture use -p 3,4 with same topologies. To run both
 directions, use -p 1,2,3,4 and provide multiple input and output
 files separated with comma. Use e.g. -i i1.raw,i2.raw
 -o o1.raw,o2.raw.
+
+### Multi-Pipeline, DP, and Multi-Core Examples
+
+```
+# 1-to-2 Fan-Out (2-way Crossover across pipelines 1, 101, 102)
+tools/testbench/build_testbench/install/bin/sof-testbench4 -r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
+  -t tools/build_tools/topology/topology2/development/sof-tgl-nocodec-crossover-2way.tplg \
+  -p 1,101,102 -i in.raw -o out_sink1.raw,out_sink2.raw
+
+# 2-to-1 Fan-In (Google RTC AEC capture + playback reference across pipelines 7, 8, 12)
+tools/testbench/build_testbench/install/bin/sof-testbench4 -r 16000 -R 16000 -c 2 -n 2 -b S16_LE \
+  -t tools/build_tools/topology/topology2/development/sof-tgl-nocodec-rtcaec.tplg \
+  -p 7,8,12 -i mic_in.raw,ref_in.raw -o aec_out.raw
+
+# Multiple DP Modules in Dedicated Threads (Playback + Capture Phase Vocoder)
+tools/testbench/build_testbench/install/bin/sof-testbench4 -r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
+  -t tools/build_tools/topology/topology2/development/sof-hda-benchmark-phase_vocoder32.tplg \
+  -p 1,2,3,4 -i pb_in.raw,cap_in.raw -o pb_out.raw,cap_out.raw
+
+# Multi-Core LL & Cross-Core DP Execution (Core 0 Capture LL, Core 1 DP SRC threads, Core 2 Playback/Capture LL)
+tools/testbench/build_testbench/install/bin/sof-testbench4 -r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
+  -t tools/build_tools/topology/topology2/development/sof-mtl-nocodec-dp-core-test.tplg \
+  -p 5,6,7,8,11,12 -i pb_in.raw,cap1_in.raw,cap2_in.raw -o pb_out.raw,cap1_out.raw,cap2_out.raw
+```
 
 ### Apply controls to simulation
 

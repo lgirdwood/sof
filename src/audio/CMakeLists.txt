@@ -137,7 +137,9 @@ if(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 		sof_list_append_ifdef(CONFIG_COMP_DAI base_files dai-zephyr.c)
 	else()
 		list(APPEND base_files host-legacy.c)
-		sof_list_append_ifdef(CONFIG_COMP_DAI base_files dai-legacy.c)
+		if(CONFIG_COMP_DAI AND NOT CONFIG_LIBRARY)
+			list(APPEND base_files dai-legacy.c)
+		endif()
 	endif()
 endif()
 
@@ -163,7 +165,7 @@ elseif(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 		${base_files}
 	)
 
-	if(CONFIG_COMP_DAI)
+	if(CONFIG_COMP_DAI AND NOT CONFIG_LIBRARY)
 		add_local_sources(sof
 			dai-legacy.c
 		)

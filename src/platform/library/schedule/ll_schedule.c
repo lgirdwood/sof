@@ -1,31 +1,41 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// Copyright(c) 2019 Intel Corporation. All rights reserved.
+// Copyright(c) 2019-2026 Intel Corporation. All rights reserved.
 //
 // Author: Tomasz Lauda <tomasz.lauda@linux.intel.com>
-
-#define _GNU_SOURCE
 
 #include <sof/audio/component.h>
 #include <rtos/task.h>
 #include <sof/schedule/schedule.h>
+#include <sof/schedule/dp_schedule.h>
 #include <platform/lib/ll_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
+#include <sof/lib/cpu.h>
 #include <rtos/wait.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <stdint.h>
 
- /* scheduler testbench definition */
+/* Single-threaded cooperative LL scheduler for Xtensa simulator (xt-run) */
 
 SOF_DEFINE_REG_UUID(ll_sched_lib);
 
 DECLARE_TR_CTX(ll_tr, SOF_UUID(ll_sched_lib_uuid), LOG_LEVEL_INFO);
 
+static int host_current_core_id;
+
 /* list of all tasks */
 static struct list_item sched_list;
+
+int arch_cpu_get_id(void)
+{
+	return host_current_core_id;
+}
+
+void host_cpu_set_id(int id)
+{
+	host_current_core_id = id;
+}
 
 void schedule_ll_run_tasks(void)
 {
@@ -44,6 +54,7 @@ void schedule_ll_run_tasks(void)
 		/* only run queued tasks */
 		if (task->state == SOF_TASK_STATE_QUEUED) {
 			task->state = SOF_TASK_STATE_RUNNING;
+			host_cpu_set_id(task->core);
 
 			state = task_run(task);
 
@@ -55,6 +66,12 @@ void schedule_ll_run_tasks(void)
 			}
 		}
 	}
+
+	host_cpu_set_id(0);
+
+#if CONFIG_ZEPHYR_DP_SCHEDULER
+	scheduler_dp_ll_tick();
+#endif
 }
 
 /* schedule new LL task */
@@ -121,7 +138,7 @@ int schedule_task_init_ll(struct task *task,
 			  int16_t priority, enum task_state (*run)(void *data),
 			  void *data, uint16_t core, uint32_t flags)
 {
-	return schedule_task_init(task, uid, SOF_SCHEDULE_LL_TIMER, 0, run,
+	return schedule_task_init(task, uid, SOF_SCHEDULE_LL_TIMER, priority, run,
 				  data, core, flags);
 }
 

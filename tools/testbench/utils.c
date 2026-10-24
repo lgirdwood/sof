@@ -21,7 +21,7 @@
 #include "testbench/trace.h"
 #include "testbench/file.h"
 
-#if defined __XCC__
+#if defined(__XCC__) || defined(__XTENSA__)
 #include <xtensa/tie/xt_timer.h>
 #endif
 
@@ -251,7 +251,7 @@ bool tb_check_trace(unsigned int log_level)
 
 void tb_gettime(struct timespec *td)
 {
-#if !defined __XCC__
+#if !defined(__XCC__) && !defined(__XTENSA__) && !defined(CONFIG_XT_SIMULATOR)
 	clock_gettime(CLOCK_MONOTONIC, td);
 #else
 	td->tv_nsec = 0;
@@ -261,7 +261,7 @@ void tb_gettime(struct timespec *td)
 
 void tb_getcycles(uint64_t *cycles)
 {
-#if defined __XCC__
+#if defined(__XCC__) || defined(__XTENSA__)
 	*cycles = XT_RSR_CCOUNT();
 #else
 	*cycles = 0;

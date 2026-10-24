@@ -691,7 +691,8 @@ __cold static struct comp_buffer *ipc4_create_buffer(struct comp_dev *src, bool 
 	 * is privileged and so avoided here.
 	 */
 	ipc_buf.comp.core = is_shared ? PLATFORM_PRIMARY_CORE_ID : src->ipc_config.core;
-	assert(IS_ENABLED(CONFIG_SOF_USERSPACE_LL) || ipc_buf.comp.core == cpu_get_id());
+	assert(IS_ENABLED(CONFIG_SOF_USERSPACE_LL) || IS_ENABLED(CONFIG_LIBRARY) ||
+	       ipc_buf.comp.core == cpu_get_id());
 
 	return buffer_new(alloc, &ipc_buf, is_shared);
 }
@@ -715,6 +716,9 @@ __cold static struct comp_buffer *ipc4_create_buffer(struct comp_dev *src, bool 
 
 #if CONFIG_SOF_USERSPACE_LL
 #error "CONFIG_SOF_USERSPACE_LL not compatible with cross-core streams"
+#elif CONFIG_LIBRARY
+#define ll_block(src_core, dst_core, flags)	irq_local_disable(flags)
+#define ll_unblock(src_core, dst_core, flags)	irq_local_enable(flags)
 #else
 #define ll_block(src_core, dst_core, flags) \
 	do { \

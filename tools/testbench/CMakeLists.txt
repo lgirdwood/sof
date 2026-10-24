@@ -4,10 +4,19 @@ cmake_minimum_required(VERSION 3.13)
 
 project(SOF_TESTBENCH C)
 
+option(TESTBENCH_XTENSA_SIM "Build single-threaded testbench for Xtensa simulator" OFF)
+if(CMAKE_C_COMPILER MATCHES "xt-" OR DEFINED ENV{XTENSA_CORE})
+	set(TESTBENCH_XTENSA_SIM ON CACHE BOOL "Build single-threaded testbench for Xtensa simulator" FORCE)
+endif()
+
 include(../../scripts/cmake/misc.cmake)
 include(CheckCCompilerFlag)
 
-set(default_asoc_h "/usr/include/alsa/sound/uapi/asoc.h")
+if(EXISTS "/usr/include/alsa/sound/uapi/asoc.h")
+	set(default_asoc_h "/usr/include/alsa/sound/uapi/asoc.h")
+else()
+	set(default_asoc_h "/usr/include/sound/asoc.h")
+endif()
 
 file(READ "../../src/arch/host/configs/library_defconfig" library_defconfig)
 
@@ -56,6 +65,9 @@ endif()
 
 target_compile_options(${testbench} PRIVATE -g -O3 -Wall -Werror -Wmissing-prototypes
   ${implicit_fallthrough} -DCONFIG_LIBRARY -DCONFIG_LIBRARY_STATIC -imacros${config_h})
+if(TESTBENCH_XTENSA_SIM)
+	target_compile_definitions(${testbench} PRIVATE CONFIG_XT_SIMULATOR=1)
+endif()
 
 target_link_libraries(${testbench} PRIVATE -lm)
 
@@ -76,6 +88,7 @@ ExternalProject_Add(sof_ep
 		-DINIT_CONFIG=library_defconfig
 		-DCONFIG_H_PATH=${config_h}
 		-DCONFIG_LIBRARY_STATIC=ON
+		-DTESTBENCH_XTENSA_SIM=${TESTBENCH_XTENSA_SIM}
 	BUILD_ALWAYS 1
 	BUILD_BYPRODUCTS "${sof_install_directory}/lib/libsof.a"
 )
@@ -108,6 +121,9 @@ add_dependencies(${testbench} sof_parser_lib)
 target_link_libraries(${testbench} PRIVATE sof_library)
 target_link_libraries(${testbench} PRIVATE sof_parser_lib)
 target_link_libraries(${testbench} PRIVATE m)
+if(NOT TESTBENCH_XTENSA_SIM)
+	target_link_libraries(${testbench} PRIVATE pthread)
+endif()
 target_include_directories(${testbench} PRIVATE ${sof_install_directory}/include)
 target_include_directories(${testbench} PRIVATE ${parser_install_dir}/include)
 

@@ -142,6 +142,8 @@ struct testbench_prm {
 	struct tb_mq_desc ipc_rx;
 	int pcm_id;	// TODO: This needs to be cleaned up
 	struct tplg_pcm_info *pcm_info;
+	struct tplg_pipeline_list playback_pipeline_list;
+	struct tplg_pipeline_list capture_pipeline_list;
 	struct tb_config config[TB_MAX_CONFIG_COUNT];
 	int num_configs;
 	int period_frames;

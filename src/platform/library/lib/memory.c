@@ -172,10 +172,20 @@ void platform_init_memmap(struct sof *sof)
 
 	/* .system and .system_runtime secondary core initialization */
 	for (i = 1; i < CONFIG_CORE_COUNT; i++) {
+#if CONFIG_CORE_COUNT > 1
+		sys_rt_heap_map[i][0] = (struct block_map)
+			BLOCK_DEF(64, HEAP_SYS_RT_X_COUNT64,
+				  uncached_block_hdr(sys_rt_x_block64[i - 1]));
+		sys_rt_heap_map[i][1] = (struct block_map)
+			BLOCK_DEF(512, HEAP_SYS_RT_X_COUNT512,
+				  uncached_block_hdr(sys_rt_x_block512[i - 1]));
+		sys_rt_heap_map[i][2] = (struct block_map)
+			BLOCK_DEF(1024, HEAP_SYS_RT_X_COUNT1024,
+				  uncached_block_hdr(sys_rt_x_block1024[i - 1]));
+#endif
 		/* .system init */
 		sof->memory_map->system[i].heap =
-				(unsigned long)malloc(HEAP_SYSTEM_S_SIZE) +
-			((i - 1) * SOF_CORE_S_SIZE);
+				(unsigned long)malloc(HEAP_SYSTEM_S_SIZE);
 		sof->memory_map->system[i].size = HEAP_SYSTEM_S_SIZE;
 		sof->memory_map->system[i].info.free = HEAP_SYSTEM_S_SIZE;
 		sof->memory_map->system[i].caps = SOF_MEM_CAPS_RAM |
@@ -187,8 +197,7 @@ void platform_init_memmap(struct sof *sof)
 		sof->memory_map->system_runtime[i].map =
 			uncached_block_map(sys_rt_heap_map[i]);
 		sof->memory_map->system_runtime[i].heap =
-			(unsigned long)malloc(HEAP_SYS_RUNTIME_S_SIZE) +
-			((i - 1) * SOF_CORE_S_SIZE) + HEAP_SYSTEM_S_SIZE;
+			(unsigned long)malloc(HEAP_SYS_RUNTIME_S_SIZE);
 		sof->memory_map->system_runtime[i].size =
 			HEAP_SYS_RUNTIME_S_SIZE;
 		sof->memory_map->system_runtime[i].info.free =

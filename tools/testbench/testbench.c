@@ -93,21 +93,21 @@ static int parse_pipelines(char *pipelines, struct testbench_prm *tp)
 	char *token = strtok_r(pipelines, ",", &output_token);
 	int index;
 
-	for (index = 0; index < TB_MAX_OUTPUT_FILE_NUM && token; index++) {
-		/* get output file name with current index */
+	for (index = 0; index < TB_MAX_PIPELINES_NUM && token; index++) {
+		/* get pipeline id with current index */
 		tp->pipelines[index] = atoi(token);
 
-		/* next output */
+		/* next pipeline */
 		token = strtok_r(NULL, ",", &output_token);
 	}
 
-	if (index == TB_MAX_OUTPUT_FILE_NUM && token) {
-		fprintf(stderr, "error: max output file number is %d\n",
-			TB_MAX_OUTPUT_FILE_NUM);
+	if (index == TB_MAX_PIPELINES_NUM && token) {
+		fprintf(stderr, "error: max pipeline number is %d\n",
+			TB_MAX_PIPELINES_NUM);
 		return -EINVAL;
 	}
 
-	/* set total output file number */
+	/* set total pipeline number */
 	tp->pipeline_num = index;
 	return 0;
 }
@@ -115,18 +115,23 @@ static int parse_pipelines(char *pipelines, struct testbench_prm *tp)
 /* print usage for testbench */
 static void print_usage(char *executable)
 {
-	printf("Usage: %s <options> -i <input_file> ", executable);
+	printf("Usage: %s <options> -i <input_file1,input_file2,...> ", executable);
 	printf("-o <output_file1,output_file2,...>\n\n");
 	printf("Options for processing:\n");
-	printf("  -t <topology file>\n\n");
+	printf("  -t <topology file>\n");
+	printf("  -i <input_file1,input_file2,...> (up to %d comma-separated input files)\n",
+	       TB_MAX_INPUT_FILE_NUM);
+	printf("  -o <output_file1,output_file2,...> (up to %d comma-separated output files)\n\n",
+	       TB_MAX_OUTPUT_FILE_NUM);
 	printf("Options to control test:\n");
 	printf("  -d <level> Sets the traces print level:\n");
 	printf("     0 all traces are suppressed\n");
 	printf("     1 shows error traces\n");
 	printf("     2 shows warning traces and previous\n");
 	printf("     3 shows info traces and previous\n");
-	printf("     4 shows debug traces and previous, plus other testbench  debug messages\n");
-	printf("  -p <pipeline1,pipeline2,...>\n");
+	printf("     4 shows debug traces and previous, plus other testbench debug messages\n");
+	printf("  -p <pipeline1,pipeline2,...> (up to %d comma-separated pipeline IDs)\n",
+	       TB_MAX_PIPELINES_NUM);
 	printf("  -C <number of copy() iterations>\n");
 	printf("  -P <number of dynamic pipeline iterations>\n");
 	printf("  -s <script file to set controls, with amixer and sleep commands>\n\n");
@@ -365,6 +370,10 @@ static int pipline_test(struct testbench_prm *tp)
 		 * to calculate current time from file write samples count
 		 */
 		out_stat = tp->fw[0].state;
+		if (!out_stat) {
+			fprintf(stderr, "error: no active output file component found\n");
+			break;
+		}
 		samples_to_ns = 1.0e9 / ((float)out_stat->channels * out_stat->rate);
 
 		/* Apply initial controls time to call again controls handler */

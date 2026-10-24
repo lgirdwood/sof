@@ -11,6 +11,7 @@
 #include <sof/schedule/edf_schedule.h>
 #include <sof/schedule/ll_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
+#include <sof/schedule/dp_schedule.h>
 #include <ipc/stream.h>
 
 #include <stdbool.h>
@@ -45,6 +46,7 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 	/* Module adapter components */
 	sys_comp_module_aria_interface_init();
 	sys_comp_module_asrc_interface_init();
+	sys_comp_module_copier_interface_init();
 	sys_comp_module_crossover_interface_init();
 	sys_comp_module_dcblock_interface_init();
 	sys_comp_module_demux_interface_init();
@@ -99,6 +101,12 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 		return -EINVAL;
 	}
 
+	/* init DP scheduler */
+	if (scheduler_dp_init() < 0) {
+		fprintf(stderr, "error: dp scheduler init\n");
+		return -EINVAL;
+	}
+
 	tb_debug_print("ipc and scheduler initialized\n");
 
 	/* setup IPC4 audio format */
@@ -141,25 +149,28 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 	return 0;
 }
 
-static int tb_prepare_widget(struct testbench_prm *tp, struct tplg_pcm_info *pcm_info,
+static int tb_prepare_widget(struct testbench_prm *tp,
 			     struct tplg_comp_info *comp_info, int dir)
 {
 	struct tplg_pipeline_list *pipeline_list;
 	int ret, i;
 
 	if (dir)
-		pipeline_list = &pcm_info->capture_pipeline_list;
+		pipeline_list = &tp->capture_pipeline_list;
 	else
-		pipeline_list = &pcm_info->playback_pipeline_list;
+		pipeline_list = &tp->playback_pipeline_list;
 
-	/* populate base config */
-	ret = tb_set_up_widget_base_config(tp, comp_info);
-	if (ret < 0)
-		return ret;
+	if (!comp_info->prepared) {
+		/* populate base config */
+		ret = tb_set_up_widget_base_config(tp, comp_info);
+		if (ret < 0)
+			return ret;
 
-	tb_pipeline_update_resource_usage(tp, comp_info);
+		tb_pipeline_update_resource_usage(tp, comp_info);
+		comp_info->prepared = true;
+	}
 
-	/* add pipeline to pcm pipeline_list if needed */
+	/* add pipeline to pipeline_list if needed */
 	for (i = 0; i < pipeline_list->count; i++) {
 		struct tplg_pipeline_info *pipe_info = pipeline_list->pipelines[i];
 
@@ -180,7 +191,7 @@ static int tb_prepare_widget(struct testbench_prm *tp, struct tplg_pcm_info *pcm
 	return 0;
 }
 
-static int tb_prepare_widgets_playback(struct testbench_prm *tp, struct tplg_pcm_info *pcm_info,
+static int tb_prepare_widgets_playback(struct testbench_prm *tp,
 				       struct tplg_comp_info *starting_comp_info,
 				       struct tplg_comp_info *current_comp_info)
 {
@@ -191,25 +202,33 @@ static int tb_prepare_widgets_playback(struct testbench_prm *tp, struct tplg_pcm
 	list_for_item(item, &tp->route_list) {
 		struct tplg_route_info *route_info = container_of(item, struct tplg_route_info,
 								  item);
+		bool sink_already_prepared;
 
 		if (route_info->source != current_comp_info)
 			continue;
 
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
+			continue;
+
 		/* set up source widget if it is the starting widget */
 		if (starting_comp_info == current_comp_info) {
-			ret = tb_prepare_widget(tp, pcm_info, current_comp_info, 0);
+			ret = tb_prepare_widget(tp, current_comp_info, 0);
 			if (ret < 0)
 				return ret;
 		}
 
+		sink_already_prepared = route_info->sink->prepared;
+
 		/* set up the sink widget */
-		ret = tb_prepare_widget(tp, pcm_info, route_info->sink, 0);
+		ret = tb_prepare_widget(tp, route_info->sink, 0);
 		if (ret < 0)
 			return ret;
 
 		/* and then continue down the path */
-		if (route_info->sink->type != SND_SOC_TPLG_DAPM_DAI_IN) {
-			ret = tb_prepare_widgets_playback(tp, pcm_info, starting_comp_info,
+		if (!sink_already_prepared &&
+		    route_info->sink->type != SND_SOC_TPLG_DAPM_DAI_IN) {
+			ret = tb_prepare_widgets_playback(tp, starting_comp_info,
 							  route_info->sink);
 			if (ret < 0)
 				return ret;
@@ -219,7 +238,7 @@ static int tb_prepare_widgets_playback(struct testbench_prm *tp, struct tplg_pcm
 	return 0;
 }
 
-static int tb_prepare_widgets_capture(struct testbench_prm *tp, struct tplg_pcm_info *pcm_info,
+static int tb_prepare_widgets_capture(struct testbench_prm *tp,
 				      struct tplg_comp_info *starting_comp_info,
 				      struct tplg_comp_info *current_comp_info)
 {
@@ -230,25 +249,33 @@ static int tb_prepare_widgets_capture(struct testbench_prm *tp, struct tplg_pcm_
 	list_for_item(item, &tp->route_list) {
 		struct tplg_route_info *route_info = container_of(item, struct tplg_route_info,
 								  item);
+		bool source_already_prepared;
 
 		if (route_info->sink != current_comp_info)
 			continue;
 
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
+			continue;
+
 		/* set up sink widget if it is the starting widget */
 		if (starting_comp_info == current_comp_info) {
-			ret = tb_prepare_widget(tp, pcm_info, current_comp_info, 1);
+			ret = tb_prepare_widget(tp, current_comp_info, 1);
 			if (ret < 0)
 				return ret;
 		}
 
+		source_already_prepared = route_info->source->prepared;
+
 		/* set up the source widget */
-		ret = tb_prepare_widget(tp, pcm_info, route_info->source, 1);
+		ret = tb_prepare_widget(tp, route_info->source, 1);
 		if (ret < 0)
 			return ret;
 
 		/* and then continue up the path */
-		if (route_info->source->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
-			ret = tb_prepare_widgets_capture(tp, pcm_info, starting_comp_info,
+		if (!source_already_prepared &&
+		    route_info->source->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
+			ret = tb_prepare_widgets_capture(tp, starting_comp_info,
 							 route_info->source);
 			if (ret < 0)
 				return ret;
@@ -266,15 +293,19 @@ static int tb_set_up_widget(struct testbench_prm *tp, struct tplg_comp_info *com
 	int ret;
 	int i;
 
+	if (comp_info->set_up)
+		return 0;
+
 	pipe_info->usage_count++;
 
 	/* first set up pipeline if needed, only done once for the first pipeline widget */
-	if (pipe_info->usage_count == 1) {
+	if (!pipe_info->set_up) {
 		ret = tb_set_up_pipeline(tp, pipe_info);
 		if (ret < 0) {
 			pipe_info->usage_count--;
 			return ret;
 		}
+		pipe_info->set_up = true;
 	}
 
 	/* now set up the widget */
@@ -307,6 +338,8 @@ static int tb_set_up_widget(struct testbench_prm *tp, struct tplg_comp_info *com
 		}
 	}
 
+	comp_info->set_up = true;
+
 	return 0;
 }
 
@@ -321,8 +354,13 @@ static int tb_set_up_widgets_playback(struct testbench_prm *tp,
 	list_for_item(item, &tp->route_list) {
 		struct tplg_route_info *route_info = container_of(item, struct tplg_route_info,
 								  item);
+		bool sink_already_set_up;
 
-		if (route_info->source != current_comp_info)
+		if (route_info->source != current_comp_info || route_info->set_up)
+			continue;
+
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
 			continue;
 
 		/* set up source widget if it is the starting widget */
@@ -331,6 +369,8 @@ static int tb_set_up_widgets_playback(struct testbench_prm *tp,
 			if (ret < 0)
 				return ret;
 		}
+
+		sink_already_set_up = route_info->sink->set_up;
 
 		/* set up the sink widget */
 		ret = tb_set_up_widget(tp, route_info->sink);
@@ -343,7 +383,8 @@ static int tb_set_up_widgets_playback(struct testbench_prm *tp,
 			return ret;
 
 		/* and then continue down the path */
-		if (route_info->sink->type != SND_SOC_TPLG_DAPM_DAI_IN) {
+		if (!sink_already_set_up &&
+		    route_info->sink->type != SND_SOC_TPLG_DAPM_DAI_IN) {
 			ret = tb_set_up_widgets_playback(tp, starting_comp_info, route_info->sink);
 			if (ret < 0)
 				return ret;
@@ -360,22 +401,29 @@ static int tb_set_up_widgets_capture(struct testbench_prm *tp,
 	struct list_item *item;
 	int ret;
 
-	/* for playback */
+	/* for capture */
 	list_for_item(item, &tp->route_list) {
 		struct tplg_route_info *route_info = container_of(item, struct tplg_route_info,
 								  item);
+		bool source_already_set_up;
 
-		if (route_info->sink != current_comp_info)
+		if (route_info->sink != current_comp_info || route_info->set_up)
 			continue;
 
-		/* set up source widget if it is the starting widget */
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
+			continue;
+
+		/* set up sink widget if it is the starting widget */
 		if (starting_comp_info == current_comp_info) {
 			ret = tb_set_up_widget(tp, current_comp_info);
 			if (ret < 0)
 				return ret;
 		}
 
-		/* set up the sink widget */
+		source_already_set_up = route_info->source->set_up;
+
+		/* set up the source widget */
 		ret = tb_set_up_widget(tp, route_info->source);
 		if (ret < 0)
 			return ret;
@@ -385,8 +433,9 @@ static int tb_set_up_widgets_capture(struct testbench_prm *tp,
 		if (ret < 0)
 			return ret;
 
-		/* and then continue down the path */
-		if (route_info->source->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
+		/* and then continue up the path */
+		if (!source_already_set_up &&
+		    route_info->source->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
 			ret = tb_set_up_widgets_capture(tp, starting_comp_info, route_info->source);
 			if (ret < 0)
 				return ret;
@@ -403,51 +452,44 @@ static int tb_set_up_pipelines(struct testbench_prm *tp, int dir)
 	struct list_item *item;
 	int ret;
 
+	/* First pass: prepare widgets and calculate pipeline memory usage across all enabled PCMs */
 	list_for_item(item, &tp->pcm_list) {
 		pcm_info = container_of(item, struct tplg_pcm_info, item);
+		host = dir ? pcm_info->capture_host : pcm_info->playback_host;
 
-		if (pcm_info->id == tp->pcm_id) {
-			if (dir)
-				host = pcm_info->capture_host;
-			else
-				host = pcm_info->playback_host;
-			break;
-		}
-	}
+		if (!host || !tb_is_pipeline_enabled(tp, host->pipeline_id))
+			continue;
 
-	if (!host) {
-		fprintf(stderr, "No host component found for PCM ID: %d\n", tp->pcm_id);
-		return -EINVAL;
-	}
-
-	if (!tb_is_pipeline_enabled(tp, host->pipeline_id))
-		return 0;
-
-	tp->pcm_info = pcm_info; /* TODO must be an array for multiple PCMs */
-
-	if (dir) {
-		ret = tb_prepare_widgets_capture(tp, pcm_info, host, host);
+		tp->pcm_info = pcm_info;
+		if (dir)
+			ret = tb_prepare_widgets_capture(tp, host, host);
+		else
+			ret = tb_prepare_widgets_playback(tp, host, host);
 		if (ret < 0)
 			return ret;
+	}
 
-		ret = tb_set_up_widgets_capture(tp, host, host);
+	/* Second pass: create pipelines, instantiate widgets, and bind routes */
+	list_for_item(item, &tp->pcm_list) {
+		pcm_info = container_of(item, struct tplg_pcm_info, item);
+		host = dir ? pcm_info->capture_host : pcm_info->playback_host;
+
+		if (!host || !tb_is_pipeline_enabled(tp, host->pipeline_id))
+			continue;
+
+		tp->pcm_info = pcm_info;
+		if (dir)
+			ret = tb_set_up_widgets_capture(tp, host, host);
+		else
+			ret = tb_set_up_widgets_playback(tp, host, host);
 		if (ret < 0)
 			return ret;
+	}
 
+	if (dir)
 		tb_debug_print("Setting up capture pipelines complete\n");
-
-		return 0;
-	}
-
-	ret = tb_prepare_widgets_playback(tp, pcm_info, host, host);
-	if (ret < 0)
-		return ret;
-
-	ret = tb_set_up_widgets_playback(tp, host, host);
-	if (ret < 0)
-		return ret;
-
-	tb_debug_print("Setting up playback pipelines complete\n");
+	else
+		tb_debug_print("Setting up playback pipelines complete\n");
 
 	return 0;
 }
@@ -483,7 +525,11 @@ static int tb_free_widgets_playback(struct testbench_prm *tp,
 	/* for playback */
 	list_for_item(item, &tp->route_list) {
 		route_info = container_of(item, struct tplg_route_info, item);
-		if (route_info->source != current_comp_info)
+		if (route_info->source != current_comp_info || !route_info->set_up)
+			continue;
+
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
 			continue;
 
 		/* Widgets will be freed when the pipeline is deleted, so just unbind modules */
@@ -510,10 +556,14 @@ static int tb_free_widgets_capture(struct testbench_prm *tp,
 	struct list_item *item;
 	int ret;
 
-	/* for playback */
+	/* for capture */
 	list_for_item(item, &tp->route_list) {
 		route_info = container_of(item, struct tplg_route_info, item);
-		if (route_info->sink != current_comp_info)
+		if (route_info->sink != current_comp_info || !route_info->set_up)
+			continue;
+
+		if (!tb_is_pipeline_enabled(tp, route_info->source->pipeline_id) ||
+		    !tb_is_pipeline_enabled(tp, route_info->sink->pipeline_id))
 			continue;
 
 		/* Widgets will be freed when the pipeline is deleted, so just unbind modules */
@@ -521,8 +571,8 @@ static int tb_free_widgets_capture(struct testbench_prm *tp,
 		if (ret < 0)
 			return ret;
 
-		/* and then continue down the path */
-		if (route_info->sink->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
+		/* and then continue up the path */
+		if (route_info->source->type != SND_SOC_TPLG_DAPM_DAI_OUT) {
 			ret = tb_free_widgets_capture(tp, starting_comp_info, route_info->source);
 			if (ret < 0)
 				return ret;
@@ -540,6 +590,11 @@ static int tb_free_pipelines(struct testbench_prm *tp, int dir)
 	struct tplg_comp_info *host = NULL;
 	int ret, i;
 
+	if (dir)
+		pipeline_list = &tp->capture_pipeline_list;
+	else
+		pipeline_list = &tp->playback_pipeline_list;
+
 	list_for_item(item, &tp->pcm_list) {
 		pcm_info = container_of(item, struct tplg_pcm_info, item);
 		if (dir)
@@ -551,30 +606,33 @@ static int tb_free_pipelines(struct testbench_prm *tp, int dir)
 			continue;
 
 		if (dir) {
-			pipeline_list = &tp->pcm_info->capture_pipeline_list;
 			ret = tb_free_widgets_capture(tp, host, host);
 			if (ret < 0) {
 				fprintf(stderr, "failed to free widgets for capture PCM\n");
 				return ret;
 			}
 		} else {
-			pipeline_list = &tp->pcm_info->playback_pipeline_list;
 			ret = tb_free_widgets_playback(tp, host, host);
 			if (ret < 0) {
 				fprintf(stderr, "failed to free widgets for playback PCM\n");
 				return ret;
 			}
 		}
-		for (i = 0; i < pipeline_list->count; i++) {
-			struct tplg_pipeline_info *pipe_info = pipeline_list->pipelines[i];
-
-			ret = tb_delete_pipeline(tp, pipe_info);
-			if (ret < 0)
-				return ret;
-		}
 	}
 
-	tp->instance_ids[SND_SOC_TPLG_DAPM_SCHEDULER] = 0;
+	for (i = 0; i < pipeline_list->count; i++) {
+		struct tplg_pipeline_info *pipe_info = pipeline_list->pipelines[i];
+
+		if (!pipe_info->set_up)
+			continue;
+
+		ret = tb_delete_pipeline(tp, pipe_info);
+		if (ret < 0)
+			return ret;
+		pipe_info->set_up = false;
+	}
+
+	pipeline_list->count = 0;
 	return 0;
 }
 
@@ -585,6 +643,8 @@ int tb_free_all_pipelines(struct testbench_prm *tp)
 
 	tb_debug_print("freeing capture direction\n");
 	tb_free_pipelines(tp, SOF_IPC_STREAM_CAPTURE);
+
+	memset(tp->instance_ids, 0, sizeof(tp->instance_ids));
 	return 0;
 }
 
@@ -597,6 +657,7 @@ void tb_free_topology(struct testbench_prm *tp)
 	struct tplg_context *ctx = &tp->tplg;
 	struct sof_ipc4_available_audio_format *available_fmts;
 	struct list_item *item, *_item;
+	uint32_t i;
 
 	list_for_item_safe(item, _item, &tp->pcm_list) {
 		pcm_info = container_of(item, struct tplg_pcm_info, item);
@@ -609,6 +670,16 @@ void tb_free_topology(struct testbench_prm *tp)
 		comp_info = container_of(item, struct tplg_comp_info, item);
 		available_fmts = &comp_info->available_fmt;
 		list_item_del(item);
+		if (comp_info->pins_info.input_pin_binding) {
+			for (i = 0; i < comp_info->pins_info.num_input_pins; i++)
+				free(comp_info->pins_info.input_pin_binding[i]);
+			free(comp_info->pins_info.input_pin_binding);
+		}
+		if (comp_info->pins_info.output_pin_binding) {
+			for (i = 0; i < comp_info->pins_info.num_output_pins; i++)
+				free(comp_info->pins_info.output_pin_binding[i]);
+			free(comp_info->pins_info.output_pin_binding);
+		}
 		free(available_fmts->output_pin_fmts);
 		free(available_fmts->input_pin_fmts);
 		free(comp_info->name);

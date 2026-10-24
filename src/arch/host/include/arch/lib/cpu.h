@@ -21,18 +21,20 @@ static inline void arch_cpu_disable_core(int id)
 
 static inline int arch_cpu_is_core_enabled(int id)
 {
-	return 0;
+	return 1;
 }
 
 static inline int arch_cpu_enabled_cores(void)
 {
+#ifdef CONFIG_CORE_COUNT
+	return (1 << CONFIG_CORE_COUNT) - 1;
+#else
 	return 1;
+#endif
 }
 
-static inline int arch_cpu_get_id(void)
-{
-	return 0;
-}
+int arch_cpu_get_id(void);
+void host_cpu_set_id(int id);
 
 static inline int arch_cpu_restore_secondary_cores(void)
 {

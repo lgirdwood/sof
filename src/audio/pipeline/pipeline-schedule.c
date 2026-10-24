@@ -602,8 +602,10 @@ int pipeline_comp_dp_task_init(struct comp_dev *comp)
 
 #if CONFIG_SOF_USERSPACE_PROXY
 	unsigned int flags = mod->user_ctx ? K_USER : 0;
+#elif CONFIG_USERSPACE
+	unsigned int flags = K_USER;
 #else
-	unsigned int flags = IS_ENABLED(CONFIG_USERSPACE) ? K_USER : 0;
+	unsigned int flags = 0;
 #endif
 
 	if (mod->priv.cfg.ext_data && mod->priv.cfg.ext_data->dp_data &&

@@ -646,6 +646,7 @@ static int file_init(struct processing_module *mod)
 				cd->fs.fn, strerror(errno));
 			goto error;
 		}
+		mod->max_sinks = SOF_WIDGET_MAX_NUM_PINS;
 
 		/* Change to DAI type is needed to avoid uninitialized hw params in
 		 * pipeline_params, A file host can be left as SOF_COMP_MODULE_ADAPTER
@@ -741,20 +742,56 @@ static int file_process(struct processing_module *mod,
 	int ret = 0;
 
 	if (cd->fs.reached_eof)
-		return -ENODATA;
+		return 0;
 
 	/* Note: a SOF_COMP_DAI does not have input_buffers and output buffers set */
 	tb_getcycles(&cycles0);
 	switch (cd->fs.mode) {
 	case FILE_READ:
-		/* read PCM samples from file */
+	{
+		struct comp_buffer *next_buf;
+		void *first_wptr;
+		size_t bytes_produced;
+
+		/* read PCM samples from file into first consumer buffer */
 		buffer = comp_dev_get_first_data_consumer(dev);
 		sink = &buffer->stream;
 		frames = audio_stream_get_free_frames(sink);
 		frames = MIN(frames, cd->max_frames);
+		comp_dev_for_each_consumer(dev, next_buf) {
+			if (next_buf == buffer)
+				continue;
+			frames = MIN(frames, audio_stream_get_free_frames(&next_buf->stream));
+		}
+		first_wptr = sink->w_ptr;
 		samples = cd->file_func(cd, sink, NULL, frames);
-		audio_stream_produce(sink, audio_stream_sample_bytes(sink) * samples);
+		bytes_produced = audio_stream_sample_bytes(sink) * samples;
+
+		/* replicate samples to any additional consumer buffers */
+		comp_dev_for_each_consumer(dev, next_buf) {
+			struct audio_stream *nsink = &next_buf->stream;
+			uint8_t *src_ptr = first_wptr;
+			uint8_t *dst_ptr = nsink->w_ptr;
+			size_t rem = bytes_produced;
+
+			if (next_buf == buffer)
+				continue;
+
+			while (rem > 0) {
+				size_t src_chunk = audio_stream_bytes_without_wrap(sink, src_ptr);
+				size_t dst_chunk = audio_stream_bytes_without_wrap(nsink, dst_ptr);
+				size_t chunk = MIN(rem, MIN(src_chunk, dst_chunk));
+
+				memcpy(dst_ptr, src_ptr, chunk);
+				rem -= chunk;
+				src_ptr = audio_stream_wrap(sink, src_ptr + chunk);
+				dst_ptr = audio_stream_wrap(nsink, dst_ptr + chunk);
+			}
+			audio_stream_produce(nsink, bytes_produced);
+		}
+		audio_stream_produce(sink, bytes_produced);
 		break;
+	}
 	case FILE_WRITE:
 		/* write PCM samples into file */
 		buffer = comp_dev_get_first_data_producer(dev);
@@ -806,10 +843,13 @@ static int file_prepare(struct processing_module *mod,
 	cd->max_frames = dev->frames;
 	switch (cd->fs.mode) {
 	case FILE_READ:
+		comp_dev_for_each_consumer(dev, buffer)
+			audio_stream_set_valid_fmt(&buffer->stream, cd->frame_fmt);
 		buffer = comp_dev_get_first_data_consumer(dev);
 		break;
 	case FILE_WRITE:
 		buffer = comp_dev_get_first_data_producer(dev);
+		audio_stream_set_valid_fmt(&buffer->stream, cd->frame_fmt);
 		break;
 	default:
 		/* TODO: duplex mode */
@@ -819,13 +859,6 @@ static int file_prepare(struct processing_module *mod,
 
 	/* set file function */
 	stream = &buffer->stream;
-
-	/*
-	 * Real copier/DAI components call ipc4_update_buffer_format() to populate
-	 * valid_sample_fmt; the testbench file component is the host endpoint stub
-	 * so propagate cd->frame_fmt to the buffer's valid format too.
-	 */
-	audio_stream_set_valid_fmt(stream, cd->frame_fmt);
 
 	switch (audio_stream_get_frm_fmt(stream)) {
 	case SOF_IPC_FRAME_S16_LE:

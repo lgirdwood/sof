@@ -7,7 +7,11 @@ project(SOF_TPLG_PARSER C)
 include(../../scripts/cmake/misc.cmake)
 include(CheckCCompilerFlag)
 
-set(default_asoc_h "/usr/include/alsa/sound/uapi/asoc.h")
+if(EXISTS "/usr/include/alsa/sound/uapi/asoc.h")
+	set(default_asoc_h "/usr/include/alsa/sound/uapi/asoc.h")
+else()
+	set(default_asoc_h "/usr/include/sound/asoc.h")
+endif()
 
 set(sof_source_directory "${PROJECT_SOURCE_DIR}/../..")
 
