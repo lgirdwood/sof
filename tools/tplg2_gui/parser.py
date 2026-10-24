@@ -891,7 +891,7 @@ class Topology2Workspace:
             )
         return vm
 
-    def build_graph_for_module(self, module_name: str) -> GraphViewModel:
+    def build_graph_for_module(self, module_name: str, include_testbench_io: bool = True) -> GraphViewModel:
         """Build a graph representing a Processing Module Class.Widget.<name> (Pane 2)."""
         cdef = self.processing_modules[module_name]
         vm = GraphViewModel(
@@ -936,10 +936,16 @@ class Topology2Workspace:
         )
         vm.nodes[node_id] = main_node
         self.attach_widget_kcontrol_nodes(vm, main_node)
-        self.attach_host_copier_io_nodes(vm)
+        if include_testbench_io:
+            self.attach_host_copier_io_nodes(vm)
         return vm
 
-    def build_graph_for_pipeline(self, pipeline_name: str, index: int = 1) -> GraphViewModel:
+    def build_graph_for_pipeline(
+        self,
+        pipeline_name: str,
+        index: int = 1,
+        include_testbench_io: bool = True,
+    ) -> GraphViewModel:
         """Build a graph for a Pipeline Class.Pipeline.<name> (Pane 3)."""
         pdef = self.pipeline_classes[pipeline_name]
         vm = GraphViewModel(
@@ -1032,7 +1038,8 @@ class Topology2Workspace:
                         )
                     )
 
-        self.attach_host_copier_io_nodes(vm)
+        if include_testbench_io:
+            self.attach_host_copier_io_nodes(vm)
         return vm
 
     def build_graph_for_topology(

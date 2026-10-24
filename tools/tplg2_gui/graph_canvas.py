@@ -1577,3 +1577,70 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.add_module_instance(mod_name, wx, wy)
             return True
         return False
+
+
+class MiniGraphPreview(TopologyGraphCanvas):
+    """Scaled miniature visual preview of a Module or Pipeline graph for the Left Panel Object View."""
+
+    def __init__(self, vm: GraphViewModel) -> None:
+        super().__init__()
+        self.set_focusable(False)
+        self.set_can_target(False)
+        self.is_row_selected: bool = False
+        self.vm = vm
+        layout_graph(vm)
+        _, _, gw, gh = self._get_graph_bounds()
+        if vm.view_kind == "module":
+            req_h = 132 if gh > 110.0 else 86
+        else:
+            req_h = int(max(106.0, min(164.0, 290.0 * (gh / max(gw, 240.0)) + 24.0)))
+        self.set_size_request(220, req_h)
+        self.set_hexpand(True)
+
+    def _setup_controllers(self) -> None:
+        # Read-only thumbnail preview; let parent Gtk.ListBox handle clicks, selection, and scrolling
+        pass
+
+    def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:
+        iw = self.get_width()
+        ih = self.get_height()
+        if iw <= 0 or ih <= 0 or not self.vm:
+            return
+        w = float(iw)
+        h = float(ih)
+
+        rect = Graphene.Rect.alloc()
+        rect.init(0.0, 0.0, w, h)
+        rrect = Gsk.RoundedRect()
+        rrect.init_from_rect(rect, 8.0)
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(BG_COLOR, rect)
+
+        min_x, min_y, graph_w, graph_h = self._get_graph_bounds()
+        pad = 10.0
+        zx = max(20.0, w - 2.0 * pad) / max(graph_w, 1.0)
+        zy = max(20.0, h - 2.0 * pad) / max(graph_h, 1.0)
+        scale = max(0.10, min(0.82, min(zx, zy)))
+        px = (w - graph_w * scale) / 2.0 - min_x * scale
+        py = (h - graph_h * scale) / 2.0 - min_y * scale
+
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(px, py)
+        snapshot.translate(pt)
+        snapshot.scale(scale, scale)
+
+        for pid, cont in self.vm.containers.items():
+            self._snapshot_container(snapshot, pid, cont)
+        for edge in self.vm.edges:
+            self._snapshot_edge(snapshot, edge)
+        for nid, node in self.vm.nodes.items():
+            self._snapshot_node(snapshot, node, is_selected=self.is_row_selected)
+
+        snapshot.restore()
+        snapshot.pop()
+
+        bcol = NODE_BORDER_SELECTED if self.is_row_selected else rgba(0.24, 0.28, 0.36, 0.85)
+        bw = 1.8 if self.is_row_selected else 1.0
+        snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
