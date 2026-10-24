@@ -1102,11 +1102,13 @@ class Topology2Workspace:
 
         # First pass over top-level Object.Widget: create/update PipelineContainers from Object.Widget.pipeline
         custom_pipe_ids: Set[int] = set()
+        nested_pipe_widgets: List[Tuple[str, str, List[AstStmt]]] = []
         for wclass, winst, wstmts in top_widgets:
             if wclass != "pipeline":
                 continue
+            expanded_wstmts = self._expand_inner_include_by_key(wstmts, defines, search_dirs, conf_path)
             p_idx: Optional[int] = None
-            for ch in wstmts:
+            for ch in expanded_wstmts:
                 if ch.stmt_type == "kv" and ch.key == "index":
                     val_s = self._substitute_vars(str(ch.value), defines)
                     if val_s.lstrip("-").isdigit():
@@ -1126,7 +1128,20 @@ class Topology2Workspace:
                     config=pcfg,
                 )
                 custom_pipe_ids.add(p_idx)
-            self._apply_override_stmts_to_config(vm.containers[p_idx].config, wstmts, defines)
+            pipe_attr_stmts: List[AstStmt] = []
+            for ch in expanded_wstmts:
+                if ch.key.startswith("Object.Widget"):
+                    self._collect_topology_widget_stmt(
+                        ch,
+                        split_dotted_key(ch.key),
+                        nested_pipe_widgets,
+                        default_index=p_idx,
+                    )
+                else:
+                    pipe_attr_stmts.append(ch)
+            self._apply_override_stmts_to_config(vm.containers[p_idx].config, pipe_attr_stmts, defines)
+
+        top_widgets.extend(nested_pipe_widgets)
 
         # Second pass: instantiate standalone/top-level Object.Widget nodes
         for wclass, winst, wstmts in top_widgets:
@@ -1440,12 +1455,51 @@ class Topology2Workspace:
             vm.nodes[wnode.id] = wnode
             self.attach_widget_kcontrol_nodes(vm, wnode)
 
+    def _expand_inner_include_by_key(
+        self,
+        stmts: List[AstStmt],
+        defines: Dict[str, str],
+        search_dirs: List[str],
+        current_file: str,
+    ) -> List[AstStmt]:
+        out: List[AstStmt] = []
+        for st in stmts:
+            if st.stmt_type == "block" and st.key.startswith("IncludeByKey."):
+                parts = split_dotted_key(st.key)
+                var_name = parts[1] if len(parts) > 1 else ""
+                var_val = str(defines.get(var_name, ""))
+                for ch in st.children:
+                    if self._key_matches(strip_quotes(ch.key), var_val):
+                        if ch.stmt_type == "kv" and ch.value:
+                            inc_file = self._substitute_vars(str(ch.value), defines)
+                            inc_path = self.resolve_include(inc_file, search_dirs, current_file)
+                            if inc_path:
+                                out.extend(self._expand_inner_include_by_key(self.get_ast(inc_path), defines, search_dirs, inc_path))
+                        elif ch.stmt_type == "block":
+                            out.extend(self._expand_inner_include_by_key(ch.children, defines, search_dirs, current_file))
+                        break
+            elif st.stmt_type == "include":
+                inc_path = self.resolve_include(st.key, search_dirs, current_file)
+                if inc_path:
+                    out.extend(self._expand_inner_include_by_key(self.get_ast(inc_path), defines, search_dirs, inc_path))
+            else:
+                out.append(st)
+        return out
+
     def _collect_topology_widget_stmt(
         self,
         st: AstStmt,
         parts: List[str],
         top_widgets: List[Tuple[str, str, List[AstStmt]]],
+        default_index: Optional[int] = None,
     ) -> None:
+        def with_default_idx(children: List[AstStmt]) -> List[AstStmt]:
+            if default_index is None:
+                return children
+            if any(ch.stmt_type == "kv" and ch.key == "index" for ch in children):
+                return children
+            return [AstStmt(stmt_type="kv", key="index", value=str(default_index))] + list(children)
+
         if len(parts) == 2 and st.stmt_type == "block":
             for wch in st.children:
                 wp = split_dotted_key(wch.key)
@@ -1453,19 +1507,19 @@ class Topology2Workspace:
                 if wch.stmt_type == "array":
                     for idx, item in enumerate(wch.children):
                         if item.stmt_type == "block":
-                            top_widgets.append((wc, str(idx + 1), item.children))
+                            top_widgets.append((wc, str(idx), with_default_idx(item.children)))
                 elif wch.stmt_type == "block":
                     wi = wp[1] if len(wp) > 1 else "1"
-                    top_widgets.append((wc, wi, wch.children))
+                    top_widgets.append((wc, wi, with_default_idx(wch.children)))
         elif len(parts) >= 3:
             wc = parts[2]
             if st.stmt_type == "array":
                 for idx, item in enumerate(st.children):
                     if item.stmt_type == "block":
-                        top_widgets.append((wc, str(idx + 1), item.children))
+                        top_widgets.append((wc, str(idx), with_default_idx(item.children)))
             elif st.stmt_type == "block":
                 wi = parts[3] if len(parts) > 3 else "1"
-                top_widgets.append((wc, wi, st.children))
+                top_widgets.append((wc, wi, with_default_idx(st.children)))
 
     def _collect_topology_route_stmt(
         self,
