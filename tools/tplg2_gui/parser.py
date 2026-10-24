@@ -131,6 +131,10 @@ def _read_compound_key(stream: TokenStream) -> str:
     if tok is None:
         return ""
     key = tok[1]
+    if key == "!" and not stream.eof():
+        nxt0 = stream.peek()
+        if nxt0 is not None and nxt0[0] in ("word", "dquote", "squote"):
+            key = "!" + stream.next()[1]
     # In alsaconf, Class.Widget."gain" or mixer."1" can be tokenized as word('Class.Widget.') + dquote('"gain"')
     while not stream.eof():
         nxt = stream.peek()
@@ -958,7 +962,9 @@ class Topology2Workspace:
         defines = dict(self.global_defines)
         defines["index"] = str(index)
 
-        direction = str(pdef.defaults.get("direction", "playback"))
+        default_dir = "capture" if "capture" in pdef.name else "playback"
+        direction = str(pdef.defaults.get("direction", default_dir))
+        is_capture = "capture" in direction.lower() or "capture" in pdef.name
         container = PipelineContainer(
             pipeline_id=index,
             class_name=pdef.name,
@@ -1014,29 +1020,84 @@ class Topology2Workspace:
                     )
                 )
 
-        # If a pipeline has host-copier or dai-copier whose route is normally added at top-level,
-        # connect unconnected adjacent widgets in declaration order so the pipeline graph is complete
-        if len(ordered_widget_ids) >= 2:
-            for i in range(len(ordered_widget_ids) - 1):
-                u = ordered_widget_ids[i]
-                v = ordered_widget_ids[i + 1]
-                # Check if u has any outgoing edge or v has any incoming edge
-                u_has_out = any(e.source_node == u for e in vm.edges)
-                v_has_in = any(e.sink_node == v for e in vm.edges)
-                if not u_has_out and not v_has_in and (u, v) not in added_pairs:
-                    added_pairs.add((u, v))
-                    edge_cfg = ConfigNode("Object.Base.route (endpoint)", node_type="object")
-                    edge_cfg.set_scalar("source", u, origin="pipeline")
-                    edge_cfg.set_scalar("sink", v, origin="pipeline")
-                    vm.edges.append(
-                        GraphEdge(
-                            id=f"implicit_{index}_{i}",
-                            source_node=u,
-                            sink_node=v,
-                            pipeline_id=index,
-                            config=edge_cfg,
-                        )
+        # Connect endpoint copiers / mixers whose route is normally added at top-level in machine topologies
+        def _has_audio_in(nid: str) -> bool:
+            return any(
+                e.sink_node == nid
+                and e.source_node in vm.nodes
+                and vm.nodes[e.source_node].class_category == "Widget"
+                for e in vm.edges
+            )
+
+        def _has_audio_out(nid: str) -> bool:
+            return any(
+                e.source_node == nid
+                and e.sink_node in vm.nodes
+                and vm.nodes[e.sink_node].class_category == "Widget"
+                for e in vm.edges
+            )
+
+        def _add_implicit_edge(u_id: str, v_id: str, tag: int) -> None:
+            if u_id != v_id and (u_id, v_id) not in added_pairs:
+                added_pairs.add((u_id, v_id))
+                edge_cfg = ConfigNode("Object.Base.route (endpoint)", node_type="object")
+                edge_cfg.set_scalar("source", u_id, origin="pipeline")
+                edge_cfg.set_scalar("sink", v_id, origin="pipeline")
+                vm.edges.append(
+                    GraphEdge(
+                        id=f"implicit_{index}_{tag}",
+                        source_node=u_id,
+                        sink_node=v_id,
+                        pipeline_id=index,
+                        config=edge_cfg,
                     )
+                )
+
+        if len(ordered_widget_ids) >= 2:
+            imp_idx = 0
+            for nid in ordered_widget_ids:
+                if _has_audio_in(nid) or _has_audio_out(nid):
+                    continue
+                wn = vm.nodes[nid]
+                wc = wn.class_name
+                wt = str(wn.config.get_scalar("type", "")).lower()
+                is_source_endpoint = (
+                    (wc == "host-copier" and (not is_capture or wt == "aif_in"))
+                    or (wc in ("dai-copier", "alh-copier") and (is_capture or wt == "dai_out"))
+                    or wc == "mixout"
+                )
+                is_sink_endpoint = (
+                    (wc == "host-copier" and (is_capture or wt == "aif_out"))
+                    or (wc in ("dai-copier", "alh-copier") and not is_capture and wt != "dai_out")
+                    or wc == "mixin"
+                )
+                if is_source_endpoint:
+                    head_id = next(
+                        (w for w in ordered_widget_ids if w != nid and not _has_audio_in(w)),
+                        None,
+                    )
+                    if head_id:
+                        _add_implicit_edge(nid, head_id, imp_idx)
+                        imp_idx += 1
+                elif is_sink_endpoint:
+                    tail_id = next(
+                        (w for w in reversed(ordered_widget_ids) if w != nid and not _has_audio_out(w)),
+                        None,
+                    )
+                    if tail_id:
+                        _add_implicit_edge(tail_id, nid, imp_idx)
+                        imp_idx += 1
+
+            # Connect any remaining completely isolated internal widgets to the chain head
+            for nid in ordered_widget_ids:
+                if not _has_audio_in(nid) and not _has_audio_out(nid):
+                    head_id = next(
+                        (w for w in ordered_widget_ids if w != nid and not _has_audio_in(w)),
+                        None,
+                    )
+                    if head_id:
+                        _add_implicit_edge(nid, head_id, imp_idx)
+                        imp_idx += 1
 
         if include_testbench_io:
             self.attach_host_copier_io_nodes(vm)
@@ -2394,6 +2455,7 @@ class Topology2Workspace:
         inst_val = str(cfg.get_scalar("instance", winst)).strip() or str(winst)
         if cdef and cdef.constructor_attrs:
             parts = [wclass]
+            used_pid = "index" in cdef.constructor_attrs
             for attr in cdef.constructor_attrs:
                 if attr == "index" and pipeline_id is not None:
                     parts.append(str(pipeline_id))
@@ -2401,7 +2463,13 @@ class Topology2Workspace:
                     parts.append(inst_val)
                 else:
                     val = cfg.get_scalar(attr, "")
-                    parts.append(str(val) if val != "" else inst_val)
+                    if val != "":
+                        parts.append(str(val))
+                    elif not used_pid and pipeline_id is not None:
+                        parts.append(str(pipeline_id))
+                        used_pid = True
+                    else:
+                        parts.append(inst_val)
             return ".".join(parts)
         idx_s = str(pipeline_id) if pipeline_id is not None else "0"
         return f"{wclass}.{idx_s}.{inst_val}"
@@ -2493,6 +2561,16 @@ class Topology2Workspace:
                 return expanded
         # Handle prefix / case-insensitive / partial matches for dai-copier or host-copier
         parts = ref.split(".")
+        if len(parts) == 4 and parts[0].lower() == "copier":
+            target_kind = parts[1].lower()
+            target_pid = parts[2]
+            target_inst = parts[3]
+            for nid, n in nodes.items():
+                if str(n.pipeline_id) == target_pid and n.instance_id == target_inst:
+                    if target_kind == "host" and n.class_name == "host-copier":
+                        return nid
+                    if target_kind in ("dai", "alh") and n.class_name in ("dai-copier", "alh-copier"):
+                        return nid
         if len(parts) >= 2:
             wclass = parts[0]
             # Try matching by class_name + pipeline_id + instance
