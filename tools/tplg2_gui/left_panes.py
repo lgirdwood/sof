@@ -25,12 +25,14 @@ class LeftNavigationPanel(Gtk.Box):
         self,
         on_item_selected: Callable[[str, str, Optional[str]], None],
         on_add_module_requested: Optional[Callable[[str], None]] = None,
+        on_add_pipeline_requested: Optional[Callable[[str], None]] = None,
     ):
         """
         Args:
             on_item_selected: callback(pane_kind, primary_id, secondary_id)
                 pane_kind in ("base_class", "module", "pipeline", "topology")
             on_add_module_requested: callback(module_name) when user clicks '+ Add Node'
+            on_add_pipeline_requested: callback(pipeline_name) when user clicks '+ Add Pipeline'
         """
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.set_size_request(320, -1)
@@ -41,6 +43,7 @@ class LeftNavigationPanel(Gtk.Box):
 
         self.on_item_selected = on_item_selected
         self.on_add_module_requested = on_add_module_requested
+        self.on_add_pipeline_requested = on_add_pipeline_requested
         self.workspace: Optional[Topology2Workspace] = None
         self._updating_selection: bool = False
         self._filter_text: str = ""
@@ -64,7 +67,7 @@ class LeftNavigationPanel(Gtk.Box):
         self.object_notebook.set_vexpand(True)
         self.object_notebook.set_hexpand(True)
 
-        # Sub-page 1: Modules visual list view
+        # Sub-page 1: Modules visual list view (drag-and-drop palette)
         mod_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         mod_page.set_margin_top(4)
         mod_page.set_margin_bottom(4)
@@ -94,16 +97,24 @@ class LeftNavigationPanel(Gtk.Box):
 
         self.object_notebook.append_page(mod_page, Gtk.Label(label="Modules"))
 
-        # Sub-page 2: Pipelines visual list view
+        # Sub-page 2: Pipelines visual list view (drag-and-drop palette)
         pipe_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         pipe_page.set_margin_top(4)
         pipe_page.set_margin_bottom(4)
         pipe_page.set_margin_start(4)
         pipe_page.set_margin_end(4)
 
+        pipe_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.obj_pipe_count_lbl = Gtk.Label(label="Pipeline Templates", xalign=0.0)
+        self.obj_pipe_count_lbl.set_hexpand(True)
         self.obj_pipe_count_lbl.add_css_class("heading")
-        pipe_page.append(self.obj_pipe_count_lbl)
+        pipe_hdr.append(self.obj_pipe_count_lbl)
+
+        obj_add_pipe_btn = Gtk.Button(label="+ Add Pipeline")
+        obj_add_pipe_btn.set_tooltip_text("Instantiate selected Pipeline onto the active Graph")
+        obj_add_pipe_btn.connect("clicked", self._on_add_pipeline_btn_clicked)
+        pipe_hdr.append(obj_add_pipe_btn)
+        pipe_page.append(pipe_hdr)
 
         self.obj_pipe_list = Gtk.ListBox()
         self.obj_pipe_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
@@ -313,6 +324,7 @@ class LeftNavigationPanel(Gtk.Box):
 
             row = Gtk.ListBoxRow()
             row.set_child(row_box)
+            row.set_tooltip_text(f"Drag and drop '{mname}' onto the main view to add this module")
             row._item_id = mname  # type: ignore[attr-defined]
             row._preview = preview  # type: ignore[attr-defined]
 
@@ -351,8 +363,19 @@ class LeftNavigationPanel(Gtk.Box):
 
             row = Gtk.ListBoxRow()
             row.set_child(row_box)
+            row.set_tooltip_text(f"Drag and drop '{pname}' onto the main view to instantiate this pipeline")
             row._item_id = pname  # type: ignore[attr-defined]
             row._preview = preview  # type: ignore[attr-defined]
+
+            drag_src = Gtk.DragSource.new()
+            drag_src.set_actions(Gdk.DragAction.COPY)
+            drag_src.connect(
+                "prepare",
+                lambda _src, _x, _y, pn=pname: Gdk.ContentProvider.new_for_value(
+                    GObject.Value(GObject.TYPE_STRING, f"pipeline:{pn}")
+                ),
+            )
+            row.add_controller(drag_src)
 
             self.obj_pipe_list.append(row)
             count += 1
@@ -460,38 +483,28 @@ class LeftNavigationPanel(Gtk.Box):
             idx += 1
 
     def _on_obj_module_row_selected(self, listbox: Gtk.ListBox, row: Optional[Gtk.ListBoxRow]) -> None:
+        """Highlight selected module card in Object View without replacing the active Main View graph."""
         self._update_listbox_preview_selection(listbox, row)
         if self._updating_selection or row is None:
-            return
-        mname = getattr(row, "_item_id", None)
-        if not mname:
             return
         self._updating_selection = True
         try:
             self.obj_pipe_list.unselect_all()
             self._update_listbox_preview_selection(self.obj_pipe_list, None)
-            for tv in (self.base_tree, self.mod_tree, self.pipe_tree, self.top_tree):
-                tv.get_selection().unselect_all()
         finally:
             self._updating_selection = False
-        self.on_item_selected("module", mname, None)
 
     def _on_obj_pipeline_row_selected(self, listbox: Gtk.ListBox, row: Optional[Gtk.ListBoxRow]) -> None:
+        """Highlight selected pipeline card in Object View without replacing the active Main View graph."""
         self._update_listbox_preview_selection(listbox, row)
         if self._updating_selection or row is None:
-            return
-        pname = getattr(row, "_item_id", None)
-        if not pname:
             return
         self._updating_selection = True
         try:
             self.obj_mod_list.unselect_all()
             self._update_listbox_preview_selection(self.obj_mod_list, None)
-            for tv in (self.base_tree, self.mod_tree, self.pipe_tree, self.top_tree):
-                tv.get_selection().unselect_all()
         finally:
             self._updating_selection = False
-        self.on_item_selected("pipeline", pname, None)
 
     def _on_tree_selection_changed(self, selection: Gtk.TreeSelection, active_pane_kind: str) -> None:
         if self._updating_selection:
@@ -505,13 +518,9 @@ class LeftNavigationPanel(Gtk.Box):
         if not kind or not primary:
             return
 
-        # Clear selection in the other panes and Object View lists
+        # Clear selection in the other File View panes
         self._updating_selection = True
         try:
-            self.obj_mod_list.unselect_all()
-            self._update_listbox_preview_selection(self.obj_mod_list, None)
-            self.obj_pipe_list.unselect_all()
-            self._update_listbox_preview_selection(self.obj_pipe_list, None)
             for pk, tv in (
                 ("base_class", self.base_tree),
                 ("module", self.mod_tree),
@@ -541,6 +550,23 @@ class LeftNavigationPanel(Gtk.Box):
             mod_name = model.get_value(tree_iter, 3)
             if mod_name:
                 self.on_add_module_requested(mod_name)
+
+    def _on_add_pipeline_btn_clicked(self, btn: Gtk.Button) -> None:
+        if not self.on_add_pipeline_requested:
+            return
+        if self.main_notebook.get_current_page() == 0:
+            row = self.obj_pipe_list.get_selected_row()
+            if row is not None:
+                pipe_name = getattr(row, "_item_id", None)
+                if pipe_name:
+                    self.on_add_pipeline_requested(pipe_name)
+                    return
+        sel = self.pipe_tree.get_selection()
+        model, tree_iter = sel.get_selected()
+        if tree_iter:
+            pipe_name = model.get_value(tree_iter, 3)
+            if pipe_name:
+                self.on_add_pipeline_requested(pipe_name)
 
     def _on_module_drag_prepare(self, source: Gtk.DragSource, x: float, y: float, tree: Gtk.TreeView) -> Optional[Gdk.ContentProvider]:
         sel = tree.get_selection()

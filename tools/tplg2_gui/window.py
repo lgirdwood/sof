@@ -137,10 +137,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.hpaned_inner.set_resize_end_child(False)
         self.hpaned_inner.set_position(780)
 
-        # 1. Left Hand Panel (4 vertical sub-panes) wrapped in high-level panel border
+        # 1. Left Hand Panel (Object View & File View notebook) wrapped in high-level panel border
         self.left_panel = LeftNavigationPanel(
             on_item_selected=self._on_left_pane_item_selected,
             on_add_module_requested=self._on_add_module_requested,
+            on_add_pipeline_requested=self._on_add_pipeline_requested,
         )
         left_panel_frame = Gtk.Frame()
         left_panel_frame.add_css_class("high-level-panel")
@@ -335,6 +336,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         nid = self.canvas.add_module_instance(module_name)
         if nid:
             self.status_lbl.set_text(f"Added module node '{nid}' to graph.")
+
+    def _on_add_pipeline_requested(self, pipeline_name: str) -> None:
+        pid = self.canvas.add_pipeline_instance(pipeline_name)
+        if pid is not None:
+            self.status_lbl.set_text(f"Added pipeline {pid} ('{pipeline_name}') to graph.")
 
     def _on_canvas_selection_changed(
         self,

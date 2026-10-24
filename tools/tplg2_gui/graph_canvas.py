@@ -110,10 +110,12 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.hovered_warning_pid: Optional[int] = None
 
         # Interaction state
-        self._drag_mode: str = "none"  # "none", "pan", "node", "wire"
+        self._drag_mode: str = "none"  # "none", "pan", "node", "container", "wire"
         self._drag_start_world: Tuple[float, float] = (0.0, 0.0)
         self._drag_start_pan: Tuple[float, float] = (0.0, 0.0)
         self._drag_node_initial: Tuple[float, float] = (0.0, 0.0)
+        self._drag_container_id: Optional[int] = None
+        self._drag_container_initial: Tuple[float, float] = (0.0, 0.0)
         self._drag_children_initial: Dict[str, Tuple[float, float]] = {}
         self._wire_source: Optional[Tuple[str, str, float, float]] = None  # (node_id, port_id, wx, wy)
         self._wire_cursor_world: Tuple[float, float] = (0.0, 0.0)
@@ -1148,6 +1150,20 @@ class TopologyGraphCanvas(Gtk.Widget):
             }
             return
 
+        pid = self._hit_test_container(wx, wy)
+        if pid is not None and pid in self.vm.containers:
+            self._drag_mode = "container"
+            self._drag_container_id = pid
+            cont = self.vm.containers[pid]
+            self._drag_container_initial = (cont.x, cont.y)
+            pipe_nids = {n.id for n in self.vm.nodes.values() if n.pipeline_id == pid}
+            self._drag_children_initial = {
+                cid: (cnode.x, cnode.y)
+                for cid, cnode in self.vm.nodes.items()
+                if cid in pipe_nids or (cnode.parent_node_id and cnode.parent_node_id in pipe_nids)
+            }
+            return
+
         self._drag_mode = "pan"
         self._drag_start_pan = (self.pan_x, self.pan_y)
 
@@ -1171,6 +1187,17 @@ class TopologyGraphCanvas(Gtk.Widget):
                     self.vm.nodes[cid].x = cx0 + dx
                     self.vm.nodes[cid].y = cy0 + dy
             update_container_bounds_from_nodes(self.vm)
+            self.queue_draw()
+        elif self._drag_mode == "container" and self._drag_container_id is not None and self._drag_container_id in self.vm.containers:
+            dx = offset_x / self.zoom
+            dy = offset_y / self.zoom
+            cont = self.vm.containers[self._drag_container_id]
+            cont.x = self._drag_container_initial[0] + dx
+            cont.y = self._drag_container_initial[1] + dy
+            for cid, (cx0, cy0) in self._drag_children_initial.items():
+                if cid in self.vm.nodes:
+                    self.vm.nodes[cid].x = cx0 + dx
+                    self.vm.nodes[cid].y = cy0 + dy
             self.queue_draw()
         elif self._drag_mode == "wire":
             wx = self._drag_start_world[0] + offset_x / self.zoom
@@ -1339,14 +1366,61 @@ class TopologyGraphCanvas(Gtk.Widget):
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
+        elif self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+            pid = self.selected_container_id
+            pipe_nids = {nid for nid, n in self.vm.nodes.items() if n.pipeline_id == pid}
+            to_remove = pipe_nids | {
+                cid for cid, cn in self.vm.nodes.items()
+                if cn.parent_node_id and cn.parent_node_id in pipe_nids
+            }
+            for rid in to_remove:
+                self.vm.nodes.pop(rid, None)
+            self.vm.edges = [
+                e for e in self.vm.edges
+                if e.source_node not in to_remove and e.sink_node not in to_remove and e.pipeline_id != pid
+            ]
+            self.vm.containers.pop(pid, None)
+            self.selected_container_id = None
+            self.vm.dirty = True
+            if self.on_graph_modified:
+                self.on_graph_modified()
+            self.queue_draw()
 
     def add_module_instance(self, module_name: str, wx: Optional[float] = None, wy: Optional[float] = None) -> Optional[str]:
         """Instantiate a new Processing Module (Class.Widget.<module_name>) onto the active graph."""
         if not self.vm or not self.workspace or module_name not in self.workspace.processing_modules:
             return None
         cdef = self.workspace.processing_modules[module_name]
-        # Pick default pipeline_id (first container if available, else 1)
-        pid = min(self.vm.containers.keys()) if self.vm.containers else 1
+        # Determine target pipeline_id:
+        # 1) If dropped inside an existing PipelineContainer at (wx, wy), use that container's pipeline_id
+        # 2) Else if a container or node is selected, use its pipeline_id
+        # 3) Else use the first container's pipeline_id or 1
+        pid: Optional[int] = None
+        if wx is not None and wy is not None:
+            pid = self._hit_test_container(wx, wy)
+        if pid is None:
+            if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+                pid = self.selected_container_id
+            elif (
+                self.selected_node_id
+                and self.selected_node_id in self.vm.nodes
+                and self.vm.nodes[self.selected_node_id].pipeline_id is not None
+            ):
+                pid = self.vm.nodes[self.selected_node_id].pipeline_id
+            else:
+                pid = min(self.vm.containers.keys()) if self.vm.containers else 1
+
+        if pid not in self.vm.containers:
+            p_cfg = ConfigNode("Object.Widget.pipeline.1", node_type="object")
+            p_cfg.set_scalar("index", str(pid), origin="instance", is_constructor=True)
+            self.vm.containers[pid] = PipelineContainer(
+                pipeline_id=pid,
+                class_name="custom",
+                direction="playback",
+                enabled_by="Added from Object View",
+                config=p_cfg,
+            )
+
         # Find unused instance number
         inst_num = 1
         while f"{module_name}.{pid}.{inst_num}" in self.vm.nodes:
@@ -1357,7 +1431,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             winst=str(inst_num),
             pipeline_id=pid,
             pipeline_class=self.vm.containers[pid].class_name if pid in self.vm.containers else "custom",
-            pipeline_direction="playback",
+            pipeline_direction=self.vm.containers[pid].direction if pid in self.vm.containers else "playback",
             override_stmts=[],
             defines=self.vm.defines or self.workspace.global_defines,
             source_file=cdef.source_file,
@@ -1400,6 +1474,93 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.on_graph_modified()
         self.queue_draw()
         return node.id
+
+    def add_pipeline_instance(self, pipeline_name: str, wx: Optional[float] = None, wy: Optional[float] = None) -> Optional[int]:
+        """Instantiate a full Pipeline (Class.Pipeline.<pipeline_name>) onto the active graph."""
+        if not self.vm or not self.workspace or pipeline_name not in self.workspace.pipeline_classes:
+            return None
+
+        used_pids = set(self.vm.containers.keys()) | {
+            n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
+        }
+        new_pid = 1
+        while new_pid in used_pids:
+            new_pid += 1
+
+        sub_vm = self.workspace.build_graph_for_pipeline(
+            pipeline_name,
+            index=new_pid,
+            include_testbench_io=True,
+        )
+        layout_graph(sub_vm)
+
+        sub_xs = [n.x for n in sub_vm.nodes.values()] + [c.x for c in sub_vm.containers.values()]
+        sub_ys = [n.y for n in sub_vm.nodes.values()] + [c.y for c in sub_vm.containers.values()]
+        sub_x2s = [n.x + n.width for n in sub_vm.nodes.values()] + [c.x + c.width for c in sub_vm.containers.values()]
+        sub_y2s = [n.y + n.height for n in sub_vm.nodes.values()] + [c.y + c.height for c in sub_vm.containers.values()]
+        sub_min_x = min(sub_xs) if sub_xs else 0.0
+        sub_min_y = min(sub_ys) if sub_ys else 0.0
+        sub_max_x = max(sub_x2s) if sub_x2s else 300.0
+        sub_max_y = max(sub_y2s) if sub_y2s else 180.0
+        sub_cx = (sub_min_x + sub_max_x) / 2.0
+        sub_cy = (sub_min_y + sub_max_y) / 2.0
+
+        if wx is None or wy is None:
+            if self.vm.nodes or self.vm.containers:
+                g_min_x, g_min_y, g_w, g_h = self._get_graph_bounds()
+                wx = g_min_x + g_w / 2.0
+                wy = g_min_y + g_h + 64.0 + (sub_max_y - sub_min_y) / 2.0
+            else:
+                wx, wy = self.screen_to_world(
+                    float(self.get_width() or 600) / 2.0,
+                    float(self.get_height() or 400) / 2.0,
+                )
+
+        dx = wx - sub_cx
+        dy = wy - sub_cy
+
+        existing_enabled_sides = {
+            str(n.config.get_scalar("side", "left")).lower()
+            for n in self.vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("enabled", "false")).lower() in ("true", "1", "yes")
+        }
+
+        for cid, cont in sub_vm.containers.items():
+            cont.x += dx
+            cont.y += dy
+            cont.enabled_by = "Added from Object View"
+            cont.config.set_scalar("index", str(new_pid), origin="instance", is_constructor=True)
+            self.vm.containers[cid] = cont
+
+        for nid, node in sub_vm.nodes.items():
+            node.x += dx
+            node.y += dy
+            if node.class_category == "TestbenchIO":
+                side = str(node.config.get_scalar("side", "left")).lower()
+                if side in existing_enabled_sides:
+                    node.config.set_scalar("enabled", "false", origin="instance")
+            self.vm.nodes[nid] = node
+
+        for edge in sub_vm.edges:
+            edge.id = f"pipe_{new_pid}_{edge.id}"
+            self.vm.edges.append(edge)
+
+        self.vm.dirty = True
+        self.selected_node_id = None
+        self.selected_edge_id = None
+        self.selected_container_id = new_pid
+        if new_pid in self.vm.containers and self.on_selection_changed:
+            cont = self.vm.containers[new_pid]
+            self.on_selection_changed(
+                f"Pipeline {new_pid}: {cont.class_name}",
+                cont.config,
+                f"Direction: {cont.direction}",
+            )
+        if self.on_graph_modified:
+            self.on_graph_modified()
+        self.queue_draw()
+        return new_pid
 
     # -------------------------------------------------------------------------
     # Testbench IO Node Radio Selection & File / ALSA PCM Pickers
@@ -1575,6 +1736,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         if value.startswith("module:"):
             mod_name = value.split(":", 1)[1]
             self.add_module_instance(mod_name, wx, wy)
+            return True
+        if value.startswith("pipeline:"):
+            pipe_name = value.split(":", 1)[1]
+            self.add_pipeline_instance(pipe_name, wx, wy)
             return True
         return False
 
