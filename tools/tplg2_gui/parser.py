@@ -1100,17 +1100,73 @@ class Topology2Workspace:
             elif obj_cat == "PCM":
                 self._process_topology_pcm_stmt(st, parts, vm, defines, conf_path)
 
-        # Instantiate standalone/top-level Object.Widget overrides or virtual widgets
+        # First pass over top-level Object.Widget: create/update PipelineContainers from Object.Widget.pipeline
+        custom_pipe_ids: Set[int] = set()
         for wclass, winst, wstmts in top_widgets:
-            if wclass == "virtual":
-                continue  # Keep graph focused on active DSP pipelines/widgets/DAIs/PCMs
-            # Find index in wstmts
+            if wclass != "pipeline":
+                continue
             p_idx: Optional[int] = None
             for ch in wstmts:
                 if ch.stmt_type == "kv" and ch.key == "index":
                     val_s = self._substitute_vars(str(ch.value), defines)
                     if val_s.lstrip("-").isdigit():
                         p_idx = int(val_s)
+            if p_idx is None and winst.lstrip("-").isdigit():
+                p_idx = int(winst)
+            if p_idx is None:
+                continue
+            if p_idx not in vm.containers:
+                pdef_base = self.processing_modules.get("pipeline")
+                pcfg = pdef_base.config_tree.clone() if pdef_base else ConfigNode("Object.Widget.pipeline", node_type="object")
+                pcfg.set_scalar("index", str(p_idx), origin="instance", is_constructor=True)
+                vm.containers[p_idx] = PipelineContainer(
+                    pipeline_id=p_idx,
+                    class_name="io-gateway",
+                    direction="playback",
+                    config=pcfg,
+                )
+                custom_pipe_ids.add(p_idx)
+            self._apply_override_stmts_to_config(vm.containers[p_idx].config, wstmts, defines)
+
+        # Second pass: instantiate standalone/top-level Object.Widget nodes
+        for wclass, winst, wstmts in top_widgets:
+            if wclass in ("virtual", "pipeline"):
+                continue  # Keep graph focused on active DSP pipelines/widgets/DAIs/PCMs
+            # Find index in wstmts
+            p_idx = None
+            w_dir: Optional[str] = None
+            w_type: Optional[str] = None
+            for ch in wstmts:
+                if ch.stmt_type == "kv":
+                    if ch.key == "index":
+                        val_s = self._substitute_vars(str(ch.value), defines)
+                        if val_s.lstrip("-").isdigit():
+                            p_idx = int(val_s)
+                    elif ch.key == "direction":
+                        w_dir = strip_quotes(self._substitute_vars(str(ch.value), defines)).lower()
+                    elif ch.key == "type":
+                        w_type = strip_quotes(self._substitute_vars(str(ch.value), defines)).lower()
+
+            if p_idx is None and winst.lstrip("-").isdigit() and int(winst) in vm.containers:
+                p_idx = int(winst)
+
+            if p_idx is not None and p_idx not in vm.containers:
+                pcfg = ConfigNode(f"Pipeline.{p_idx}", node_type="object")
+                pcfg.set_scalar("index", str(p_idx), origin="instance", is_constructor=True)
+                vm.containers[p_idx] = PipelineContainer(
+                    pipeline_id=p_idx,
+                    class_name="io-gateway",
+                    direction="playback",
+                    config=pcfg,
+                )
+                custom_pipe_ids.add(p_idx)
+
+            if p_idx in custom_pipe_ids:
+                is_cap = (w_dir == "capture") or (w_type == "dai_out")
+                if is_cap:
+                    vm.containers[p_idx].direction = "capture"
+                    vm.containers[p_idx].class_name = "io-gateway-capture"
+
             wnode = self._instantiate_widget_node(
                 wclass=wclass,
                 winst=winst,
@@ -1240,7 +1296,7 @@ class Topology2Workspace:
 
     def _is_pure_class_include(self, inc_path: str) -> bool:
         rel = os.path.relpath(inc_path, self.root_dir)
-        return rel.startswith("include/")
+        return rel.startswith("include/") and not rel.startswith("include/bench/")
 
     def _process_topology_pipeline_stmt(
         self,
