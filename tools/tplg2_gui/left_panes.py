@@ -48,6 +48,14 @@ class LeftNavigationPanel(Gtk.Box):
         self._updating_selection: bool = False
         self._filter_text: str = ""
         self._mini_vm_cache: Dict[str, GraphViewModel] = {}
+        self._hovered_row: Optional[Gtk.ListBoxRow] = None
+
+        # Reusable non-modal Hover Zoom Info Box Popover for Object View items
+        self._hover_popover = Gtk.Popover()
+        self._hover_popover.set_autohide(False)
+        self._hover_popover.set_can_target(False)
+        self._hover_popover.set_position(Gtk.PositionType.RIGHT)
+        self._hover_popover.add_css_class("zoom-info-popover")
 
         # Search entry filtering both Object View and File View
         self.search_entry = Gtk.SearchEntry()
@@ -89,6 +97,10 @@ class LeftNavigationPanel(Gtk.Box):
         self.obj_mod_list = Gtk.ListBox()
         self.obj_mod_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.obj_mod_list.connect("row-selected", self._on_obj_module_row_selected)
+        mod_motion = Gtk.EventControllerMotion.new()
+        mod_motion.connect("motion", self._on_obj_list_motion, self.obj_mod_list)
+        mod_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
+        self.obj_mod_list.add_controller(mod_motion)
         mod_scroll = Gtk.ScrolledWindow()
         mod_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         mod_scroll.set_vexpand(True)
@@ -119,6 +131,10 @@ class LeftNavigationPanel(Gtk.Box):
         self.obj_pipe_list = Gtk.ListBox()
         self.obj_pipe_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.obj_pipe_list.connect("row-selected", self._on_obj_pipeline_row_selected)
+        pipe_motion = Gtk.EventControllerMotion.new()
+        pipe_motion.connect("motion", self._on_obj_list_motion, self.obj_pipe_list)
+        pipe_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
+        self.obj_pipe_list.add_controller(pipe_motion)
         pipe_scroll = Gtk.ScrolledWindow()
         pipe_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         pipe_scroll.set_vexpand(True)
@@ -126,8 +142,10 @@ class LeftNavigationPanel(Gtk.Box):
         pipe_page.append(pipe_scroll)
 
         self.object_notebook.append_page(pipe_page, Gtk.Label(label="Pipelines"))
+        self.object_notebook.connect("switch-page", lambda *_: self._hide_hover_zoom_box())
 
         self.main_notebook.append_page(self.object_notebook, Gtk.Label(label="Object View"))
+        self.main_notebook.connect("switch-page", lambda *_: self._hide_hover_zoom_box())
 
         # ---------------------------------------------------------------------
         # Page 2: File View (4 vertical tree-view sub-panes)
@@ -304,37 +322,67 @@ class LeftNavigationPanel(Gtk.Box):
             self._updating_selection = False
 
     def _populate_object_modules(self) -> None:
+        self._hide_hover_zoom_box()
         self._clear_listbox(self.obj_mod_list)
         if not self.workspace:
             return
         count = 0
         for mname, cdef in sorted(self.workspace.processing_modules.items()):
             wtype = str(cdef.defaults.get("type", "effect"))
-            if not self._matches_filter(mname, wtype, cdef.rel_path):
+            desc = cdef.description or f"SOF {mname} processing module ({wtype})."
+            if not self._matches_filter(mname, wtype, desc, cdef.rel_path):
                 continue
             vm = self._get_mini_module_vm(mname)
             preview = MiniGraphPreview(vm)
 
+            in_p = cdef.defaults.get("num_input_pins", 1)
+            out_p = cdef.defaults.get("num_output_pins", 1)
+            badge_text = f"{wtype} • {in_p}→{out_p} pins"
+
             row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            row_box.set_margin_top(3)
-            row_box.set_margin_bottom(3)
-            row_box.set_margin_start(3)
-            row_box.set_margin_end(3)
+            row_box.set_margin_top(4)
+            row_box.set_margin_bottom(4)
+            row_box.set_margin_start(4)
+            row_box.set_margin_end(4)
+
+            hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            title_lbl = Gtk.Label(label=mname, xalign=0.0)
+            title_lbl.set_hexpand(True)
+            title_lbl.add_css_class("obj-item-title")
+            hdr_row.append(title_lbl)
+
+            badge_lbl = Gtk.Label(label=badge_text, xalign=1.0)
+            badge_lbl.add_css_class("obj-item-badge")
+            hdr_row.append(badge_lbl)
+            row_box.append(hdr_row)
+
+            desc_lbl = Gtk.Label(label=desc, xalign=0.0)
+            desc_lbl.set_wrap(True)
+            desc_lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            desc_lbl.add_css_class("obj-item-desc")
+            row_box.append(desc_lbl)
+
             row_box.append(preview)
 
             row = Gtk.ListBoxRow()
             row.set_child(row_box)
-            row.set_tooltip_text(f"Drag and drop '{mname}' onto the main view to add this module")
+            row._item_kind = "module"  # type: ignore[attr-defined]
             row._item_id = mname  # type: ignore[attr-defined]
+            row._title_text = mname  # type: ignore[attr-defined]
+            row._badge_text = badge_text  # type: ignore[attr-defined]
+            row._desc_text = desc  # type: ignore[attr-defined]
             row._preview = preview  # type: ignore[attr-defined]
 
             drag_src = Gtk.DragSource.new()
             drag_src.set_actions(Gdk.DragAction.COPY)
             drag_src.connect(
                 "prepare",
-                lambda _src, _x, _y, mn=mname: Gdk.ContentProvider.new_for_value(
-                    GObject.Value(GObject.TYPE_STRING, f"module:{mn}")
-                ),
+                lambda _src, _x, _y, mn=mname: (
+                    self._hide_hover_zoom_box(),
+                    Gdk.ContentProvider.new_for_value(
+                        GObject.Value(GObject.TYPE_STRING, f"module:{mn}")
+                    ),
+                )[1],
             )
             row.add_controller(drag_src)
 
@@ -343,37 +391,67 @@ class LeftNavigationPanel(Gtk.Box):
         self.obj_mod_count_lbl.set_text(f"Modules ({count})")
 
     def _populate_object_pipelines(self) -> None:
+        self._hide_hover_zoom_box()
         self._clear_listbox(self.obj_pipe_list)
         if not self.workspace:
             return
         count = 0
         for pname, pdef in sorted(self.workspace.pipeline_classes.items()):
-            direction = str(pdef.defaults.get("direction", "playback"))
-            if not self._matches_filter(pname, direction, pdef.rel_path):
+            default_dir = "capture" if "capture" in pname else "playback"
+            direction = str(pdef.defaults.get("direction", default_dir))
+            desc = pdef.description or f"{direction.capitalize()} pipeline: {pname}."
+            if not self._matches_filter(pname, direction, desc, pdef.rel_path):
                 continue
             vm = self._get_mini_pipeline_vm(pname)
             preview = MiniGraphPreview(vm)
 
+            wcount = len([w for w in pdef.widgets if w["class_name"] != "pipeline"])
+            badge_text = f"{direction} • {wcount} widgets"
+
             row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            row_box.set_margin_top(3)
-            row_box.set_margin_bottom(3)
-            row_box.set_margin_start(3)
-            row_box.set_margin_end(3)
+            row_box.set_margin_top(4)
+            row_box.set_margin_bottom(4)
+            row_box.set_margin_start(4)
+            row_box.set_margin_end(4)
+
+            hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            title_lbl = Gtk.Label(label=pname, xalign=0.0)
+            title_lbl.set_hexpand(True)
+            title_lbl.add_css_class("obj-item-title")
+            hdr_row.append(title_lbl)
+
+            badge_lbl = Gtk.Label(label=badge_text, xalign=1.0)
+            badge_lbl.add_css_class("obj-item-badge")
+            hdr_row.append(badge_lbl)
+            row_box.append(hdr_row)
+
+            desc_lbl = Gtk.Label(label=desc, xalign=0.0)
+            desc_lbl.set_wrap(True)
+            desc_lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            desc_lbl.add_css_class("obj-item-desc")
+            row_box.append(desc_lbl)
+
             row_box.append(preview)
 
             row = Gtk.ListBoxRow()
             row.set_child(row_box)
-            row.set_tooltip_text(f"Drag and drop '{pname}' onto the main view to instantiate this pipeline")
+            row._item_kind = "pipeline"  # type: ignore[attr-defined]
             row._item_id = pname  # type: ignore[attr-defined]
+            row._title_text = pname  # type: ignore[attr-defined]
+            row._badge_text = badge_text  # type: ignore[attr-defined]
+            row._desc_text = desc  # type: ignore[attr-defined]
             row._preview = preview  # type: ignore[attr-defined]
 
             drag_src = Gtk.DragSource.new()
             drag_src.set_actions(Gdk.DragAction.COPY)
             drag_src.connect(
                 "prepare",
-                lambda _src, _x, _y, pn=pname: Gdk.ContentProvider.new_for_value(
-                    GObject.Value(GObject.TYPE_STRING, f"pipeline:{pn}")
-                ),
+                lambda _src, _x, _y, pn=pname: (
+                    self._hide_hover_zoom_box(),
+                    Gdk.ContentProvider.new_for_value(
+                        GObject.Value(GObject.TYPE_STRING, f"pipeline:{pn}")
+                    ),
+                )[1],
             )
             row.add_controller(drag_src)
 
@@ -577,3 +655,159 @@ class LeftNavigationPanel(Gtk.Box):
                 val = GObject.Value(GObject.TYPE_STRING, f"module:{mod_name}")
                 return Gdk.ContentProvider.new_for_value(val)
         return None
+
+    # ------------------------------------------------------------------
+    # Hover Zoom Info Box for Object View List Items
+    # ------------------------------------------------------------------
+    def _on_obj_list_motion(
+        self,
+        _ctrl: Gtk.EventControllerMotion,
+        x: float,
+        y: float,
+        listbox: Gtk.ListBox,
+    ) -> None:
+        row = listbox.get_row_at_y(int(y))
+        if row is None:
+            self._hide_hover_zoom_box()
+            return
+        if row is self._hovered_row:
+            return
+        self._hovered_row = row
+        self._show_hover_zoom_box(listbox, row, y)
+
+    def _show_hover_zoom_box(
+        self,
+        listbox: Gtk.ListBox,
+        row: Gtk.ListBoxRow,
+        pointer_y: float = 0.0,
+    ) -> None:
+        if not self.workspace:
+            return
+        item_kind = getattr(row, "_item_kind", None)
+        item_id = getattr(row, "_item_id", None)
+        if not item_kind or not item_id:
+            self._hide_hover_zoom_box()
+            return
+
+        cache_key = f"{item_kind}:{item_id}"
+        vm = self._mini_vm_cache.get(cache_key)
+        if vm is None:
+            if item_kind == "module":
+                vm = self.workspace.build_graph_for_module(item_id)
+            else:
+                vm = self.workspace.build_graph_for_pipeline(item_id)
+            self._mini_vm_cache[cache_key] = vm
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+
+        # Header row: Full Class Title + Badge
+        hdr_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        prefix = "Class.Widget." if item_kind == "module" else "Class.Pipeline."
+        title_lbl = Gtk.Label(label=f"{prefix}{item_id}", xalign=0.0)
+        title_lbl.set_hexpand(True)
+        title_lbl.add_css_class("zoom-info-title")
+        hdr_row.append(title_lbl)
+
+        badge_text = getattr(row, "_badge_text", "")
+        if badge_text:
+            badge_lbl = Gtk.Label(label=badge_text, xalign=1.0)
+            badge_lbl.add_css_class("zoom-info-badge")
+            hdr_row.append(badge_lbl)
+        card.append(hdr_row)
+
+        # Full description text
+        desc_text = getattr(row, "_desc_text", "")
+        if desc_text:
+            desc_lbl = Gtk.Label(label=desc_text, xalign=0.0)
+            desc_lbl.set_wrap(True)
+            desc_lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            desc_lbl.set_max_width_chars(88)
+            desc_lbl.add_css_class("zoom-info-desc")
+            card.append(desc_lbl)
+
+        # Metadata details
+        meta_lines = []
+        if item_kind == "module":
+            cdef = self.workspace.processing_modules.get(item_id)
+            if cdef:
+                if cdef.rel_path:
+                    meta_lines.append(f"Source: {cdef.rel_path}")
+                n_in = cdef.defaults.get("num_input_pins", 0)
+                n_out = cdef.defaults.get("num_output_pins", 0)
+                in_fmts = cdef.defaults.get("num_input_audio_formats", 0)
+                out_fmts = cdef.defaults.get("num_output_audio_formats", 0)
+                meta_lines.append(
+                    f"Pins: {n_in} in / {n_out} out  |  "
+                    f"Audio Formats: {in_fmts} in / {out_fmts} out"
+                )
+                ctrl_names = []
+                for ctrl in cdef.controls:
+                    cname = ctrl.get("name") or f"{ctrl.get('type', 'control')}.{ctrl.get('index', '0')}"
+                    ctrl_names.append(str(cname))
+                if ctrl_names:
+                    meta_lines.append(f"Controls ({len(ctrl_names)}): {', '.join(ctrl_names[:4])}")
+        else:
+            cdef = self.workspace.pipeline_classes.get(item_id)
+            if cdef:
+                if cdef.rel_path:
+                    meta_lines.append(f"Source: {cdef.rel_path}")
+                p_details = []
+                if cdef.extends_class:
+                    p_details.append(f"Extends: {cdef.extends_class}")
+                td = cdef.defaults.get("time_domain")
+                if td:
+                    p_details.append(f"Time Domain: {td}")
+                dyn = cdef.defaults.get("dynamic_pipeline")
+                if dyn is not None:
+                    p_details.append(f"Dynamic: {dyn}")
+                if p_details:
+                    meta_lines.append("  |  ".join(p_details))
+                w_chain = [f"{w.get('class_name', '')}.{w.get('instance', '')}" for w in cdef.widgets]
+                if w_chain:
+                    meta_lines.append(f"Chain ({len(w_chain)} widgets): {' → '.join(w_chain)}")
+
+        if meta_lines:
+            meta_lbl = Gtk.Label(label="\n".join(meta_lines), xalign=0.0)
+            meta_lbl.set_wrap(True)
+            meta_lbl.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            meta_lbl.set_max_width_chars(92)
+            meta_lbl.add_css_class("zoom-info-meta")
+            card.append(meta_lbl)
+
+        # Zoomed-in graphical preview card
+        zoom_preview = MiniGraphPreview(vm, zoom_card=True)
+        card.append(zoom_preview)
+
+        hint_lbl = Gtk.Label(
+            label="Drag and drop onto the Main View to instantiate",
+            xalign=0.5,
+        )
+        hint_lbl.add_css_class("zoom-info-hint")
+        card.append(hint_lbl)
+
+        self._hover_popover.set_child(card)
+        if self._hover_popover.get_parent() is not listbox:
+            if self._hover_popover.get_parent() is not None:
+                self._hover_popover.unparent()
+            self._hover_popover.set_parent(listbox)
+
+        ok, bounds = row.compute_bounds(listbox)
+        rect = Gdk.Rectangle()
+        if ok:
+            rect.x = int(bounds.origin.x + bounds.size.width - 6)
+            rect.y = int(bounds.origin.y + bounds.size.height / 2)
+            rect.width = 4
+            rect.height = 4
+        else:
+            rect.x = max(10, listbox.get_Width() - 6 if hasattr(listbox, "get_Width") else 260)
+            rect.y = int(pointer_y)
+            rect.width = 4
+            rect.height = 4
+        self._hover_popover.set_pointing_to(rect)
+        if listbox.get_mapped():
+            self._hover_popover.popup()
+
+    def _hide_hover_zoom_box(self) -> None:
+        self._hovered_row = None
+        if self._hover_popover.get_parent() is not None:
+            self._hover_popover.popdown()

@@ -58,6 +58,49 @@ textview {
     color: #cbd5e1;
     font-size: 11px;
 }
+.obj-item-title {
+    font-weight: bold;
+    font-size: 11.5px;
+    color: #f8fafc;
+}
+.obj-item-badge {
+    font-size: 10px;
+    font-weight: bold;
+    color: #60a5fa;
+}
+.obj-item-desc {
+    font-size: 10px;
+    color: #94a3b8;
+}
+popover.zoom-info-popover > contents {
+    background-color: #111827;
+    border: 2px solid #3b82f6;
+    border-radius: 10px;
+    padding: 14px;
+}
+.zoom-info-title {
+    font-weight: bold;
+    font-size: 16px;
+    color: #f8fafc;
+}
+.zoom-info-badge {
+    font-size: 13px;
+    font-weight: bold;
+    color: #60a5fa;
+}
+.zoom-info-desc {
+    font-size: 13.5px;
+    color: #e2e8f0;
+}
+.zoom-info-meta {
+    font-size: 12.5px;
+    color: #93c5fd;
+}
+.zoom-info-hint {
+    font-size: 12px;
+    color: #fbbf24;
+    font-weight: bold;
+}
 """
 
 

@@ -418,6 +418,44 @@ class Topology2Workspace:
                     else:
                         self.base_classes[f"{cat}.{cname}"] = cdef
 
+    @staticmethod
+    def _extract_file_description(fpath: str, doxy: str) -> str:
+        lines: List[str] = []
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    if not s.startswith("#"):
+                        break
+                    c = s.lstrip("#").strip()
+                    c = re.sub(r"^\\struct\s+\S+\s*", "", c).strip()
+                    c = re.sub(r"^\\brief\s*", "", c).strip()
+                    if not c or c.startswith("SPDX"):
+                        continue
+                    if any(
+                        c.startswith(p)
+                        for p in ("All attributes", "by alsatplg", "Usage:", "Object.", "Where N", '"Object.')
+                    ):
+                        break
+                    if "All attributes defined herein" in c:
+                        c = c.split("All attributes defined herein")[0].strip()
+                        if c:
+                            lines.append(c)
+                        break
+                    lines.append(c)
+        except Exception:
+            pass
+        if not lines and doxy:
+            for raw in doxy.splitlines():
+                c = re.sub(r"^\\(struct|brief)\s*\S*\s*", "", raw.strip()).strip()
+                if c:
+                    lines.append(c)
+        if len(lines) >= 2 and lines[0].lower().rstrip(".") in lines[1].lower():
+            lines = lines[1:]
+        return " — ".join(lines[:2])
+
     def _build_class_def(
         self,
         category: str,
@@ -426,16 +464,24 @@ class Topology2Workspace:
         fpath: str,
         rel_path: str,
     ) -> TplgClassDef:
+        desc = self._extract_file_description(fpath, class_stmt.doxy)
         cdef = TplgClassDef(
             category=category,
             name=name,
             source_file=fpath,
             rel_path=rel_path,
-            description=class_stmt.doxy,
+            description=desc,
         )
         # Flatten inline includes inside the class block (e.g. <include/components/widget-common.conf>)
         expanded_stmts = self._expand_class_body(class_stmt.children, fpath)
         self._populate_class_from_stmts(cdef, expanded_stmts)
+        if not cdef.description:
+            if category == "Widget":
+                wtype = str(cdef.defaults.get("type", "effect"))
+                cdef.description = f"SOF {name} processing module ({wtype})."
+            elif category == "Pipeline":
+                direction = str(cdef.defaults.get("direction", "capture" if "capture" in name else "playback"))
+                cdef.description = f"{direction.capitalize()} pipeline: {name}."
         return cdef
 
     def _expand_class_body(self, stmts: List[AstStmt], current_file: str) -> List[AstStmt]:

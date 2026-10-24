@@ -1745,21 +1745,31 @@ class TopologyGraphCanvas(Gtk.Widget):
 
 
 class MiniGraphPreview(TopologyGraphCanvas):
-    """Scaled miniature visual preview of a Module or Pipeline graph for the Left Panel Object View."""
+    """Scaled miniature (or hover-zoomed) visual preview of a Module or Pipeline graph."""
 
-    def __init__(self, vm: GraphViewModel) -> None:
+    def __init__(self, vm: GraphViewModel, zoom_card: bool = False) -> None:
         super().__init__()
         self.set_focusable(False)
         self.set_can_target(False)
         self.is_row_selected: bool = False
+        self.zoom_card: bool = zoom_card
         self.vm = vm
         layout_graph(vm)
         _, _, gw, gh = self._get_graph_bounds()
-        if vm.view_kind == "module":
-            req_h = 132 if gh > 110.0 else 86
+        if zoom_card:
+            if vm.view_kind == "module":
+                req_w = int(min(780.0, max(520.0, gw * 1.55 + 48.0)))
+                req_h = int(min(520.0, max(280.0, gh * 1.55 + 44.0)))
+            else:
+                req_w = int(min(1120.0, max(720.0, gw * 1.15 + 56.0)))
+                req_h = int(min(580.0, max(340.0, gh * 1.15 + 48.0)))
+            self.set_size_request(req_w, req_h)
         else:
-            req_h = int(max(106.0, min(164.0, 290.0 * (gh / max(gw, 240.0)) + 24.0)))
-        self.set_size_request(220, req_h)
+            if vm.view_kind == "module":
+                req_h = 132 if gh > 110.0 else 86
+            else:
+                req_h = int(max(106.0, min(164.0, 290.0 * (gh / max(gw, 240.0)) + 24.0)))
+            self.set_size_request(220, req_h)
         self.set_hexpand(True)
 
     def _setup_controllers(self) -> None:
@@ -1783,10 +1793,14 @@ class MiniGraphPreview(TopologyGraphCanvas):
         snapshot.append_color(BG_COLOR, rect)
 
         min_x, min_y, graph_w, graph_h = self._get_graph_bounds()
-        pad = 10.0
+        pad = 18.0 if self.zoom_card else 10.0
         zx = max(20.0, w - 2.0 * pad) / max(graph_w, 1.0)
         zy = max(20.0, h - 2.0 * pad) / max(graph_h, 1.0)
-        scale = max(0.10, min(0.82, min(zx, zy)))
+        if self.zoom_card:
+            max_sc = 1.65 if self.vm.view_kind == "module" else 1.35
+        else:
+            max_sc = 0.82
+        scale = max(0.10, min(max_sc, min(zx, zy)))
         px = (w - graph_w * scale) / 2.0 - min_x * scale
         py = (h - graph_h * scale) / 2.0 - min_y * scale
 
