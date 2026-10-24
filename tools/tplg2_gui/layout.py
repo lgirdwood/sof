@@ -10,6 +10,10 @@ from .model import GraphEdge, GraphNode, GraphViewModel, PipelineContainer
 
 NODE_WIDTH = 200.0
 NODE_BASE_HEIGHT = 86.0
+CONTROL_WIDTH = 34.0
+CONTROL_MIN_HEIGHT = 86.0
+CTRL_TOP_GAP = 16.0
+CTRL_H_GAP = 7.0
 H_GAP = 72.0
 V_GAP = 28.0
 CONTAINER_PAD_X = 26.0
@@ -36,12 +40,29 @@ def layout_graph(vm: GraphViewModel) -> None:
 
 
 def _compute_node_geometry(node: GraphNode) -> None:
+    if node.class_category == "Control":
+        node.width = CONTROL_WIDTH
+        node.height = max(CONTROL_MIN_HEIGHT, min(175.0, len(node.title) * 6.0 + 30.0))
+        # Vertical kcontrol nodes connect from their top-center port up to the bottom of the parent widget
+        for port in node.out_ports:
+            port.rel_x = node.width / 2.0
+            port.rel_y = 0.0
+        for port in node.in_ports:
+            port.rel_x = node.width / 2.0
+            port.rel_y = 0.0
+        return
+
     num_ports = max(len(node.in_ports), len(node.out_ports), 1)
-    badge_extra = 18.0 if node.badges else 0.0
+    has_bottom_row = bool(node.in_fmt_badge or node.out_fmt_badge or node.badges)
+    badge_extra = 20.0 if has_bottom_row else 0.0
     title_w = len(node.title) * 7.6 + 28.0
     sub_w = len(node.subtitle) * 6.6 + 28.0
     badge_w = sum(len(b) * 6.5 + 18.0 for b in node.badges[:2]) + 24.0 if node.badges else 0.0
-    node.width = max(NODE_WIDTH, title_w, sub_w, badge_w)
+    in_fmt_w = (len(node.in_fmt_badge) * 6.6 + 16.0) if node.in_fmt_badge else 0.0
+    out_fmt_w = (len(node.out_fmt_badge) * 6.6 + 16.0) if node.out_fmt_badge else 0.0
+    fmt_row_w = in_fmt_w + out_fmt_w + (36.0 if (in_fmt_w and out_fmt_w) else 24.0)
+
+    node.width = max(NODE_WIDTH, title_w, sub_w, badge_w, fmt_row_w)
     node.height = max(NODE_BASE_HEIGHT, 54.0 + num_ports * 18.0 + badge_extra)
 
     # Position input ports along left edge
@@ -100,16 +121,32 @@ def _layout_flat_dag(
     start_x: float = 60.0,
     start_y: float = 60.0,
 ) -> Tuple[float, float]:
-    """Layout a subset of nodes as a left-to-right DAG starting at (start_x, start_y).
+    """Layout a subset of nodes as a left-to-right DAG starting at (start_x, start_y),
+    with any kcontrol nodes stacked directly below their parent widget node.
     Returns (total_width, total_height).
     """
     if not node_ids:
         return (0.0, 0.0)
 
+    id_set = set(node_ids)
+    main_ids: List[str] = []
+    ctrl_by_parent: Dict[str, List[str]] = defaultdict(list)
+
+    for nid in node_ids:
+        node = vm.nodes[nid]
+        if node.parent_node_id and node.parent_node_id in id_set:
+            ctrl_by_parent[node.parent_node_id].append(nid)
+        else:
+            main_ids.append(nid)
+
+    if not main_ids:
+        main_ids = list(node_ids)
+        ctrl_by_parent.clear()
+
     # Heuristic source/sink ordering hint so host-copier/mixout starts on left and mixin/dai-copier ends on right
     def node_role_rank(nid: str) -> int:
         n = vm.nodes[nid]
-        if n.category == "control":
+        if n.class_category == "Control":
             return 0
         if n.class_name in ("host-copier", "mixout") and "capture" not in nid:
             return 1
@@ -123,13 +160,28 @@ def _layout_flat_dag(
             return 4
         return 2
 
-    ordered_ids = sorted(node_ids, key=lambda nid: (node_role_rank(nid), nid))
+    ordered_ids = sorted(main_ids, key=lambda nid: (node_role_rank(nid), nid))
     layers = _compute_dag_layers(ordered_ids, vm.edges)
+
+    def group_width(nid: str) -> float:
+        w = vm.nodes[nid].width
+        ctrls = ctrl_by_parent.get(nid, [])
+        if ctrls:
+            row_w = sum(vm.nodes[cid].width for cid in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
+            w = max(w, row_w)
+        return w
+
+    def group_height(nid: str) -> float:
+        h = vm.nodes[nid].height
+        ctrls = ctrl_by_parent.get(nid, [])
+        if ctrls:
+            h += CTRL_TOP_GAP + max(vm.nodes[cid].height for cid in ctrls)
+        return h
 
     max_col_h = 0.0
     col_heights: List[float] = []
     for lyr in layers:
-        h = sum(vm.nodes[nid].height for nid in lyr) + max(0, len(lyr) - 1) * V_GAP
+        h = sum(group_height(nid) for nid in lyr) + max(0, len(lyr) - 1) * V_GAP
         col_heights.append(h)
         max_col_h = max(max_col_h, h)
 
@@ -137,12 +189,24 @@ def _layout_flat_dag(
     for col_idx, lyr in enumerate(layers):
         col_h = col_heights[col_idx]
         cur_y = start_y + (max_col_h - col_h) / 2.0
-        col_w = max(vm.nodes[nid].width for nid in lyr)
+        col_w = max(group_width(nid) for nid in lyr)
         for nid in lyr:
             node = vm.nodes[nid]
-            node.x = cur_x
+            gw = group_width(nid)
+            node.x = cur_x + (gw - node.width) / 2.0
             node.y = cur_y
-            cur_y += node.height + V_GAP
+            # Place attached vertical kcontrol nodes side-by-side directly beneath the parent widget node
+            ctrls = ctrl_by_parent.get(nid, [])
+            if ctrls:
+                row_w = sum(vm.nodes[cid].width for cid in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
+                ctrl_x = node.x + (node.width - row_w) / 2.0
+                ctrl_y = node.y + node.height + CTRL_TOP_GAP
+                for cid in ctrls:
+                    cnode = vm.nodes[cid]
+                    cnode.x = ctrl_x
+                    cnode.y = ctrl_y
+                    ctrl_x += cnode.width + CTRL_H_GAP
+            cur_y += group_height(nid) + V_GAP
         cur_x += col_w + H_GAP
 
     total_w = max(0.0, cur_x - start_x - H_GAP)

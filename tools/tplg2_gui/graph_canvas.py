@@ -11,7 +11,13 @@ gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Gdk, GObject, Graphene, Gsk, Gtk, Pango
 
-from .layout import layout_graph, update_container_bounds_from_nodes, _compute_node_geometry
+from .layout import (
+    CTRL_H_GAP,
+    CTRL_TOP_GAP,
+    _compute_node_geometry,
+    layout_graph,
+    update_container_bounds_from_nodes,
+)
 from .model import ConfigNode, GraphEdge, GraphNode, GraphPort, GraphViewModel, PipelineContainer
 from .parser import Topology2Workspace
 
@@ -33,6 +39,10 @@ CATEGORY_COLORS: Dict[str, Tuple[Gdk.RGBA, Gdk.RGBA]] = {
     "dai": (rgba(0.20, 0.62, 0.28, 1.0), rgba(0.11, 0.20, 0.14, 0.96)),
     "pcm": (rgba(0.45, 0.32, 0.78, 1.0), rgba(0.16, 0.13, 0.24, 0.96)),
     "control": (rgba(0.64, 0.30, 0.56, 1.0), rgba(0.20, 0.13, 0.19, 0.96)),
+    "control_mixer": (rgba(0.62, 0.26, 0.88, 1.0), rgba(0.18, 0.12, 0.25, 0.96)),
+    "control_switch": (rgba(0.86, 0.56, 0.12, 1.0), rgba(0.24, 0.18, 0.10, 0.96)),
+    "control_bytes": (rgba(0.12, 0.66, 0.84, 1.0), rgba(0.10, 0.19, 0.24, 0.96)),
+    "control_enum": (rgba(0.86, 0.24, 0.42, 1.0), rgba(0.24, 0.11, 0.16, 0.96)),
     "base": (rgba(0.36, 0.44, 0.54, 1.0), rgba(0.14, 0.16, 0.20, 0.96)),
     "pipeline": (rgba(0.25, 0.48, 0.72, 1.0), rgba(0.12, 0.17, 0.23, 0.96)),
 }
@@ -85,6 +95,9 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.pan_x: float = 24.0
         self.pan_y: float = 24.0
         self.zoom: float = 1.0
+        self._is_fitted: bool = True
+        self._last_canvas_size: Tuple[int, int] = (0, 0)
+        self._pointer_pos: Optional[Tuple[float, float]] = None
 
         # Selection state
         self.selected_node_id: Optional[str] = None
@@ -97,6 +110,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self._drag_start_world: Tuple[float, float] = (0.0, 0.0)
         self._drag_start_pan: Tuple[float, float] = (0.0, 0.0)
         self._drag_node_initial: Tuple[float, float] = (0.0, 0.0)
+        self._drag_children_initial: Dict[str, Tuple[float, float]] = {}
         self._wire_source: Optional[Tuple[str, str, float, float]] = None  # (node_id, port_id, wx, wy)
         self._wire_cursor_world: Tuple[float, float] = (0.0, 0.0)
 
@@ -127,8 +141,9 @@ class TopologyGraphCanvas(Gtk.Widget):
             pan_drag.connect("drag-update", self._on_pan_update)
             self.add_controller(pan_drag)
 
-        # Motion controller for port hover highlight
+        # Motion controller for cursor tracking (pointer-centered zoom) & port hover highlight
         motion = Gtk.EventControllerMotion.new()
+        motion.connect("enter", self._on_motion_enter)
         motion.connect("motion", self._on_motion)
         self.add_controller(motion)
 
@@ -175,15 +190,10 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.on_selection_changed(node.title, node.config, node.subtitle)
         self.queue_draw()
 
-    def fit_to_view(self) -> None:
-        """Center and scale camera to fit the active graph."""
+    def _get_graph_bounds(self) -> Tuple[float, float, float, float]:
+        """Return (min_x, min_y, graph_w, graph_h) in world coordinates."""
         if not self.vm or not self.vm.nodes:
-            self.pan_x = 30.0
-            self.pan_y = 30.0
-            self.zoom = 1.0
-            self.queue_draw()
-            return
-
+            return (0.0, 0.0, 200.0, 150.0)
         min_x = min(n.x for n in self.vm.nodes.values())
         min_y = min(n.y for n in self.vm.nodes.values())
         max_x = max(n.x + n.width for n in self.vm.nodes.values())
@@ -197,17 +207,57 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         graph_w = max(max_x - min_x, 200.0)
         graph_h = max(max_y - min_y, 150.0)
+        return (min_x, min_y, graph_w, graph_h)
 
-        alloc_w = float(self.get_width() or 860)
-        alloc_h = float(self.get_height() or 600)
+    def _compute_fit_zoom(self, alloc_w: float, alloc_h: float, graph_w: float, graph_h: float) -> float:
+        pad = min(44.0, max(16.0, alloc_w * 0.04), max(16.0, alloc_h * 0.04))
+        zx = max(40.0, alloc_w - 2.0 * pad) / graph_w
+        zy = max(40.0, alloc_h - 2.0 * pad) / graph_h
+        return max(0.08, min(4.0, min(zx, zy)))
 
-        pad = 70.0
-        zx = (alloc_w - 2 * pad) / graph_w
-        zy = (alloc_h - 2 * pad) / graph_h
-        self.zoom = max(0.30, min(1.25, min(zx, zy)))
+    def fit_to_view(self, width: Optional[float] = None, height: Optional[float] = None) -> None:
+        """Center and scale camera to fit the active graph."""
+        self._is_fitted = True
+        if not self.vm or not self.vm.nodes:
+            self.pan_x = 30.0
+            self.pan_y = 30.0
+            self.zoom = 1.0
+            self.queue_draw()
+            return
+
+        min_x, min_y, graph_w, graph_h = self._get_graph_bounds()
+        alloc_w = float(width if width is not None else (self.get_width() or 860))
+        alloc_h = float(height if height is not None else (self.get_height() or 600))
+
+        self.zoom = self._compute_fit_zoom(alloc_w, alloc_h, graph_w, graph_h)
         self.pan_x = (alloc_w - graph_w * self.zoom) / 2.0 - min_x * self.zoom
         self.pan_y = (alloc_h - graph_h * self.zoom) / 2.0 - min_y * self.zoom
         self.queue_draw()
+
+    def _handle_canvas_resize(self, new_w: int, new_h: int) -> None:
+        """Scale and re-center the graph when the canvas widget is resized."""
+        old_w, old_h = self._last_canvas_size
+        self._last_canvas_size = (new_w, new_h)
+        if not self.vm or not self.vm.nodes:
+            return
+        if old_w <= 0 or old_h <= 0 or self._is_fitted:
+            self.fit_to_view(float(new_w), float(new_h))
+            return
+
+        # User has manually zoomed/panned: scale zoom proportionally with canvas resize
+        # while keeping the viewport center world point anchored at the new canvas center.
+        _, _, graph_w, graph_h = self._get_graph_bounds()
+        old_fit = self._compute_fit_zoom(float(old_w), float(old_h), graph_w, graph_h)
+        new_fit = self._compute_fit_zoom(float(new_w), float(new_h), graph_w, graph_h)
+        scale_ratio = (new_fit / old_fit) if old_fit > 0 else 1.0
+        if abs(scale_ratio - 1.0) < 1e-4:
+            # Fallback if fit axis didn't change: scale by geometric mean of dimension ratios
+            scale_ratio = math.sqrt((new_w / float(old_w)) * (new_h / float(old_h)))
+
+        wx_center, wy_center = self.screen_to_world(old_w / 2.0, old_h / 2.0)
+        self.zoom = max(0.08, min(5.0, self.zoom * scale_ratio))
+        self.pan_x = (new_w / 2.0) - wx_center * self.zoom
+        self.pan_y = (new_h / 2.0) - wy_center * self.zoom
 
     def screen_to_world(self, sx: float, sy: float) -> Tuple[float, float]:
         return ((sx - self.pan_x) / self.zoom, (sy - self.pan_y) / self.zoom)
@@ -229,10 +279,15 @@ class TopologyGraphCanvas(Gtk.Widget):
     # -------------------------------------------------------------------------
 
     def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:
-        w = float(self.get_width())
-        h = float(self.get_height())
-        if w <= 0 or h <= 0:
+        iw = self.get_width()
+        ih = self.get_height()
+        if iw <= 0 or ih <= 0:
             return
+        if (iw, ih) != self._last_canvas_size:
+            self._handle_canvas_resize(iw, ih)
+
+        w = float(iw)
+        h = float(ih)
 
         # 1. Background fill
         bounds = Graphene.Rect.alloc()
@@ -339,20 +394,68 @@ class TopologyGraphCanvas(Gtk.Widget):
         rect = Graphene.Rect.alloc()
         rect.init(node.x, node.y, node.width, node.height)
         rrect = Gsk.RoundedRect()
-        rrect.init_from_rect(rect, 9.0)
+        rrect.init_from_rect(rect, 6.0 if node.class_category == "Control" else 9.0)
 
         header_col, body_col = CATEGORY_COLORS.get(node.category, CATEGORY_COLORS["widget"])
 
         # Selection glow shadow
         if is_selected:
-            snapshot.push_shadow([Gsk.ShadowEntry(NODE_SHADOW_SELECTED, 0.0, 0.0, 14.0)] if hasattr(Gsk, "ShadowEntry") else []) if False else None
             glow_rect = Graphene.Rect.alloc()
             glow_rect.init(node.x - 4.0, node.y - 4.0, node.width + 8.0, node.height + 8.0)
             glow_rr = Gsk.RoundedRect()
-            glow_rr.init_from_rect(glow_rect, 12.0)
+            glow_rr.init_from_rect(glow_rect, 9.0 if node.class_category == "Control" else 12.0)
             snapshot.push_rounded_clip(glow_rr)
             snapshot.append_color(NODE_SHADOW_SELECTED, glow_rect)
             snapshot.pop()
+
+        if node.class_category == "Control":
+            # Compact vertical kcontrol node rendered beneath its parent widget
+            snapshot.push_rounded_clip(rrect)
+            snapshot.append_color(body_col, rect)
+
+            hdr_rect = Graphene.Rect.alloc()
+            hdr_rect.init(node.x, node.y, node.width, 18.0)
+            snapshot.append_color(header_col, hdr_rect)
+
+            # Short control type tag in top cap
+            tag_map = {
+                "control_mixer": "VOL",
+                "control_switch": "SW",
+                "control_bytes": "BYT",
+                "control_enum": "ENM",
+            }
+            tag_txt = tag_map.get(node.category, "CTL")
+            tag_layout = self._get_pango_layout(tag_txt, size_pt=6, bold=True)
+            _, tag_ext = tag_layout.get_pixel_extents()
+            snapshot.save()
+            pt = Graphene.Point.alloc()
+            pt.init(node.x + max(2.0, (node.width - float(tag_ext.width)) / 2.0), node.y + 3.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(tag_layout, TEXT_WHITE)
+            snapshot.restore()
+
+            # 90-degree rotated vertical label inside the control pill
+            v_layout = self._get_pango_layout(node.title, size_pt=7, bold=True)
+            _, v_ext = v_layout.get_pixel_extents()
+            lh = float(v_ext.height) if v_ext.height > 0 else 11.0
+            snapshot.save()
+            pt.init(node.x + (node.width + lh) / 2.0, node.y + 22.0)
+            snapshot.translate(pt)
+            snapshot.rotate(90.0)
+            snapshot.append_layout(v_layout, TEXT_WHITE)
+            snapshot.restore()
+
+            snapshot.pop()
+
+            bcol = NODE_BORDER_SELECTED if is_selected else header_col
+            bw = 2.0 if is_selected else 1.1
+            snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
+
+            for port in node.out_ports:
+                px = node.x + port.rel_x
+                py = node.y + port.rel_y
+                self._snapshot_port_circle(snapshot, px, py, header_col, radius=3.6)
+            return
 
         # Clip rounded node card
         snapshot.push_rounded_clip(rrect)
@@ -386,15 +489,53 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_layout(sub_layout, TEXT_MUTED)
         snapshot.restore()
 
-        # Badges row
-        if node.badges:
+        # Bottom row: Input audio format on bottom-left, Output audio format on bottom-right
+        by = node.y + node.height - 24.0
+        bh_px = 16.0
+        if node.in_fmt_badge or node.out_fmt_badge:
+            if node.in_fmt_badge:
+                in_layout = self._get_pango_layout(node.in_fmt_badge, size_pt=7, bold=True)
+                _, in_log = in_layout.get_pixel_extents()
+                in_bw = float(in_log.width) + 10.0
+                in_bx = node.x + 10.0
+                brect = Graphene.Rect.alloc()
+                brect.init(in_bx, by, in_bw, bh_px)
+                brr = Gsk.RoundedRect()
+                brr.init_from_rect(brect, 4.0)
+                snapshot.push_rounded_clip(brr)
+                snapshot.append_color(BADGE_BG, brect)
+                snapshot.pop()
+
+                snapshot.save()
+                pt.init(in_bx + 5.0, by + 2.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(in_layout, BADGE_FG)
+                snapshot.restore()
+
+            if node.out_fmt_badge:
+                out_layout = self._get_pango_layout(node.out_fmt_badge, size_pt=7, bold=True)
+                _, out_log = out_layout.get_pixel_extents()
+                out_bw = float(out_log.width) + 10.0
+                out_bx = node.x + node.width - out_bw - 10.0
+                brect = Graphene.Rect.alloc()
+                brect.init(out_bx, by, out_bw, bh_px)
+                brr = Gsk.RoundedRect()
+                brr.init_from_rect(brect, 4.0)
+                snapshot.push_rounded_clip(brr)
+                snapshot.append_color(BADGE_BG, brect)
+                snapshot.pop()
+
+                snapshot.save()
+                pt.init(out_bx + 5.0, by + 2.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(out_layout, BADGE_FG)
+                snapshot.restore()
+        elif node.badges:
             bx = node.x + 10.0
-            by = node.y + node.height - 24.0
             for btxt in node.badges[:2]:
                 blayout = self._get_pango_layout(btxt, size_pt=7, bold=True)
                 ink, logical = blayout.get_pixel_extents()
                 bw_px = float(logical.width) + 10.0
-                bh_px = 16.0
                 if bx + bw_px > node.x + node.width - 8.0:
                     break
                 brect = Graphene.Rect.alloc()
@@ -442,6 +583,30 @@ class TopologyGraphCanvas(Gtk.Widget):
         if not u or not v:
             return
 
+        is_sel = edge.id == self.selected_edge_id
+        if u.class_category == "Control":
+            x1 = u.x + u.width / 2.0
+            y1 = u.y
+            x2 = max(v.x + 10.0, min(v.x + v.width - 10.0, x1))
+            y2 = v.y + v.height
+            hdr_col, _ = CATEGORY_COLORS.get(u.category, CATEGORY_COLORS["control"])
+            color = EDGE_SELECTED_COLOR if is_sel else hdr_col
+            dy = max(6.0, abs(y1 - y2) * 0.45)
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(x1, y1)
+            pb.cubic_to(x1, y1 - dy, x2, y2 + dy, x2, y2)
+            stroke = Gsk.Stroke.new(2.4 if is_sel else 1.5)
+            stroke.set_dash([3.0, 2.5])
+            snapshot.append_stroke(pb.to_path(), stroke, color)
+
+            arrow_pb = Gsk.PathBuilder.new()
+            arrow_pb.move_to(x2, y2)
+            arrow_pb.line_to(x2 - 3.2, y2 + 5.5)
+            arrow_pb.line_to(x2 + 3.2, y2 + 5.5)
+            arrow_pb.close()
+            snapshot.append_fill(arrow_pb.to_path(), Gsk.FillRule.WINDING, color)
+            return
+
         u_port = u.out_ports[0] if u.out_ports else GraphPort("out0", "out", "out", rel_x=u.width, rel_y=u.height / 2.0)
         v_port = v.in_ports[0] if v.in_ports else GraphPort("in0", "in", "in", rel_x=0.0, rel_y=v.height / 2.0)
 
@@ -450,7 +615,6 @@ class TopologyGraphCanvas(Gtk.Widget):
         x2 = v.x + v_port.rel_x
         y2 = v.y + v_port.rel_y
 
-        is_sel = edge.id == self.selected_edge_id
         color = EDGE_SELECTED_COLOR if is_sel else (EDGE_INTER_COLOR if edge.is_inter_pipeline else EDGE_INTRA_COLOR)
         width = 3.2 if is_sel else (2.4 if edge.is_inter_pipeline else 2.0)
         self._snapshot_bezier_wire(snapshot, x1, y1, x2, y2, color, width=width, dashed=edge.is_inter_pipeline)
@@ -645,6 +809,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.select_node(nid)
             node = self.vm.nodes[nid]
             self._drag_node_initial = (node.x, node.y)
+            self._drag_children_initial = {
+                cid: (cnode.x, cnode.y)
+                for cid, cnode in self.vm.nodes.items()
+                if cnode.parent_node_id == nid
+            }
             return
 
         self._drag_mode = "pan"
@@ -654,13 +823,21 @@ class TopologyGraphCanvas(Gtk.Widget):
         if not self.vm:
             return
         if self._drag_mode == "pan":
+            if abs(offset_x) > 2.0 or abs(offset_y) > 2.0:
+                self._is_fitted = False
             self.pan_x = self._drag_start_pan[0] + offset_x
             self.pan_y = self._drag_start_pan[1] + offset_y
             self.queue_draw()
         elif self._drag_mode == "node" and self.selected_node_id in self.vm.nodes:
+            dx = offset_x / self.zoom
+            dy = offset_y / self.zoom
             node = self.vm.nodes[self.selected_node_id]
-            node.x = self._drag_node_initial[0] + offset_x / self.zoom
-            node.y = self._drag_node_initial[1] + offset_y / self.zoom
+            node.x = self._drag_node_initial[0] + dx
+            node.y = self._drag_node_initial[1] + dy
+            for cid, (cx0, cy0) in self._drag_children_initial.items():
+                if cid in self.vm.nodes:
+                    self.vm.nodes[cid].x = cx0 + dx
+                    self.vm.nodes[cid].y = cy0 + dy
             update_container_bounds_from_nodes(self.vm)
             self.queue_draw()
         elif self._drag_mode == "wire":
@@ -686,11 +863,17 @@ class TopologyGraphCanvas(Gtk.Widget):
         self._drag_start_pan = (self.pan_x, self.pan_y)
 
     def _on_pan_update(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
+        if abs(offset_x) > 2.0 or abs(offset_y) > 2.0:
+            self._is_fitted = False
         self.pan_x = self._drag_start_pan[0] + offset_x
         self.pan_y = self._drag_start_pan[1] + offset_y
         self.queue_draw()
 
+    def _on_motion_enter(self, controller: Gtk.EventControllerMotion, sx: float, sy: float) -> None:
+        self._pointer_pos = (sx, sy)
+
     def _on_motion(self, controller: Gtk.EventControllerMotion, sx: float, sy: float) -> None:
+        self._pointer_pos = (sx, sy)
         if not self.vm:
             return
         wx, wy = self.screen_to_world(sx, sy)
@@ -701,14 +884,23 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.queue_draw()
 
     def _on_scroll(self, controller: Gtk.EventControllerScroll, dx: float, dy: float) -> bool:
+        if dy == 0.0:
+            return False
+        self._is_fitted = False
         factor = 1.12 if dy < 0 else (1.0 / 1.12)
-        new_zoom = max(0.20, min(3.0, self.zoom * factor))
-        w = float(self.get_width()) / 2.0
-        h = float(self.get_height()) / 2.0
-        wx, wy = self.screen_to_world(w, h)
+        new_zoom = max(0.08, min(5.0, self.zoom * factor))
+
+        # Anchor zoom on the mouse pointer position
+        if self._pointer_pos is not None:
+            px, py = self._pointer_pos
+        else:
+            px = float(self.get_width()) / 2.0
+            py = float(self.get_height()) / 2.0
+
+        wx, wy = self.screen_to_world(px, py)
         self.zoom = new_zoom
-        self.pan_x = w - wx * self.zoom
-        self.pan_y = h - wy * self.zoom
+        self.pan_x = px - wx * self.zoom
+        self.pan_y = py - wy * self.zoom
         self.queue_draw()
         return True
 
@@ -768,8 +960,14 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.queue_draw()
         elif self.selected_node_id and self.selected_node_id in self.vm.nodes:
             nid = self.selected_node_id
-            del self.vm.nodes[nid]
-            self.vm.edges = [e for e in self.vm.edges if e.source_node != nid and e.sink_node != nid]
+            to_remove = {nid} | {
+                cid for cid, cn in self.vm.nodes.items() if cn.parent_node_id == nid
+            }
+            for rid in to_remove:
+                self.vm.nodes.pop(rid, None)
+            self.vm.edges = [
+                e for e in self.vm.edges if e.source_node not in to_remove and e.sink_node not in to_remove
+            ]
             self.selected_node_id = None
             self.vm.dirty = True
             update_container_bounds_from_nodes(self.vm)
@@ -805,6 +1003,18 @@ class TopologyGraphCanvas(Gtk.Widget):
         node.x = wx - node.width / 2.0
         node.y = wy - node.height / 2.0
         self.vm.nodes[node.id] = node
+        self.workspace.attach_widget_kcontrol_nodes(self.vm, node)
+        ctrls = [cnode for cnode in self.vm.nodes.values() if cnode.parent_node_id == node.id]
+        if ctrls:
+            for cnode in ctrls:
+                _compute_node_geometry(cnode)
+            row_w = sum(cnode.width for cnode in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
+            ctrl_x = node.x + (node.width - row_w) / 2.0
+            ctrl_y = node.y + node.height + CTRL_TOP_GAP
+            for cnode in ctrls:
+                cnode.x = ctrl_x
+                cnode.y = ctrl_y
+                ctrl_x += cnode.width + CTRL_H_GAP
         self.vm.dirty = True
         update_container_bounds_from_nodes(self.vm)
         self.select_node(node.id)

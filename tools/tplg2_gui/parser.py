@@ -339,6 +339,7 @@ class Topology2Workspace:
         self.global_defines.clear()
 
         # 1. Load common definitions first (so $HDA_HOST_OUTPUT_CLASS etc. are known)
+        self.global_defines["DEEP_BUF_JACK_RATE"] = "48000"
         common_defs = os.path.join(self.root_dir, "include", "common", "common_definitions.conf")
         if os.path.isfile(common_defs):
             for stmt in self.get_ast(common_defs):
@@ -434,12 +435,29 @@ class Topology2Workspace:
 
     def _expand_class_body(self, stmts: List[AstStmt], current_file: str) -> List[AstStmt]:
         result: List[AstStmt] = []
+        search_dirs = [
+            "include",
+            "include/common",
+            "include/components",
+            "include/dais",
+            "include/pipelines",
+            "include/pipelines/cavs",
+        ]
         for st in stmts:
             if st.stmt_type == "include":
-                inc_path = self.resolve_include(st.key, ["include", "include/common", "include/components", "include/pipelines"], current_file)
+                inc_path = self.resolve_include(st.key, search_dirs, current_file)
                 if inc_path:
                     result.extend(self._expand_class_body(self.get_ast(inc_path), inc_path))
             else:
+                if st.children:
+                    st = AstStmt(
+                        stmt_type=st.stmt_type,
+                        key=st.key,
+                        value=st.value,
+                        children=self._expand_class_body(st.children, current_file),
+                        doxy=st.doxy,
+                        source_file=st.source_file,
+                    )
                 result.append(st)
         return result
 
@@ -506,7 +524,9 @@ class Topology2Workspace:
                         self._populate_class_from_stmts(cdef, ch.children)
 
             elif st.stmt_type in ("block", "array") and (
-                st.key.startswith("Object.") or st.key in ("!route", "route")
+                st.key.startswith("Object.")
+                or st.key.startswith("CombineArrays.Object.")
+                or st.key in ("!route", "route")
             ):
                 self._extract_class_embedded_objects(cdef, st)
 
@@ -529,6 +549,10 @@ class Topology2Workspace:
                 rdict = {ch.key: str(ch.value) for ch in st.children if ch.stmt_type == "kv"}
                 if "source" in rdict and "sink" in rdict:
                     cdef.routes.append(rdict)
+            return
+
+        if len(parts) >= 2 and parts[0] == "CombineArrays" and parts[1] == "Object":
+            cdef.sub_objects.append(self._ast_to_config_node(st, origin="default"))
             return
 
         if len(parts) >= 2 and parts[0] == "Object":
@@ -583,22 +607,26 @@ class Topology2Workspace:
                     for cch in st.children:
                         cparts = split_dotted_key(cch.key)
                         ctype = cparts[0]
-                        cinst = cparts[1] if len(cparts) > 1 else "1"
+                        cinst = strip_quotes(cparts[1]) if len(cparts) > 1 else "1"
+                        ccfg = self._ast_to_config_node(cch, origin="default")
+                        ccfg.key = f"{ctype}.{cinst}"
                         cdef.controls.append(
                             {
                                 "control_type": ctype,
                                 "instance": cinst,
-                                "config": self._ast_to_config_node(cch, origin="default"),
+                                "config": ccfg,
                             }
                         )
                 elif len(parts) >= 3:
                     ctype = parts[2]
-                    cinst = parts[3] if len(parts) > 3 else "1"
+                    cinst = strip_quotes(parts[3]) if len(parts) > 3 else "1"
+                    ccfg = self._ast_to_config_node(st, origin="default")
+                    ccfg.key = f"{ctype}.{cinst}"
                     cdef.controls.append(
                         {
                             "control_type": ctype,
                             "instance": cinst,
-                            "config": self._ast_to_config_node(st, origin="default"),
+                            "config": ccfg,
                         }
                     )
             else:
@@ -886,6 +914,7 @@ class Topology2Workspace:
             badges.append(f"ctrls: {len(cdef.controls)}")
 
         node_id = f"{cdef.name}.1.1"
+        node_cfg = cdef.config_tree.clone()
         main_node = GraphNode(
             id=node_id,
             title=cdef.name,
@@ -897,40 +926,15 @@ class Topology2Workspace:
             pipeline_id=1,
             in_ports=in_ports,
             out_ports=out_ports,
+            in_fmt_badge=self.summarize_pin_audio_format(node_cfg, "in"),
+            out_fmt_badge=self.summarize_pin_audio_format(node_cfg, "out"),
             badges=badges,
-            config=cdef.config_tree.clone(),
+            config=node_cfg,
             class_def=cdef,
             source_file=cdef.source_file,
         )
         vm.nodes[node_id] = main_node
-
-        # Add attached control nodes so the user can inspect/edit mixer/bytes/enum controls visually
-        for idx, ctrl in enumerate(cdef.controls):
-            cid = f"control.{ctrl['control_type']}.{ctrl['instance']}.{idx}"
-            cnode = GraphNode(
-                id=cid,
-                title=f"{ctrl['control_type']}.{ctrl['instance']}",
-                subtitle="Object.Control",
-                category="control",
-                class_category="Control",
-                class_name=ctrl["control_type"],
-                instance_id=ctrl["instance"],
-                in_ports=[],
-                out_ports=[GraphPort("out0", "ctl", "out", "control")],
-                badges=[ctrl["control_type"]],
-                config=ctrl["config"].clone(),
-                source_file=cdef.source_file,
-            )
-            vm.nodes[cid] = cnode
-            vm.edges.append(
-                GraphEdge(
-                    id=f"ctl_edge_{idx}",
-                    source_node=cid,
-                    sink_node=node_id,
-                    control=ctrl["control_type"],
-                )
-            )
-
+        self.attach_widget_kcontrol_nodes(vm, main_node)
         return vm
 
     def build_graph_for_pipeline(self, pipeline_name: str, index: int = 1) -> GraphViewModel:
@@ -976,6 +980,7 @@ class Topology2Workspace:
                 source_file=pdef.source_file,
             )
             vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
             ordered_widget_ids.append(wnode.id)
 
         # Add explicit routes from the pipeline class
@@ -1116,6 +1121,7 @@ class Topology2Workspace:
                 source_file=conf_path,
             )
             vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
 
         # Resolve all collected routes into GraphEdges
         seen_edges: Set[Tuple[str, str]] = set()
@@ -1343,6 +1349,7 @@ class Topology2Workspace:
                     source_file=source_file,
                 )
                 vm.nodes[wnode.id] = wnode
+                self.attach_widget_kcontrol_nodes(vm, wnode)
 
             for rdict in pdef.routes:
                 raw_routes.append(
@@ -1370,6 +1377,7 @@ class Topology2Workspace:
                 source_file=source_file,
             )
             vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
 
     def _collect_topology_widget_stmt(
         self,
@@ -1494,27 +1502,25 @@ class Topology2Workspace:
         # Compute canonical widget name using constructor attributes (matching alsatplg pre-process-dapm.c)
         node_id = self._compute_widget_id(wclass, winst, pipeline_id, cfg, cdef)
 
-        # Determine badges (audio formats, PCM ID, stream_name, controls)
-        badges: List[str] = []
-        pcm_id = cfg.get_scalar("pcm_id")
-        if pcm_id is not None and str(pcm_id) != "":
-            badges.append(f"PCM {pcm_id}")
-        stream_name = cfg.get_scalar("stream_name")
-        if stream_name:
-            badges.append(str(stream_name))
-
-        fmt_badge = self._summarize_audio_format(cfg)
-        if fmt_badge:
-            badges.append(fmt_badge)
-
-        ctrl_node = cfg.get_child("Object.Control")
-        if ctrl_node and ctrl_node.children:
-            badges.append(f"{len(ctrl_node.children)} ctl")
+        # Determine input & output audio format badges (bottom-left = input, bottom-right = output)
+        in_fmt_badge = self.summarize_pin_audio_format(cfg, "in")
+        out_fmt_badge = self.summarize_pin_audio_format(cfg, "out")
 
         wtype = str(cfg.get_scalar("type", wclass))
         subtitle = f"{wclass} ({wtype})" if wtype != wclass else f"Widget.{wclass}"
         if pipeline_id is not None:
             subtitle = f"Pipe {pipeline_id} • {subtitle}"
+        pcm_id = cfg.get_scalar("pcm_id")
+        if pcm_id is not None and str(pcm_id) != "":
+            subtitle += f" • PCM {pcm_id}"
+        stream_name = cfg.get_scalar("stream_name")
+        if stream_name:
+            subtitle += f" ({stream_name})"
+
+        badges: List[str] = []
+        ctrl_node = cfg.get_child("Object.Control")
+        if ctrl_node and ctrl_node.children:
+            badges.append(f"{len(ctrl_node.children)} ctl")
 
         num_in = int(str(cfg.get_scalar("num_input_pins", 1) or 1))
         num_out = int(str(cfg.get_scalar("num_output_pins", 1) or 1))
@@ -1533,6 +1539,8 @@ class Topology2Workspace:
             pipeline_class=pipeline_class,
             in_ports=in_ports,
             out_ports=out_ports,
+            in_fmt_badge=in_fmt_badge,
+            out_fmt_badge=out_fmt_badge,
             badges=badges,
             config=cfg,
             class_def=cdef,
@@ -1545,6 +1553,18 @@ class Topology2Workspace:
         stmts: List[AstStmt],
         defines: Dict[str, str],
     ) -> None:
+        in_fmt_keys = {"Object.Base.input_audio_format", "CombineArrays.Object.Base.input_audio_format"}
+        out_fmt_keys = {"Object.Base.output_audio_format", "CombineArrays.Object.Base.output_audio_format"}
+        search_dirs = [
+            "include",
+            "include/common",
+            "include/components",
+            "include/controls",
+            "include/pipelines",
+            "include/pipelines/cavs",
+            "platform",
+            "platform/intel",
+        ]
         for st in stmts:
             if st.stmt_type == "kv":
                 val = self._substitute_vars(str(st.value), defines)
@@ -1556,20 +1576,143 @@ class Topology2Workspace:
                 for ch in st.children:
                     if self._key_matches(strip_quotes(ch.key), var_val):
                         if ch.stmt_type == "kv" and ch.value:
-                            cfg.set_scalar("included_param_file", str(ch.value), origin="instance")
+                            inc_str = self._substitute_vars(str(ch.value), defines)
+                            cfg.set_scalar("included_param_file", inc_str, origin="instance")
+                            inc_path = self.resolve_include(inc_str, search_dirs)
+                            if inc_path:
+                                self._apply_override_stmts_to_config(cfg, self.get_ast(inc_path), defines)
                         elif ch.stmt_type == "block":
                             self._apply_override_stmts_to_config(cfg, ch.children, defines)
                         break
             elif st.stmt_type == "include":
-                cfg.set_scalar("included_conf", st.key, origin="instance")
-            elif st.stmt_type in ("block", "array"):
-                # Replace or add compound child (e.g. Object.Base.input_audio_format, Object.Control)
-                conv = self._ast_to_config_node(st, defines, origin="instance")
-                existing_idx = next((i for i, c in enumerate(cfg.children) if c.key == conv.key), None)
-                if existing_idx is not None:
-                    cfg.children[existing_idx] = conv
+                inc_path = self.resolve_include(st.key, search_dirs)
+                if inc_path:
+                    self._apply_override_stmts_to_config(cfg, self.get_ast(inc_path), defines)
                 else:
+                    cfg.set_scalar("included_conf", st.key, origin="instance")
+            elif st.stmt_type in ("block", "array") and st.key.startswith("Object.Control"):
+                parts = split_dotted_key(st.key)
+                ctrl_group = cfg.get_child("Object.Control")
+                if ctrl_group is None:
+                    ctrl_group = ConfigNode(key="Object.Control", node_type="object", category_info="controls")
+                    cfg.children.append(ctrl_group)
+                if len(parts) == 2:
+                    for cch in st.children:
+                        cparts = split_dotted_key(cch.key)
+                        ctype = cparts[0]
+                        cinst = strip_quotes(cparts[1]) if len(cparts) > 1 else "1"
+                        ckey = f"{ctype}.{cinst}"
+                        target_ctrl = ctrl_group.get_child(ckey)
+                        if target_ctrl is None:
+                            target_ctrl = ConfigNode(key=ckey, node_type="object", category_info=f"Control.{ctype}", origin="instance")
+                            ctrl_group.children.append(target_ctrl)
+                        self._apply_override_stmts_to_config(target_ctrl, cch.children, defines)
+                elif len(parts) >= 3:
+                    ctype = parts[2]
+                    cinst = strip_quotes(parts[3]) if len(parts) > 3 else "1"
+                    ckey = f"{ctype}.{cinst}"
+                    target_ctrl = ctrl_group.get_child(ckey)
+                    if target_ctrl is None:
+                        target_ctrl = ConfigNode(key=ckey, node_type="object", category_info=f"Control.{ctype}", origin="instance")
+                        ctrl_group.children.append(target_ctrl)
+                    self._apply_override_stmts_to_config(target_ctrl, st.children, defines)
+            elif st.stmt_type in ("block", "array"):
+                # Replace or add compound child (e.g. Object.Base.input_audio_format, Object.Base.tlv)
+                conv = self._ast_to_config_node(st, defines, origin="instance")
+                if conv.key in in_fmt_keys:
+                    cfg.children = [c for c in cfg.children if c.key not in in_fmt_keys]
                     cfg.children.append(conv)
+                elif conv.key in out_fmt_keys:
+                    cfg.children = [c for c in cfg.children if c.key not in out_fmt_keys]
+                    cfg.children.append(conv)
+                else:
+                    existing_idx = next((i for i, c in enumerate(cfg.children) if c.key == conv.key), None)
+                    if existing_idx is not None:
+                        cfg.children[existing_idx] = conv
+                    else:
+                        cfg.children.append(conv)
+
+    def attach_widget_kcontrol_nodes(self, vm: GraphViewModel, parent_node: GraphNode) -> None:
+        """Instantiate child kcontrol GraphNodes below parent_node for each control in Object.Control."""
+        ctrl_group = parent_node.config.get_child("Object.Control")
+        if not ctrl_group or not ctrl_group.children:
+            return
+
+        ctrl_cat_map = {
+            "mixer": "control_mixer",
+            "bytes": "control_bytes",
+            "enum": "control_enum",
+        }
+
+        for idx, ctrl_cfg in enumerate(ctrl_group.children):
+            cparts = split_dotted_key(ctrl_cfg.key)
+            ctype = cparts[0] if cparts else "mixer"
+            cinst = strip_quotes(cparts[1]) if len(cparts) > 1 else str(idx + 1)
+            node_cat = ctrl_cat_map.get(ctype, "control")
+
+            kname = str(ctrl_cfg.get_scalar("name", "")).strip()
+            title = f"{ctype}.{cinst}: {kname}" if kname else f"{ctype}.{cinst}"
+
+            badges: List[str] = []
+            if ctype == "mixer":
+                max_val = str(ctrl_cfg.get_scalar("max", "")).strip()
+                is_switch = max_val == "1"
+                if is_switch:
+                    node_cat = "control_switch"
+                subtitle = f"Control.mixer ({'Switch' if is_switch else 'Volume'})"
+                if max_val:
+                    badges.append(f"max {max_val}")
+                if any(c.key.startswith("Object.Base.tlv") for c in ctrl_cfg.children):
+                    badges.append("TLV")
+            elif ctype == "bytes":
+                subtitle = "Control.bytes (TLV/Blob)"
+                pfile = str(ctrl_cfg.get_scalar("included_param_file", "")).strip()
+                max_val = str(ctrl_cfg.get_scalar("max", "")).strip()
+                if pfile:
+                    badges.append(os.path.basename(pfile))
+                if max_val:
+                    badges.append(f"max {max_val}")
+            elif ctype == "enum":
+                subtitle = "Control.enum (Enum)"
+                badges.append("enum")
+            else:
+                subtitle = f"Control.{ctype}"
+                badges.append(ctype)
+
+            if not badges:
+                badges.append(ctype)
+
+            cid = f"{parent_node.id}.ctl.{ctype}.{cinst}"
+            cnode = GraphNode(
+                id=cid,
+                title=title,
+                subtitle=subtitle,
+                category=node_cat,
+                class_category="Control",
+                class_name=ctype,
+                instance_id=cinst,
+                pipeline_id=parent_node.pipeline_id,
+                pipeline_class=parent_node.pipeline_class,
+                parent_node_id=parent_node.id,
+                in_ports=[],
+                out_ports=[GraphPort("ctl_out", "ctl", "out", "control")],
+                badges=badges,
+                config=ctrl_cfg,
+                class_def=self.base_classes.get(f"Control.{ctype}"),
+                source_file=parent_node.source_file,
+            )
+            vm.nodes[cid] = cnode
+            vm.edges.append(
+                GraphEdge(
+                    id=f"ctl_edge_{parent_node.id}_{ctype}_{cinst}",
+                    source_node=cid,
+                    sink_node=parent_node.id,
+                    source_port="ctl_out",
+                    sink_port="ctl_in",
+                    control=ctype,
+                    pipeline_id=parent_node.pipeline_id,
+                )
+            )
 
     def _compute_widget_id(
         self,
@@ -1594,20 +1737,73 @@ class Topology2Workspace:
         return f"{wclass}.{idx_s}.{winst}"
 
     @staticmethod
-    def _summarize_audio_format(cfg: ConfigNode) -> str:
-        for fmt_key in ("Object.Base.output_audio_format", "Object.Base.input_audio_format"):
-            fnode = cfg.get_child(fmt_key)
-            if fnode and fnode.children:
-                first = fnode.children[0]
-                bits = first.get_scalar("out_bit_depth", first.get_scalar("in_bit_depth", "32"))
-                vbits = first.get_scalar("out_valid_bit_depth", first.get_scalar("in_valid_bit_depth", bits))
-                rate = first.get_scalar("out_rate", first.get_scalar("in_rate", "48000"))
-                ch = first.get_scalar("out_channels", first.get_scalar("in_channels", "2"))
-                rate_khz = f"{int(rate)//1000}k" if str(rate).isdigit() else str(rate)
-                if str(bits) != str(vbits):
-                    return f"s{vbits}/{bits} {rate_khz} {ch}ch"
-                return f"s{bits} {rate_khz} {ch}ch"
-        return ""
+    def summarize_pin_audio_format(cfg: ConfigNode, direction: str) -> str:
+        """Summarize min/max rates, channels, and sample format for 'in' or 'out' audio_format."""
+        prefix = "in" if direction == "in" else "out"
+        target_keys = (
+            ("Object.Base.input_audio_format", "CombineArrays.Object.Base.input_audio_format")
+            if direction == "in"
+            else ("Object.Base.output_audio_format", "CombineArrays.Object.Base.output_audio_format")
+        )
+        fnodes = [c for c in cfg.children if c.key in target_keys and c.children]
+        if not fnodes:
+            return ""
+
+        def extract_ints(entry: ConfigNode, field_name: str, default_val: int) -> List[int]:
+            ch = entry.get_child(field_name)
+            if ch is None:
+                return [default_val]
+            if ch.node_type == "scalar":
+                s = str(ch.value).strip()
+                return [int(s)] if s.isdigit() else [default_val]
+            vals: List[int] = []
+            for item in ch.children:
+                cand = str(item.key if item.key else item.value).strip()
+                if cand.isdigit():
+                    vals.append(int(cand))
+            return vals if vals else [default_val]
+
+        def fmt_khz(hz: int) -> str:
+            if hz % 1000 == 0:
+                return f"{hz // 1000}k"
+            return f"{hz / 1000:.1f}k".rstrip("0").rstrip(".")
+
+        rates: List[int] = []
+        chans: List[int] = []
+        depths: List[Tuple[int, int, str]] = []
+
+        for fnode in fnodes:
+            for entry in fnode.children:
+                rates.extend(extract_ints(entry, f"{prefix}_rate", 48000))
+                chans.extend(extract_ints(entry, f"{prefix}_channels", 2))
+                b_list = extract_ints(entry, f"{prefix}_bit_depth", 16)
+                has_vb = entry.get_child(f"{prefix}_valid_bit_depth") is not None
+                vb_list = extract_ints(entry, f"{prefix}_valid_bit_depth", b_list[0]) if has_vb else list(b_list)
+                st_str = str(entry.get_scalar(f"{prefix}_sample_type", "")).upper()
+                sp = "f" if "FLOAT" in st_str else ("u" if "UNSIGNED" in st_str else "s")
+                for b in b_list:
+                    for vb in vb_list:
+                        depths.append((vb, b, sp))
+
+        if not rates or not chans or not depths:
+            return ""
+
+        unique_depths = sorted(set(depths), key=lambda t: (t[0], t[1]))
+        if len(unique_depths) == 1:
+            vb, b, sp = unique_depths[0]
+            fmt_str = f"{sp}{vb}/{b}" if vb != b else f"{sp}{vb}"
+        else:
+            min_vb, _, min_sp = unique_depths[0]
+            max_vb, _, max_sp = unique_depths[-1]
+            fmt_str = f"{min_sp}{min_vb}-{max_sp}{max_vb}" if (min_vb != max_vb or min_sp != max_sp) else f"{min_sp}{min_vb}"
+
+        min_r, max_r = min(rates), max(rates)
+        rate_str = fmt_khz(min_r) if min_r == max_r else f"{fmt_khz(min_r)}-{fmt_khz(max_r)}"
+
+        min_c, max_c = min(chans), max(chans)
+        ch_str = f"{min_c}ch" if min_c == max_c else f"{min_c}-{max_c}ch"
+
+        return f"{fmt_str} {rate_str} {ch_str}"
 
     @staticmethod
     def _match_widget_id(

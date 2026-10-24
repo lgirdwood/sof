@@ -171,12 +171,15 @@ class GraphNode:
     instance_id: str = "1"
     pipeline_id: Optional[int] = None
     pipeline_class: Optional[str] = None
+    parent_node_id: Optional[str] = None
     x: float = 0.0
     y: float = 0.0
     width: float = 190.0
     height: float = 86.0
     in_ports: List[GraphPort] = field(default_factory=list)
     out_ports: List[GraphPort] = field(default_factory=list)
+    in_fmt_badge: str = ""
+    out_fmt_badge: str = ""
     badges: List[str] = field(default_factory=list)
     config: ConfigNode = field(default_factory=lambda: ConfigNode("attributes", node_type="object"))
     class_def: Optional[TplgClassDef] = None

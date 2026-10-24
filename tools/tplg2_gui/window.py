@@ -18,7 +18,7 @@ from gi.repository import Gio, GLib, Gtk
 
 from .compiler import CompileResult, TopologyCompiler
 from .graph_canvas import TopologyGraphCanvas
-from .layout import layout_graph
+from .layout import _compute_node_geometry, layout_graph
 from .left_panes import LeftNavigationPanel
 from .model import ConfigNode, GraphViewModel
 from .parser import Topology2Workspace
@@ -39,6 +39,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.tb_runner: Optional[TestbenchRunner] = None
         self.last_compiled_tplg: Optional[str] = None
         self.last_output_wav: Optional[str] = None
+        self._last_allocated_width: int = 0
+        self._last_allocated_height: int = 0
 
         self._build_header_bar()
         self._build_main_3panel_layout()
@@ -121,15 +123,19 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         header.pack_end(self.sig_combo)
 
     def _build_main_3panel_layout(self) -> None:
-        # Outer horizontal paned: [Left Panel] | [Center + Right Paned]
+        # Outer horizontal paned: [Left Panel (25%)] | [Center (50%) + Right (25%) Paned]
         self.hpaned_outer = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         self.hpaned_outer.set_wide_handle(True)
-        self.hpaned_outer.set_position(410)
+        self.hpaned_outer.set_resize_start_child(False)
+        self.hpaned_outer.set_resize_end_child(True)
+        self.hpaned_outer.set_position(390)
 
-        # Inner horizontal paned: [Middle Graph Panel] | [Right Attribute Inspector]
+        # Inner horizontal paned: [Middle Graph Panel (50%)] | [Right Attribute Inspector (25%)]
         self.hpaned_inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         self.hpaned_inner.set_wide_handle(True)
-        self.hpaned_inner.set_position(740)
+        self.hpaned_inner.set_resize_start_child(True)
+        self.hpaned_inner.set_resize_end_child(False)
+        self.hpaned_inner.set_position(780)
 
         # 1. Left Hand Panel (4 vertical sub-panes) wrapped in high-level panel border
         self.left_panel = LeftNavigationPanel(
@@ -145,11 +151,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         left_panel_frame.set_child(self.left_panel)
 
         # 2. Middle Horizontal Panel (Graph Canvas + Bottom Testbench/Compiler Drawer)
-        center_vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        center_vpaned.set_wide_handle(True)
-        center_vpaned.set_vexpand(True)
-        center_vpaned.set_hexpand(True)
-        center_vpaned.set_position(620)
+        self.center_vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        self.center_vpaned.set_wide_handle(True)
+        self.center_vpaned.set_vexpand(True)
+        self.center_vpaned.set_hexpand(True)
+        self.center_vpaned.set_resize_start_child(True)
+        self.center_vpaned.set_resize_end_child(False)
+        self.center_vpaned.set_position(640)
 
         self.canvas = TopologyGraphCanvas(
             on_selection_changed=self._on_canvas_selection_changed,
@@ -158,7 +166,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         canvas_frame = Gtk.Frame()
         canvas_frame.add_css_class("sub-panel-frame")
         canvas_frame.set_child(self.canvas)
-        center_vpaned.set_start_child(canvas_frame)
+        self.center_vpaned.set_start_child(canvas_frame)
 
         # Bottom drawer: Waveform comparison + Compiler/Testbench console log
         bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -200,7 +208,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         bottom_drawer_frame = Gtk.Frame()
         bottom_drawer_frame.add_css_class("sub-panel-frame")
         bottom_drawer_frame.set_child(bottom_box)
-        center_vpaned.set_end_child(bottom_drawer_frame)
+        self.center_vpaned.set_end_child(bottom_drawer_frame)
 
         center_panel_frame = Gtk.Frame()
         center_panel_frame.add_css_class("high-level-panel")
@@ -208,7 +216,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         center_panel_frame.set_margin_end(2)
         center_panel_frame.set_margin_top(4)
         center_panel_frame.set_margin_bottom(4)
-        center_panel_frame.set_child(center_vpaned)
+        center_panel_frame.set_child(self.center_vpaned)
 
         # 3. Right Hand Panel (Tree View of Attributes of Selected Graph Node)
         self.right_inspector = RightAttributeInspector(
@@ -227,8 +235,34 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         self.hpaned_outer.set_start_child(left_panel_frame)
         self.hpaned_outer.set_end_child(self.hpaned_inner)
+        self.hpaned_outer.add_tick_callback(self._on_outer_paned_tick)
 
         self.set_child(self.hpaned_outer)
+
+    def _on_outer_paned_tick(self, widget: Gtk.Widget, _frame_clock: object) -> bool:
+        """Keep default horizontal split at 25% Left / 50% Main Graph / 25% Right when UI resizes."""
+        total_w = widget.get_width()
+        total_h = widget.get_height()
+        if total_w > 100 and total_h > 100 and (
+            total_w != self._last_allocated_width or total_h != self._last_allocated_height
+        ):
+            self._last_allocated_width = total_w
+            self._last_allocated_height = total_h
+            target_left = int(total_w * 0.25)
+            target_center = int(total_w * 0.50)
+            target_vpos = int(total_h * 0.72)
+            self.hpaned_outer.set_position(target_left)
+            self.hpaned_inner.set_position(target_center)
+            self.center_vpaned.set_position(target_vpos)
+            GLib.idle_add(self._sync_inner_paned_position, target_left, target_center, target_vpos)
+        return GLib.SOURCE_CONTINUE
+
+    def _sync_inner_paned_position(self, target_left: int, target_center: int, target_vpos: int) -> bool:
+        self.hpaned_outer.set_position(target_left)
+        self.hpaned_inner.set_position(target_center)
+        self.center_vpaned.set_position(target_vpos)
+        self.canvas.queue_draw()
+        return False
 
     # -------------------------------------------------------------------------
     # Workspace Loading & Left Pane Selection Handling
@@ -314,11 +348,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.canvas.vm:
             return
         self.canvas.vm.dirty = True
-        # Update node badge if format or stream_name changed
+        # Update node input/output format badges and geometry if format or stream_name changed
         if self.canvas.selected_node_id and self.canvas.selected_node_id in self.canvas.vm.nodes:
             node = self.canvas.vm.nodes[self.canvas.selected_node_id]
-            if key == "stream_name":
-                node.badges = [new_val] + [b for b in node.badges[:1]]
+            node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
+            node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
+            _compute_node_geometry(node)
         self.canvas.queue_draw()
         self.status_lbl.set_text(f"Updated attribute '{key}' = '{new_val}'")
 
