@@ -640,9 +640,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         dashed: bool = False,
     ) -> None:
         dx = max(45.0, abs(x2 - x1) * 0.48)
+        sign = 1.0 if x2 >= x1 else -1.0
         pb = Gsk.PathBuilder.new()
         pb.move_to(x1, y1)
-        pb.cubic_to(x1 + dx, y1, x2 - dx, y2, x2, y2)
+        pb.cubic_to(x1 + sign * dx, y1, x2 - sign * dx, y2, x2, y2)
         path = pb.to_path()
 
         stroke = Gsk.Stroke.new(width)
@@ -650,11 +651,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             stroke.set_dash([7.0, 4.0])
         snapshot.append_stroke(path, stroke, color)
 
-        # Draw arrowhead at (x2, y2)
+        # Draw arrowhead at (x2, y2) pointing along the flow direction
         arrow_pb = Gsk.PathBuilder.new()
         arrow_pb.move_to(x2, y2)
-        arrow_pb.line_to(x2 - 9.0, y2 - 4.5)
-        arrow_pb.line_to(x2 - 9.0, y2 + 4.5)
+        arrow_pb.line_to(x2 - sign * 9.0, y2 - 4.5)
+        arrow_pb.line_to(x2 - sign * 9.0, y2 + 4.5)
         arrow_pb.close()
         snapshot.append_fill(arrow_pb.to_path(), Gsk.FillRule.WINDING, color)
 
@@ -728,11 +729,12 @@ class TopologyGraphCanvas(Gtk.Widget):
             x2 = v.x + v_port.rel_x
             y2 = v.y + v_port.rel_y
             dx = max(45.0, abs(x2 - x1) * 0.48)
+            sign = 1.0 if x2 >= x1 else -1.0
             # Sample 16 points along cubic Bezier
             for step in range(17):
                 t = step / 16.0
                 mt = 1.0 - t
-                bx = (mt**3) * x1 + 3 * (mt**2) * t * (x1 + dx) + 3 * mt * (t**2) * (x2 - dx) + (t**3) * x2
+                bx = (mt**3) * x1 + 3 * (mt**2) * t * (x1 + sign * dx) + 3 * mt * (t**2) * (x2 - sign * dx) + (t**3) * x2
                 by = (mt**3) * y1 + 3 * (mt**2) * t * y1 + 3 * mt * (t**2) * y2 + (t**3) * y2
                 if math.hypot(wx - bx, wy - by) <= threshold:
                     return edge.id

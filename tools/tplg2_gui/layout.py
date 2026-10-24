@@ -23,20 +23,42 @@ CONTAINER_GAP_X = 95.0
 CONTAINER_GAP_Y = 48.0
 
 
+def _is_node_capture(vm: GraphViewModel, node: GraphNode) -> bool:
+    if node.pipeline_id is not None and node.pipeline_id in vm.containers:
+        if "capture" in vm.containers[node.pipeline_id].direction.lower():
+            return True
+    if "capture" in node.id.lower() or "capture" in node.subtitle.lower():
+        return True
+    wdir = str(node.config.get_scalar("direction", "")).lower()
+    wtype = str(node.config.get_scalar("type", "")).lower()
+    if wdir == "capture" or wtype == "dai_out":
+        return True
+    return "capture" in vm.title.lower()
+
+
 def layout_graph(vm: GraphViewModel) -> None:
     """Compute (x, y, width, height) for all nodes, ports, and pipeline containers in vm."""
     if not vm.nodes:
         return
 
-    # 1. Size each node and position its ports
+    # Propagate capture direction to any container that holds capture nodes
     for node in vm.nodes.values():
-        _compute_node_geometry(node)
+        if node.pipeline_id is not None and node.pipeline_id in vm.containers:
+            wdir = str(node.config.get_scalar("direction", "")).lower()
+            wtype = str(node.config.get_scalar("type", "")).lower()
+            if "capture" in node.id.lower() or wdir == "capture" or wtype == "dai_out":
+                vm.containers[node.pipeline_id].direction = "capture"
+
+    # 1. Size each node and position its ports (Playback: in=left/out=right, Capture: in=right/out=left)
+    for node in vm.nodes.values():
+        _compute_node_geometry(node, is_capture=_is_node_capture(vm, node))
 
     # 2. If there are pipeline containers and multiple nodes, layout per pipeline container
     if vm.containers and vm.view_kind in ("topology", "pipeline"):
         _layout_with_containers(vm)
     else:
-        _layout_flat_dag(vm, list(vm.nodes.keys()), start_x=60.0, start_y=60.0)
+        any_cap = any(_is_node_capture(vm, n) for n in vm.nodes.values() if n.class_category != "Control")
+        _layout_flat_dag(vm, list(vm.nodes.keys()), start_x=60.0, start_y=60.0, is_capture=any_cap)
 
     # 3. Assign distinct source/sink pins to multi-edge nodes ordered top-to-bottom to avoid pin collisions
     _assign_edge_ports(vm)
@@ -88,7 +110,7 @@ def _assign_edge_ports(vm: GraphViewModel) -> None:
             edge.sink_port = v.in_ports[port_idx].id
 
 
-def _compute_node_geometry(node: GraphNode) -> None:
+def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
     if node.class_category == "Control":
         node.width = CONTROL_WIDTH
         node.height = max(CONTROL_MIN_HEIGHT, min(175.0, len(node.title) * 6.0 + 30.0))
@@ -114,16 +136,19 @@ def _compute_node_geometry(node: GraphNode) -> None:
     node.width = max(NODE_WIDTH, title_w, sub_w, badge_w, fmt_row_w)
     node.height = max(NODE_BASE_HEIGHT, 54.0 + num_ports * 18.0 + badge_extra)
 
-    # Position input ports along left edge
+    # Playback flows Left -> Right (in_ports on left, out_ports on right).
+    # Capture flows Right -> Left from DAI/ALH on right to Host on left (in_ports on right, out_ports on left).
+    in_x = node.width if is_capture else 0.0
+    out_x = 0.0 if is_capture else node.width
+
     in_count = len(node.in_ports)
     for i, port in enumerate(node.in_ports):
-        port.rel_x = 0.0
+        port.rel_x = in_x
         port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / max(in_count, 1))
 
-    # Position output ports along right edge
     out_count = len(node.out_ports)
     for i, port in enumerate(node.out_ports):
-        port.rel_x = node.width
+        port.rel_x = out_x
         port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / max(out_count, 1))
 
 
@@ -169,9 +194,10 @@ def _layout_flat_dag(
     node_ids: List[str],
     start_x: float = 60.0,
     start_y: float = 60.0,
+    is_capture: bool = False,
 ) -> Tuple[float, float]:
-    """Layout a subset of nodes as a left-to-right DAG starting at (start_x, start_y),
-    with any kcontrol nodes stacked directly below their parent widget node.
+    """Layout a subset of nodes into left-to-right columns starting at (start_x, start_y),
+    with host-copiers on the left, dai/alh-copiers on the right, and kcontrol nodes below their parent.
     Returns (total_width, total_height).
     """
     if not node_ids:
@@ -192,25 +218,34 @@ def _layout_flat_dag(
         main_ids = list(node_ids)
         ctrl_by_parent.clear()
 
-    # Heuristic source/sink ordering hint so host-copier/mixout starts on left and mixin/dai-copier ends on right
+    # Keep host-copier on the left (rank 1) and dai-copier/alh-copier on the right (rank 4)
     def node_role_rank(nid: str) -> int:
         n = vm.nodes[nid]
         if n.class_category == "Control":
             return 0
-        if n.class_name in ("host-copier", "mixout") and "capture" not in nid:
+        if "host-copier" in n.class_name:
             return 1
-        if n.class_name == "dai-copier" and "capture" in nid:
+        if n.class_name == "mixout":
             return 1
-        if n.class_name in ("mixin", "module-copier"):
+        if n.class_name == "module-copier":
+            return 1 if is_capture else 3
+        if n.class_name == "mixin":
             return 3
-        if n.class_name == "dai-copier" and "playback" in nid:
-            return 4
-        if n.class_name == "host-copier" and "capture" in nid:
+        if "dai-copier" in n.class_name or "alh-copier" in n.class_name:
             return 4
         return 2
 
     ordered_ids = sorted(main_ids, key=lambda nid: (node_role_rank(nid), nid))
-    layers = _compute_dag_layers(ordered_ids, vm.edges)
+    if is_capture:
+        # In Capture, audio flows from DAI/ALH (right) -> Host (left), so reverse edge direction
+        # when assigning left-to-right columns so Host/module-copier is on the left and DAI/ALH is on the right.
+        dag_edges = [
+            GraphEdge(id=e.id, source_node=e.sink_node, sink_node=e.source_node)
+            for e in vm.edges
+        ]
+    else:
+        dag_edges = vm.edges
+    layers = _compute_dag_layers(ordered_ids, dag_edges)
 
     def group_width(nid: str) -> float:
         w = vm.nodes[nid].width
@@ -284,15 +319,16 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
             container.height = NODE_BASE_HEIGHT + CONTAINER_PAD_TOP + CONTAINER_PAD_BOTTOM
             container_sizes[pid] = (container.width, container.height)
             continue
-        inner_w, inner_h = _layout_flat_dag(vm, member_ids, start_x=0.0, start_y=0.0)
+        inner_is_cap = "capture" in container.direction.lower()
+        inner_w, inner_h = _layout_flat_dag(vm, member_ids, start_x=0.0, start_y=0.0, is_capture=inner_is_cap)
         container.width = max(inner_w + 2 * CONTAINER_PAD_X, min_header_w)
         container.height = inner_h + CONTAINER_PAD_TOP + CONTAINER_PAD_BOTTOM
         container_sizes[pid] = (container.width, container.height)
 
-    # Build inter-pipeline DAG to arrange FE and BE containers left-to-right
+    # Build inter-pipeline DAG to arrange FE (host-copier on left) and BE (dai/alh-copier on right) columns
     pipe_ids = sorted(vm.containers.keys())
     pipe_adj: Dict[int, Set[int]] = defaultdict(set)
-    pipe_in_deg: Dict[int, int] = {pid: 0 for pid in pipe_ids}
+    undirected: Dict[int, Set[int]] = defaultdict(set)
 
     for e in vm.edges:
         u_node = vm.nodes.get(e.source_node)
@@ -301,27 +337,18 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
             up = u_node.pipeline_id
             vp = v_node.pipeline_id
             if up != vp and up in vm.containers and vp in vm.containers:
-                if vp not in pipe_adj[up]:
-                    pipe_adj[up].add(vp)
-                    pipe_in_deg[vp] += 1
+                pipe_adj[up].add(vp)
+                undirected[up].add(vp)
+                undirected[vp].add(up)
 
-    # Assign each pipeline container to a column (0 = upstream/FE, 1 = downstream/BE)
-    pipe_col: Dict[int, int] = {pid: 0 for pid in pipe_ids}
-    q = deque([pid for pid in pipe_ids if pipe_in_deg[pid] == 0])
-    while q:
-        u = q.popleft()
-        for v in sorted(pipe_adj[u]):
-            pipe_col[v] = max(pipe_col[v], pipe_col[u] + 1)
-            pipe_in_deg[v] -= 1
-            if pipe_in_deg[v] == 0:
-                q.append(v)
+    def pipe_has_dai(pid: int) -> bool:
+        return any(
+            "dai-copier" in vm.nodes[nid].class_name or "alh-copier" in vm.nodes[nid].class_name
+            for nid in by_pipe.get(pid, [])
+        )
 
-    # Group connected pipelines into horizontal rows (connected components) so paired FE/BE sit side-by-side
-    undirected: Dict[int, Set[int]] = defaultdict(set)
-    for u, vs in pipe_adj.items():
-        for v in vs:
-            undirected[u].add(v)
-            undirected[v].add(u)
+    def pipe_has_host(pid: int) -> bool:
+        return any("host-copier" in vm.nodes[nid].class_name for nid in by_pipe.get(pid, []))
 
     visited_pipes: Set[int] = set()
     components: List[List[int]] = []
@@ -340,6 +367,42 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
                     dq.append(nb)
         components.append(sorted(comp))
 
+    # Compute left-to-right column index per component so Host pipelines are always on the left
+    # and DAI/ALH pipelines are always on the right (for both Playback and Capture).
+    pipe_col: Dict[int, int] = {pid: 0 for pid in pipe_ids}
+    for comp in components:
+        comp_is_cap = any("capture" in vm.containers[p].direction.lower() for p in comp)
+        adj_in_comp: Dict[int, Set[int]] = defaultdict(set)
+        in_deg: Dict[int, int] = {p: 0 for p in comp}
+        for u in comp:
+            for v in pipe_adj[u]:
+                if v in in_deg:
+                    if comp_is_cap:
+                        # Reverse capture inter-pipeline edge so Host (sink) is column 0 (left)
+                        # and DAI/ALH (source) is the rightmost column.
+                        adj_in_comp[v].add(u)
+                        in_deg[u] += 1
+                    else:
+                        adj_in_comp[u].add(v)
+                        in_deg[v] += 1
+
+        q = deque([p for p in comp if in_deg[p] == 0])
+        while q:
+            u = q.popleft()
+            for v in sorted(adj_in_comp[u]):
+                pipe_col[v] = max(pipe_col[v], pipe_col[u] + 1)
+                in_deg[v] -= 1
+                if in_deg[v] == 0:
+                    q.append(v)
+
+        # Ensure standalone DAI/ALH-only pipelines sit on the right-hand column (column 1)
+        if len(comp) == 1 and pipe_has_dai(comp[0]) and not pipe_has_host(comp[0]):
+            pipe_col[comp[0]] = 1
+
+    default_col0_w = max(
+        (vm.containers[p].width for p in pipe_ids if pipe_col[p] == 0),
+        default=440.0,
+    )
     cur_row_y = 50.0
     for comp in components:
         # Group pipelines in this connected component by their column
@@ -349,6 +412,8 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
 
         max_comp_h = 0.0
         col_x = 50.0
+        if 0 not in cols and max(cols.keys(), default=0) >= 1:
+            col_x += default_col0_w + CONTAINER_GAP_X
         for c_idx in sorted(cols.keys()):
             pids_in_col = cols[c_idx]
             col_w = max(vm.containers[p].width for p in pids_in_col)
