@@ -2171,19 +2171,23 @@ class Topology2Workspace:
         cfg: ConfigNode,
         cdef: Optional[TplgClassDef],
     ) -> str:
+        explicit_name = str(cfg.get_scalar("name", "")).strip()
+        if explicit_name:
+            return explicit_name
+        inst_val = str(cfg.get_scalar("instance", winst)).strip() or str(winst)
         if cdef and cdef.constructor_attrs:
             parts = [wclass]
             for attr in cdef.constructor_attrs:
                 if attr == "index" and pipeline_id is not None:
                     parts.append(str(pipeline_id))
                 elif attr == "instance":
-                    parts.append(str(winst))
+                    parts.append(inst_val)
                 else:
                     val = cfg.get_scalar(attr, "")
-                    parts.append(str(val) if val != "" else str(winst))
+                    parts.append(str(val) if val != "" else inst_val)
             return ".".join(parts)
         idx_s = str(pipeline_id) if pipeline_id is not None else "0"
-        return f"{wclass}.{idx_s}.{winst}"
+        return f"{wclass}.{idx_s}.{inst_val}"
 
     @staticmethod
     def summarize_pin_audio_format(cfg: ConfigNode, direction: str) -> str:
