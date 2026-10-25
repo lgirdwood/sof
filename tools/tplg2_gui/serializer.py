@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 import os
+import re
 from typing import Dict, List, Set, Tuple
 
 from .model import ConfigNode, GraphNode, GraphViewModel
@@ -62,6 +63,154 @@ def serialize_config_node(node: ConfigNode, indent: int = 0) -> str:
     return "".join(lines)
 
 
+def _extract_active_pipeline_ids(vm: GraphViewModel) -> List[int]:
+    """Return the active testbench pipeline IDs from the enabled TestbenchIO node or containers."""
+    for target_cls in ("testbench-source", "testbench-sink"):
+        for node in vm.nodes.values():
+            if (
+                node.class_category == "TestbenchIO"
+                and node.class_name == target_cls
+                and str(node.config.get_scalar("enabled", "false")).lower() == "true"
+            ):
+                tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
+                if tp_str:
+                    pids = [int(m) for m in re.findall(r"\d+", tp_str)]
+                    if pids:
+                        return pids
+
+    pipe_ids = sorted(vm.containers.keys())
+    if 1 in pipe_ids and 2 in pipe_ids:
+        return [1, 2]
+    if 0 in pipe_ids and 1 in pipe_ids:
+        return [0, 1]
+    if len(pipe_ids) >= 2:
+        return pipe_ids[:2]
+    if len(pipe_ids) == 1:
+        return pipe_ids
+    return [1, 2]
+
+
+def _has_structural_or_param_edits(vm: GraphViewModel) -> bool:
+    """Return True if modules, routes, or control_bytes parameter files were modified on a topology graph."""
+    if getattr(vm, "graph_structure_modified", False):
+        return True
+    if any(e.id.startswith("user_edge_") for e in vm.edges):
+        return True
+    if any(
+        c.class_name == "custom" or c.enabled_by == "Added from Object View"
+        for c in vm.containers.values()
+    ):
+        return True
+    return False
+
+
+def _extract_ordered_proc_nodes(vm: GraphViewModel, active_pids: List[int]) -> List[GraphNode]:
+    """Extract processing Widget nodes along the active pipeline chain in signal-flow order."""
+    from collections import deque
+
+    copier_classes = {
+        "host-copier",
+        "dai-copier",
+        "alh-dai-copier",
+        "alh-copier",
+        "mixin",
+        "mixout",
+        "module-copier",
+        "pipeline",
+        "virtual",
+    }
+
+    def is_proc_widget(n: GraphNode) -> bool:
+        return n.class_category == "Widget" and n.class_name not in copier_classes
+
+    # Build adjacency map from audio/TestbenchIO edges
+    adj: Dict[str, List[str]] = {}
+    for e in vm.edges:
+        u = vm.nodes.get(e.source_node)
+        v = vm.nodes.get(e.sink_node)
+        if not u or not v:
+            continue
+        if u.class_category == "Control" or v.class_category == "Control":
+            continue
+        adj.setdefault(u.id, []).append(v.id)
+
+    ordered: List[GraphNode] = []
+    visited_nids: Set[str] = set()
+
+    # 1. Start BFS/walk from enabled testbench-source node(s)
+    enabled_sources = [
+        n for n in vm.nodes.values()
+        if n.class_category == "TestbenchIO"
+        and n.class_name == "testbench-source"
+        and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+    ]
+    queue: deque[str] = deque()
+    for snode in enabled_sources:
+        queue.append(snode.id)
+        if snode.parent_node_id and snode.parent_node_id in vm.nodes:
+            queue.append(snode.parent_node_id)
+
+    while queue:
+        curr_id = queue.popleft()
+        if curr_id in visited_nids:
+            continue
+        visited_nids.add(curr_id)
+        curr_node = vm.nodes.get(curr_id)
+        if curr_node and is_proc_widget(curr_node):
+            ordered.append(curr_node)
+        for nxt_id in adj.get(curr_id, []):
+            if nxt_id not in visited_nids:
+                queue.append(nxt_id)
+
+    # 2. Include any additional processing widgets in active_pids (or custom pipelines, or all if non-topology)
+    target_pid_set = set(active_pids)
+    for pid, cont in vm.containers.items():
+        if cont.class_name == "custom" or cont.enabled_by == "Added from Object View":
+            target_pid_set.add(pid)
+
+    remaining: List[GraphNode] = []
+    for node in vm.nodes.values():
+        if not is_proc_widget(node) or node in ordered:
+            continue
+        if vm.view_kind != "topology" or not target_pid_set or node.pipeline_id in target_pid_set:
+            remaining.append(node)
+
+    if remaining:
+        def _sort_key(n: GraphNode) -> Tuple[int, float]:
+            pid = n.pipeline_id if n.pipeline_id is not None else 0
+            cont = vm.containers.get(pid)
+            is_cap = bool(cont and "capture" in cont.direction.lower())
+            return (pid, -n.x if is_cap else n.x)
+
+        remaining.sort(key=_sort_key)
+        ordered.extend(remaining)
+
+    return ordered
+
+
+def _resolve_bytes_param_include(
+    pfile: str,
+    wclass: str,
+    topology2_root: str,
+) -> str:
+    """Resolve a Control.bytes included_param_file path to a topology2_root-relative include string."""
+    raw = pfile.strip().strip('"').strip("'")
+    if not raw or raw.startswith("Choose ") or raw.startswith("("):
+        return ""
+    if os.path.isabs(raw):
+        try:
+            rel = os.path.relpath(raw, topology2_root)
+            if not rel.startswith("..") and os.path.isfile(os.path.join(topology2_root, rel)):
+                return rel
+        except ValueError:
+            pass
+    for prefix in ("", "include/", "include/components/", f"include/components/{wclass}/"):
+        cand = prefix + (os.path.basename(raw) if prefix.endswith(f"{wclass}/") else raw)
+        if os.path.isfile(os.path.join(topology2_root, cand)):
+            return cand
+    return ""
+
+
 def generate_compilable_conf(
     vm: GraphViewModel,
     topology2_root: str,
@@ -74,7 +223,12 @@ def generate_compilable_conf(
     Returns:
         (conf_text, defines_str, pipeline_ids_for_testbench)
     """
-    if vm.view_kind == "topology" and vm.source_file and os.path.isfile(vm.source_file):
+    if (
+        vm.view_kind == "topology"
+        and vm.source_file
+        and os.path.isfile(vm.source_file)
+        and not _has_structural_or_param_edits(vm)
+    ):
         return _generate_modified_topology_conf(
             vm,
             topology2_root,
@@ -126,16 +280,7 @@ def _generate_modified_topology_conf(
             def_lines.append("}\n")
             extra_blocks.append("".join(def_lines))
 
-    pipe_ids = sorted(vm.containers.keys())
-    tb_pipes = [1, 2]
-    if 1 in pipe_ids and 2 in pipe_ids:
-        tb_pipes = [1, 2]
-    elif 0 in pipe_ids and 1 in pipe_ids:
-        tb_pipes = [0, 1]
-    elif len(pipe_ids) >= 2:
-        tb_pipes = pipe_ids[:2]
-    elif len(pipe_ids) == 1:
-        tb_pipes = pipe_ids
+    tb_pipes = _extract_active_pipeline_ids(vm)
 
     full_text = base_text
     if extra_blocks:
@@ -156,22 +301,8 @@ def _generate_standalone_harness_conf(
     Uses the topology2/include/bench/ pattern so any Processing Module or Pipeline graph can
     be compiled by alsatplg -p and executed in sof-testbench4 -p 1,2 immediately.
     """
-    proc_nodes: List[GraphNode] = []
-    for node in vm.nodes.values():
-        if node.class_category == "Widget" and node.class_name not in (
-            "host-copier",
-            "dai-copier",
-            "alh-dai-copier",
-            "mixin",
-            "mixout",
-            "module-copier",
-            "pipeline",
-            "virtual",
-        ):
-            proc_nodes.append(node)
-
-    node_order = {nid: idx for idx, nid in enumerate(vm.nodes.keys())}
-    proc_nodes.sort(key=lambda n: node_order.get(n.id, 0))
+    active_pids = _extract_active_pipeline_ids(vm)
+    proc_nodes = _extract_ordered_proc_nodes(vm, active_pids)
     if not proc_nodes:
         # Default to a single gain widget if the selection has no processing modules
         proc_nodes = [
@@ -197,23 +328,88 @@ def _generate_standalone_harness_conf(
     w_blocks: List[str] = []
     chain_names: List[str] = ["host-copier.0.playback"]
     used_counts: Dict[str, int] = {}
+    used_kctl_names: Set[str] = set()
 
     for idx, n in enumerate(proc_nodes):
         wclass = n.class_name
         inst_num = used_counts.get(wclass, 0) + 1
         used_counts[wclass] = inst_num
 
-        # Check if include/bench/ has control bytes or controls config for this component
-        ctrl_inc = ""
-        for cand in (
-            f"include/bench/{wclass}_control_bytes_playback.conf",
-            f"include/bench/{wclass}_controls_playback.conf",
-        ):
-            if os.path.isfile(os.path.join(topology2_root, cand)):
-                # Only include on first instance of a given class so control names stay unique
-                if inst_num == 1:
-                    ctrl_inc = f"\n\t<{cand}>"
-                break
+        # Inspect child Control nodes attached to `n` on the graph
+        child_ctrls = [
+            cnode for cnode in vm.nodes.values()
+            if cnode.parent_node_id == n.id and cnode.class_category == "Control"
+        ]
+        bytes_cnode = next((c for c in child_ctrls if c.class_name == "bytes"), None)
+        mixer_cnode = next((c for c in child_ctrls if c.class_name == "mixer" and c.instance_id == "1"), None)
+        if mixer_cnode is None:
+            mixer_cnode = next((c for c in child_ctrls if c.class_name == "mixer"), None)
+        enum_cnode = next((c for c in child_ctrls if c.class_name == "enum"), None)
+
+        raw_pfile = ""
+        if bytes_cnode is not None:
+            raw_pfile = str(bytes_cnode.config.get_scalar("included_param_file", "")).strip()
+        if not raw_pfile:
+            ctrl_grp = n.config.get_child("Object.Control")
+            if ctrl_grp:
+                b_cfg = ctrl_grp.get_child("bytes.1")
+                if b_cfg:
+                    raw_pfile = str(b_cfg.get_scalar("included_param_file", "")).strip()
+
+        resolved_bytes_inc = _resolve_bytes_param_include(raw_pfile, wclass, topology2_root)
+
+        custom_ctrl_blocks: List[str] = []
+        if resolved_bytes_inc:
+            b_name = ""
+            if bytes_cnode is not None:
+                b_name = str(bytes_cnode.config.get_scalar("name", "")).strip().strip('"').strip("'")
+            if not b_name or b_name in used_kctl_names:
+                suffix = f" {inst_num}" if inst_num > 1 else ""
+                b_name = f"Analog Playback {wclass.upper()}{suffix} bytes"
+            used_kctl_names.add(b_name)
+            if bytes_cnode is not None:
+                bytes_cnode.config.set_scalar("name", b_name, origin="instance")
+            custom_ctrl_blocks.append(
+                f'\tObject.Control.bytes."1" {{\n\t\tname\t\'{b_name}\'\n\t\t<{resolved_bytes_inc}>\n\t}}'
+            )
+
+        if mixer_cnode is not None and (wclass == "gain" or resolved_bytes_inc):
+            m_name = str(mixer_cnode.config.get_scalar("name", "")).strip().strip('"').strip("'")
+            if not m_name or m_name in used_kctl_names:
+                is_sw = str(mixer_cnode.config.get_scalar("max", "")).strip() == "1"
+                mkind = "switch" if is_sw else "volume"
+                suffix = f" {inst_num}" if inst_num > 1 else ""
+                m_name = f"Analog Playback {wclass.upper()}{suffix} {mkind}"
+            used_kctl_names.add(m_name)
+            mixer_cnode.config.set_scalar("name", m_name, origin="instance")
+            custom_ctrl_blocks.append(
+                f'\tObject.Control.mixer."1" {{\n\t\tname\t\'{m_name}\'\n\t}}'
+            )
+
+        if enum_cnode is not None and resolved_bytes_inc:
+            e_name = str(enum_cnode.config.get_scalar("name", "")).strip().strip('"').strip("'")
+            if not e_name or e_name in used_kctl_names:
+                suffix = f" {inst_num}" if inst_num > 1 else ""
+                e_name = f"Analog Playback {wclass.upper()}{suffix} enum"
+            used_kctl_names.add(e_name)
+            enum_cnode.config.set_scalar("name", e_name, origin="instance")
+            custom_ctrl_blocks.append(
+                f'\tObject.Control.enum."1" {{\n\t\tname\t\'{e_name}\'\n\t}}'
+            )
+
+        if custom_ctrl_blocks:
+            ctrl_inc = "\n" + "\n".join(custom_ctrl_blocks)
+        else:
+            # Fallback to include/bench/ control bytes or controls config for this component
+            ctrl_inc = ""
+            for cand in (
+                f"include/bench/{wclass}_control_bytes_playback.conf",
+                f"include/bench/{wclass}_controls_playback.conf",
+            ):
+                if os.path.isfile(os.path.join(topology2_root, cand)):
+                    if inst_num == 1:
+                        ctrl_inc = f"\n\t<{cand}>"
+                    break
 
         custom_scalars: List[str] = []
         for ch in n.config.children:
@@ -336,9 +532,9 @@ Define {{
 \tBENCH_PCM_CHANNELS_MIN\t\t2
 \tBENCH_PCM_CHANNELS_MAX\t\t2
 \tBENCH_MODULE_FORMAT\t\t"s32"
-\tBENCH_EQIIR_PARAMS\t\t"passthrough"
-\tBENCH_EQFIR_PARAMS\t\t"passthrough"
-\tBENCH_DRC_PARAMS\t\t"default"
+\tBENCH_EQIIR_PARAMS\t\t"bandpass"
+\tBENCH_EQFIR_PARAMS\t\t"loudness"
+\tBENCH_DRC_PARAMS\t\t"enabled"
 \tBENCH_MULTIBAND_DRC_PARAMS\t"default"
 \tBENCH_DCBLOCK_PARAMS\t\t"default"
 \tBENCH_TDFB_PARAMS\t\t"default"

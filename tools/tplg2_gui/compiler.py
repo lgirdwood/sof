@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .model import GraphViewModel
+from .model import GraphViewModel, debug_log_command, debug_log_line
 from .serializer import generate_compilable_conf
 
 
@@ -477,6 +477,12 @@ class TopologyCompiler:
         with open(conf_path, "w", encoding="utf-8") as f:
             f.write(abi_text + "\n" + body_text)
 
+        debug_log_line(
+            "COMPILER:CONF",
+            f"Generated compilable .conf for '{vm.title}' (view_kind={vm.view_kind}, dirty={vm.dirty}, "
+            f"graph_modified={getattr(vm, 'graph_structure_modified', False)}, pipes={tb_pipes}) -> {conf_path} ({len(body_text)} B)",
+        )
+
         cmd = [
             self.alsatplg_bin,
             "-I",
@@ -500,10 +506,19 @@ class TopologyCompiler:
                 cwd=self.topology2_root,
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=30,
             )
             ok = proc.returncode == 0 and os.path.isfile(tplg_path)
             sz = os.path.getsize(tplg_path) if ok else 0
+            debug_log_command(
+                "ALSATPLG",
+                cmd_str,
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                extra=f"tplg={tplg_path} ({sz} B), pipes={tb_pipes}",
+            )
             diags = parse_compile_diagnostics(
                 proc.stdout,
                 proc.stderr,
@@ -524,6 +539,14 @@ class TopologyCompiler:
             )
         except Exception as exc:
             err_s = str(exc)
+            debug_log_command(
+                "ALSATPLG",
+                cmd_str,
+                returncode=-1,
+                stdout="",
+                stderr=err_s,
+                extra="EXCEPTION",
+            )
             diags = parse_compile_diagnostics(
                 "",
                 err_s,

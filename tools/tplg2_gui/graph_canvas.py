@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import subprocess
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -36,6 +36,7 @@ from .model import (
     GraphViewModel,
     PipelineContainer,
     UndoRedoManager,
+    debug_log_action,
 )
 from .parser import Topology2Workspace
 
@@ -74,7 +75,13 @@ CONTAINER_BORDER_PB = rgba(0.28, 0.52, 0.82, 0.48)
 CONTAINER_BORDER_CAP = rgba(0.28, 0.72, 0.48, 0.48)
 NODE_BORDER_NORMAL = rgba(0.30, 0.35, 0.44, 0.90)
 NODE_BORDER_SELECTED = rgba(0.35, 0.78, 1.00, 1.00)
+NODE_BORDER_PROBED = rgba(0.06, 0.73, 0.51, 0.98)
+NODE_BORDER_POWERED = rgba(0.22, 0.74, 0.97, 0.72)
 NODE_SHADOW_SELECTED = rgba(0.20, 0.68, 1.00, 0.45)
+TAP_BG_ACTIVE = rgba(0.06, 0.73, 0.51, 0.95)
+TAP_BG_IDLE = rgba(0.06, 0.09, 0.16, 0.50)
+TAP_FG_IDLE = rgba(0.80, 0.84, 0.88, 0.90)
+TELEM_SUB_FG = rgba(0.49, 0.83, 0.99, 0.95)
 TEXT_WHITE = rgba(0.95, 0.97, 1.00, 1.0)
 TEXT_MUTED = rgba(0.68, 0.74, 0.82, 1.0)
 BADGE_BG = rgba(0.18, 0.22, 0.30, 0.95)
@@ -137,6 +144,8 @@ class TopologyGraphCanvas(Gtk.Widget):
         on_graph_modified: Optional[Callable[[], None]] = None,
         on_history_changed: Optional[Callable[[], None]] = None,
         on_kcontrol_changed: Optional[Callable[[GraphNode], None]] = None,
+        on_probe_tap_toggled: Optional[Callable[[Optional[str], int, str], None]] = None,
+        on_testbench_io_changed: Optional[Callable[[List[int]], None]] = None,
     ):
         super().__init__()
         self.set_hexpand(True)
@@ -147,6 +156,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.on_selection_changed = on_selection_changed
         self.on_graph_modified = on_graph_modified
         self.on_kcontrol_changed = on_kcontrol_changed
+        self.on_probe_tap_toggled = on_probe_tap_toggled
+        self.on_testbench_io_changed = on_testbench_io_changed
+        self.live_node_telemetry: Dict[str, Dict[str, Any]] = {}
+        self.active_probe_node_id: Optional[str] = None
         self.history = UndoRedoManager(on_history_changed=on_history_changed)
         self._suppress_auto_history: bool = False
         self._pending_drag_history_entry: Optional[GraphHistoryEntry] = None
@@ -287,6 +300,58 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.diag_banner_text = None
         self.queue_draw()
 
+    def set_live_telemetry_overlay(self, telem: Optional[Any]) -> None:
+        """Populate live node telemetry and DAPM power badges from TestbenchTelemetry."""
+        self.live_node_telemetry.clear()
+        if telem is None or not self.vm:
+            self.queue_draw()
+            return
+
+        comps = getattr(telem, "components", []) or []
+        dapms = getattr(telem, "dapm_nodes", []) or []
+
+        for nid, node in self.vm.nodes.items():
+            if node.class_category in ("Control", "TestbenchIO"):
+                continue
+            matched_comp = None
+            for c in comps:
+                wname = getattr(c, "widget_name", "") or ""
+                if not wname:
+                    continue
+                if wname == nid or wname == node.title or nid in wname or wname in nid:
+                    matched_comp = c
+                    break
+                if node.pipeline_id is not None and wname.startswith(f"{node.class_name}.{node.pipeline_id}."):
+                    matched_comp = c
+                    break
+
+            matched_dapm = None
+            for d in dapms:
+                dname = (d.get("name", "") if isinstance(d, dict) else getattr(d, "name", "")) or ""
+                if not dname:
+                    continue
+                if dname == nid or dname == node.title or nid in dname or dname in nid:
+                    matched_dapm = d
+                    break
+
+            if matched_comp or matched_dapm:
+                d_nid = matched_dapm.get("node_id", 0) if isinstance(matched_dapm, dict) else getattr(matched_dapm, "node_id", 0)
+                d_name = matched_dapm.get("name", "") if isinstance(matched_dapm, dict) else getattr(matched_dapm, "name", "")
+                d_pwr = matched_dapm.get("power", 1) if isinstance(matched_dapm, dict) else getattr(matched_dapm, "power", 1)
+                self.live_node_telemetry[nid] = {
+                    "comp_id": int(getattr(matched_comp, "resource_id", getattr(matched_comp, "comp_id", 0))) if matched_comp else int(d_nid),
+                    "widget_name": (getattr(matched_comp, "widget_name", "") if matched_comp else d_name) or nid,
+                    "avg_kcps": float(getattr(matched_comp, "avg_kcps", 0.0)) if matched_comp else 0.0,
+                    "peak_kcps": float(getattr(matched_comp, "peak_kcps", 0.0)) if matched_comp else 0.0,
+                    "domain": str(getattr(matched_comp, "domain", "LL")) if matched_comp else "LL",
+                    "mem_domain": str(getattr(matched_comp, "mem_domain", "SRAM")) if matched_comp else "SRAM",
+                    "core_id": int(getattr(matched_comp, "core_id", 0)) if matched_comp else 0,
+                    "in_rms_db": float(getattr(matched_comp, "in_rms_db", -120.0)) if matched_comp else -120.0,
+                    "out_rms_db": float(getattr(matched_comp, "out_rms_db", -120.0)) if matched_comp else -120.0,
+                    "powered": bool(d_pwr) if matched_dapm else True,
+                }
+        self.queue_draw()
+
     def set_graph(self, vm: GraphViewModel, workspace: Optional[Topology2Workspace] = None) -> None:
         """Load a new GraphViewModel, auto-layout its nodes, and trigger snapshot redraw."""
         self.workspace = workspace
@@ -324,6 +389,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         """Record a snapshot of the current graph state onto the Undo stack before a mutation."""
         if self._suppress_auto_history or not self.vm:
             return
+        debug_log_action("CANVAS-MUTATE", description, f"graph={self.vm.title}")
         entry = self._capture_history_entry(description)
         if entry is not None:
             self.history.push_undo_entry(entry)
@@ -438,6 +504,11 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.selected_container_ids.clear()
         if self.vm and self.selected_node_id and self.selected_node_id in self.vm.nodes:
             node = self.vm.nodes[self.selected_node_id]
+            debug_log_action(
+                "CANVAS-SELECT",
+                f"Select node {node.id}",
+                f"class={node.class_name} category={node.class_category} pipe={node.pipeline_id}",
+            )
             if self.on_selection_changed:
                 self.on_selection_changed(node.title, node.config, node.subtitle)
         self.queue_draw()
@@ -1211,9 +1282,21 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_color(header_col, hdr_rect)
         snapshot.pop()
 
-        # Node border
-        bcol = NODE_BORDER_SELECTED if is_selected else NODE_BORDER_NORMAL
-        bw = 2.2 if is_selected else 1.2
+        # Node border (highlight in emerald when actively probed or DAPM powered)
+        telem_info = self.live_node_telemetry.get(node.id)
+        is_probed = self.active_probe_node_id == node.id
+        if is_probed:
+            bcol = NODE_BORDER_PROBED
+            bw = 2.4
+        elif is_selected:
+            bcol = NODE_BORDER_SELECTED
+            bw = 2.2
+        elif telem_info and telem_info.get("powered"):
+            bcol = NODE_BORDER_POWERED
+            bw = 1.6
+        else:
+            bcol = NODE_BORDER_NORMAL
+            bw = 1.2
         snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
 
         # Node Title in header (full text, node width is sized to fit)
@@ -1225,12 +1308,43 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_layout(title_layout, TEXT_WHITE)
         snapshot.restore()
 
-        # Subtitle (full text, node width is sized to fit)
-        sub_layout = self._get_pango_layout(node.subtitle, size_pt=8, bold=False)
+        # Clickable Probe Tap pill in top-right of module header
+        tap_w = 38.0
+        tap_h = 16.0
+        tap_x = node.x + node.width - tap_w - 6.0
+        tap_y = node.y + 5.0
+        tap_rect = Graphene.Rect.alloc()
+        tap_rect.init(tap_x, tap_y, tap_w, tap_h)
+        tap_rr = Gsk.RoundedRect()
+        tap_rr.init_from_rect(tap_rect, 4.0)
+        snapshot.push_rounded_clip(tap_rr)
+        snapshot.append_color(TAP_BG_ACTIVE if is_probed else TAP_BG_IDLE, tap_rect)
+        snapshot.pop()
+        tap_lbl = self._get_pango_layout("●TAP" if is_probed else "TAP", size_pt=6, bold=True)
+        snapshot.save()
+        pt.init(tap_x + (4.0 if is_probed else 8.0), tap_y + 2.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(tap_lbl, TEXT_WHITE if is_probed else TAP_FG_IDLE)
+        snapshot.restore()
+
+        # Subtitle (or live telemetry badge if testbench telemetry is available for this node)
+        sub_text = node.subtitle
+        sub_col = TEXT_MUTED
+        if telem_info:
+            kcps_val = float(telem_info.get("avg_kcps", 0.0))
+            mem_dom = str(telem_info.get("mem_domain", "SRAM"))
+            out_db = float(telem_info.get("out_rms_db", -120.0))
+            pwr_str = "ON" if telem_info.get("powered", True) else "OFF"
+            if out_db > -115.0:
+                sub_text = f"⚡{kcps_val:.0f} KCPS · {mem_dom} · {out_db:.1f}dB [{pwr_str}]"
+            else:
+                sub_text = f"⚡{kcps_val:.0f} KCPS · {mem_dom} · C{telem_info.get('core_id', 0)} [{pwr_str}]"
+            sub_col = TELEM_SUB_FG if telem_info.get("powered", True) else TEXT_MUTED
+        sub_layout = self._get_pango_layout(sub_text, size_pt=8, bold=bool(telem_info))
         snapshot.save()
         pt.init(node.x + 10.0, node.y + 31.0)
         snapshot.translate(pt)
-        snapshot.append_layout(sub_layout, TEXT_MUTED)
+        snapshot.append_layout(sub_layout, sub_col)
         snapshot.restore()
 
         # Bottom row: Input audio format on bottom-left, Output audio format on bottom-right
@@ -2098,6 +2212,26 @@ class TopologyGraphCanvas(Gtk.Widget):
                     else:
                         self._open_tb_file_chooser(node)
                     return
+                return
+            # Processing module node: check if user clicked the top-right [TAP] probe pill
+            lx = wx - node.x
+            ly = wy - node.y
+            if 0.0 <= ly <= 26.0 and lx >= node.width - 48.0:
+                if self.active_probe_node_id == nid:
+                    self.active_probe_node_id = None
+                    comp_id = 0
+                else:
+                    self.active_probe_node_id = nid
+                    comp_id = int(self.live_node_telemetry.get(nid, {}).get("comp_id", 0))
+                debug_log_action(
+                    "CANVAS-PROBE-TAP",
+                    f"Toggle probe tap on {nid}",
+                    f"active={self.active_probe_node_id} comp_id={comp_id}",
+                )
+                if self.on_probe_tap_toggled:
+                    self.on_probe_tap_toggled(self.active_probe_node_id, comp_id, nid)
+                self.queue_draw()
+                return
             return
 
         eid = self._hit_test_edge(wx, wy)
@@ -2108,6 +2242,12 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.selected_container_id = None
             self.selected_container_ids.clear()
             edge = next((e for e in self.vm.edges if e.id == eid), None)
+            if edge:
+                debug_log_action(
+                    "CANVAS-SELECT",
+                    f"Select route {edge.id}",
+                    f"{edge.source_node} ({edge.source_port}) -> {edge.sink_node} ({edge.sink_port})",
+                )
             if edge and self.on_selection_changed:
                 self.on_selection_changed(
                     f"Route: {edge.source_node} ({edge.source_port}) → {edge.sink_node} ({edge.sink_port})",
@@ -2133,6 +2273,11 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.selected_container_ids = {pid}
                 self.selected_container_id = pid
             cont = self.vm.containers[pid]
+            debug_log_action(
+                "CANVAS-SELECT",
+                f"Select pipeline container {pid}",
+                f"class={cont.class_name} dir={cont.direction}",
+            )
             if self.on_selection_changed:
                 self.on_selection_changed(
                     f"Pipeline {pid}: {cont.class_name}",
@@ -2553,6 +2698,12 @@ class TopologyGraphCanvas(Gtk.Widget):
         )
         self.vm.edges.append(new_edge)
         self.vm.dirty = True
+        self.vm.graph_structure_modified = True
+        debug_log_action(
+            "CANVAS-WIRE",
+            f"Wired route {src_nid} ({src_port}) -> {snk_nid} ({snk_port})",
+            f"edge_id={new_edge.id} inter_pipeline={is_inter}",
+        )
         if self.on_graph_modified:
             self.on_graph_modified()
         self.queue_draw()
@@ -2562,9 +2713,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             return
         if self.selected_edge_id:
             self.record_undo_snapshot("Delete route")
+            debug_log_action("CANVAS-DELETE", f"Deleted route {self.selected_edge_id}")
             self.vm.edges = [e for e in self.vm.edges if e.id != self.selected_edge_id]
             self.selected_edge_id = None
             self.vm.dirty = True
+            self.vm.graph_structure_modified = True
             self._notify_current_selection()
             if self.on_graph_modified:
                 self.on_graph_modified()
@@ -2577,6 +2730,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             pids = set(self.selected_container_ids)
             if self.selected_container_id is not None:
                 pids.add(self.selected_container_id)
+            debug_log_action(
+                "CANVAS-DELETE",
+                "Deleted selected objects",
+                f"nodes={sorted(nids)} pipelines={sorted(pids)}",
+            )
 
             to_remove = set()
             for nid in nids:
@@ -2607,6 +2765,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.selected_container_id = None
             self.selected_container_ids.clear()
             self.vm.dirty = True
+            self.vm.graph_structure_modified = True
             update_container_bounds_from_nodes(self.vm)
             self._notify_current_selection()
             if self.on_graph_modified:
@@ -3247,6 +3406,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                     ctrl_x += cnode.width + CTRL_H_GAP
 
             self.vm.dirty = True
+            self.vm.graph_structure_modified = True
             update_container_bounds_from_nodes(self.vm)
             self.workspace.attach_host_copier_io_nodes(self.vm)
             for tb_node in self.vm.nodes.values():
@@ -3255,6 +3415,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             _position_testbench_io_nodes(self.vm)
             _assign_edge_ports(self.vm)
             self.select_node(node.id)
+            debug_log_action(
+                "CANVAS-ADD-MODULE",
+                f"Added module {node.id} (Class.Widget.{module_name})",
+                f"pipeline_id={pid} pos=({node.x:.0f},{node.y:.0f})",
+            )
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
@@ -3384,6 +3549,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                 _assign_edge_ports(self.vm)
 
             self.vm.dirty = True
+            self.vm.graph_structure_modified = True
             self.selected_node_id = None
             self.selected_node_ids.clear()
             self.selected_edge_id = None
@@ -3396,6 +3562,11 @@ class TopologyGraphCanvas(Gtk.Widget):
                     cont.config,
                     f"Direction: {cont.direction}",
                 )
+            debug_log_action(
+                "CANVAS-ADD-PIPELINE",
+                f"Added pipeline {new_pid} (Class.Pipeline.{pipeline_name})",
+                f"joined_to={target_pid}",
+            )
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
@@ -3412,7 +3583,6 @@ class TopologyGraphCanvas(Gtk.Widget):
         if not self.vm or active_nid not in self.vm.nodes:
             return
         active_node = self.vm.nodes[active_nid]
-        self.record_undo_snapshot(f"Enable {active_node.title}")
         active_side = str(active_node.config.get_scalar("side", "left")).lower()
         active_pids = self._parse_pipe_ids(str(active_node.config.get_scalar("target_pipelines", "")))
 
@@ -3436,10 +3606,14 @@ class TopologyGraphCanvas(Gtk.Widget):
             )
             n.config.set_scalar("enabled", "true" if is_connected else "false", origin="instance")
 
-        self.vm.dirty = True
         self.select_node(active_nid)
-        if self.on_graph_modified:
-            self.on_graph_modified()
+        debug_log_action(
+            "CANVAS-TB-RADIO",
+            f"Enabled TestbenchIO {active_node.title} ({active_nid})",
+            f"side={active_side} target_pipelines={sorted(active_pids)}",
+        )
+        if self.on_testbench_io_changed:
+            self.on_testbench_io_changed(sorted(active_pids))
         self.queue_draw()
 
     @staticmethod
@@ -3818,14 +3992,23 @@ class TopologyGraphCanvas(Gtk.Widget):
         dialog = Gtk.FileDialog()
         dialog.set_title(f"Select Bytes Parameter File ({self._get_kcontrol_short_name(node)})")
         curr_file = self._get_kcontrol_bytes_file(node)
-        if self.vm and self.vm.source_file:
-            base_dir = os.path.dirname(os.path.abspath(self.vm.source_file))
-            if curr_file and curr_file != "(select file…)":
-                candidate = os.path.join(base_dir, curr_file)
-                if os.path.exists(candidate):
-                    base_dir = os.path.dirname(candidate)
-            if os.path.isdir(base_dir):
-                dialog.set_initial_folder(Gio.File.new_for_path(base_dir))
+        tplg_root = (
+            self.workspace.root_dir
+            if (self.workspace and os.path.isdir(self.workspace.root_dir))
+            else (os.path.dirname(os.path.abspath(self.vm.source_file)) if (self.vm and self.vm.source_file) else "")
+        )
+        base_dir = tplg_root
+        if self.vm and node.parent_node_id and node.parent_node_id in self.vm.nodes and tplg_root:
+            parent_wclass = self.vm.nodes[node.parent_node_id].class_name
+            comp_dir = os.path.join(tplg_root, "include", "components", parent_wclass)
+            if os.path.isdir(comp_dir):
+                base_dir = comp_dir
+        if curr_file and not curr_file.startswith("Choose ") and not curr_file.startswith("(") and tplg_root:
+            candidate = curr_file if os.path.isabs(curr_file) else os.path.join(tplg_root, curr_file)
+            if os.path.exists(candidate):
+                base_dir = os.path.dirname(candidate)
+        if base_dir and os.path.isdir(base_dir):
+            dialog.set_initial_folder(Gio.File.new_for_path(base_dir))
 
         root = self.get_root()
         win = root if isinstance(root, Gtk.Window) else None
@@ -3836,8 +4019,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                 if gfile and gfile.get_path():
                     chosen = gfile.get_path()
                     # Store relative path when inside topology2 root if possible
-                    if self.vm and self.vm.source_file:
-                        tplg_root = os.path.dirname(os.path.abspath(self.vm.source_file))
+                    if tplg_root:
                         try:
                             rel = os.path.relpath(chosen, tplg_root)
                             if not rel.startswith(".."):
@@ -3846,8 +4028,10 @@ class TopologyGraphCanvas(Gtk.Widget):
                             pass
                     self.record_undo_snapshot(f"Set {self._get_kcontrol_short_name(node)} bytes file")
                     node.config.set_scalar("included_param_file", chosen, origin="instance")
+                    node.badges = [os.path.basename(chosen)]
                     if self.vm:
                         self.vm.dirty = True
+                        self.vm.graph_structure_modified = True
                     self.select_node(node.id)
                     if self.on_kcontrol_changed:
                         self.on_kcontrol_changed(node)

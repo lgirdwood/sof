@@ -17,6 +17,7 @@ import socket
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -29,6 +30,24 @@ gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Pango", "1.0")
 from gi.repository import Gdk, Graphene, Gsk, Gtk, Pango
+
+from .model import debug_log_command, debug_log_line
+from .tplg_ipc4 import (
+    SND_SOC_TPLG_TYPE_BYTES,
+    SND_SOC_TPLG_TYPE_ENUM,
+    SND_SOC_TPLG_TYPE_MIXER,
+    SOF_IPC4_PIPELINE_STATE_PAUSED,
+    SOF_IPC4_PIPELINE_STATE_RESET,
+    SOF_IPC4_PIPELINE_STATE_RUNNING,
+    TplgIpc4Parser,
+    TplgIpc4Plan,
+    TplgKcontrolDesc,
+    build_ipc4_plan,
+    encode_delete_pipeline,
+    encode_kcontrol_set_ipc,
+    encode_large_config_set_chunks,
+    encode_set_pipeline_state,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -48,6 +67,7 @@ SOF_NET_OP_WIN_READ = 0x0021
 SOF_NET_OP_WIN_WRITE = 0x0022
 SOF_NET_OP_WINSTREAM_IO = 0x0023
 SOF_NET_OP_TELEM_SNAPSHOT = 0x0028
+SOF_NET_OP_WORKLOAD_SIM_CFG = 0x0029
 SOF_NET_OP_LLEXT_LOAD = 0x0030
 SOF_NET_OP_SHELL_EXEC = 0x0040
 SOF_NET_OP_PROBE_CTL = 0x0050
@@ -59,6 +79,26 @@ SOF_NET_OP_COMPR_CTL = 0x0073
 SOF_NET_OP_KCTL_LIST = 0x0074
 SOF_NET_OP_KCTL_GET = 0x0075
 SOF_NET_OP_KCTL_SET = 0x0076
+
+# Workload Simulation Operations & Modes (SOF_NET_OP_WORKLOAD_SIM_CFG)
+SOF_WORKLOAD_SIM_OP_GET = 0
+SOF_WORKLOAD_SIM_OP_SET = 1
+SOF_WORKLOAD_SIM_OP_MOD_SET = 2
+SOF_WORKLOAD_SIM_OP_RESET_OVERRIDES = 3
+
+SOF_WORKLOAD_SIM_OFF = 0
+SOF_WORKLOAD_SIM_VIRTUAL = 1
+SOF_WORKLOAD_SIM_REALTIME = 2
+
+SOF_WORKLOAD_MEM_SRAM = 0
+SOF_WORKLOAD_MEM_DRAM = 1
+SOF_WORKLOAD_MEM_AUTO = 0xFF
+
+# SRAM Window IDs (SOF_NET_OP_WIN_READ)
+SOF_CDEV_WIN_FW_REGS = 0
+SOF_CDEV_WIN_OUTBOX = 1
+SOF_CDEV_WIN_DEBUG = 2
+SOF_CDEV_WIN_PERF = 3
 
 # Power Management Operations (SOF_NET_OP_PM_CTL)
 SOF_PM_OP_QUERY = 0
@@ -107,6 +147,9 @@ SOF_PROBE_OP_INIT = 1
 SOF_PROBE_OP_DEINIT = 2
 SOF_PROBE_OP_INFO_ACTIVE = 3
 SOF_PROBE_OP_INFO_AVAILABLE = 4
+SOF_PROBE_OP_POINTS_ADD = 5
+SOF_PROBE_OP_POINTS_REMOVE = 6
+SOF_PROBE_OP_READ_BUFFER = 7
 
 # IPC4 BaseFW Large Config Parameter IDs
 TB_IPC4_MODULES_INFO_GET = 9
@@ -162,6 +205,14 @@ class CoreTelemetry:
     budget_kcps: int = 0
     cpu_load_pct: float = 0.0
     peak_load_pct: float = 0.0
+    freq_hz: int = 400_000_000
+    ll_deadline_violations: int = 0
+    ll_avg_exec_us: float = 0.0
+    ll_peak_exec_us: float = 0.0
+    dp_avg_kcps: int = 0
+    dp_peak_kcps: int = 0
+    dp_avg_exec_us: float = 0.0
+    dp_peak_exec_us: float = 0.0
 
 
 @dataclass
@@ -171,14 +222,26 @@ class ComponentPerfItem:
     instance_id: int
     module_name: str
     widget_name: str = ""
+    pipeline_id: int = 0
     core_id: int = 0
     domain: str = "LL"
+    mem_domain: str = "SRAM"
     is_removed: bool = False
     avg_kcps: int = 0
     peak_kcps: int = 0
     iterations: int = 0
     total_cycles: int = 0
     heap_bytes: int = 0
+    effective_cpc: int = 0
+    cpc_violations: int = 0
+    ibs: int = 0
+    obs: int = 0
+    in_rms_db: float = -120.0
+    out_rms_db: float = -120.0
+
+    @property
+    def comp_id(self) -> int:
+        return self.resource_id
 
 
 @dataclass
@@ -223,6 +286,13 @@ class TestbenchTelemetry:
     dsp_clock_hz: int = 400_000_000
     total_ll_ticks: int = 0
     active_pcm_streams: int = 0
+    # Workload Simulation state (SOF_NET_OP_WORKLOAD_SIM_CFG)
+    workload_sim_mode: int = 0  # 0=OFF, 1=VIRTUAL, 2=REALTIME
+    default_mem_domain: int = 0  # 0=SRAM, 1=DRAM
+    sram_factor_x100: int = 100
+    dram_factor_x100: int = 160
+    dram_cycles_per_word: int = 2
+    num_workload_overrides: int = 0
     # PCM status over SOF_NET_OP_PCM_CTL
     pcm_tone_running: bool = False
     pcm_device: str = "hw:0,0"
@@ -257,14 +327,20 @@ class TestbenchTelemetry:
     shell_stats: str = ""
     shell_cycles: str = ""
     shell_threads: str = ""
+    shell_platform_cfg: str = ""
+    shell_sched_telem: str = ""
+    shell_mod_buffers: str = ""
     protocol_log: List[str] = field(default_factory=list)
 
     def format_report(self) -> str:
         pwr = "D0 (ACTIVE)" if self.dsp_power_state == 1 else f"D3 (PAUSED/{self.dsp_power_state})"
+        sim_modes = {0: "OFF (HOST-MEASURED)", 1: "VIRTUAL-CPC", 2: "REALTIME-PACED"}
+        mem_dom = "DRAM" if self.default_mem_domain == 1 else "SRAM"
         lines = [
             f"=== SOFR Network Protocol Telemetry (127.0.0.1:{self.server_port}) ===",
             f"Platform: {self.platform}  |  FW: v{self.fw_version} ({self.fw_filename})  |  State: {pwr}",
             f"DSP Cores: mask=0x{self.enabled_cores_mask:02x}/{self.num_cores}  |  Total LL Ticks: {self.total_ll_ticks}  |  Active PCMs: {self.active_pcm_streams}",
+            f"Workload Sim: {sim_modes.get(self.workload_sim_mode, 'OFF')}  |  Mem Domain: {mem_dom} (DRAM {self.dram_factor_x100 / 100.0:.2f}x +{self.dram_cycles_per_word} cyc/w)  |  Overrides: {self.num_workload_overrides}",
             f"DAPM Graph: {self.dapm_powered_nodes}/{self.dapm_total_nodes} widgets powered, {self.dapm_active_edges}/{self.dapm_total_edges} routes active",
             f"Memory: HPSRAM {self.hpsram.powered_banks}/{self.hpsram.total_banks} banks ON ({self.hpsram.free_phys_pages} free pages)  |  "
             f"LPSRAM {self.lpsram.powered_banks}/{self.lpsram.total_banks} banks ON  |  Module Heap: {self.total_heap_bytes} B",
@@ -275,20 +351,26 @@ class TestbenchTelemetry:
             lines.append("--- Active DSP Core Telemetry ---")
             for c in self.cores:
                 if c.enabled or c.tick_count > 0:
+                    freq_mhz = c.freq_hz / 1e6
                     lines.append(
-                        f"  Core {c.core_id}: ticks={c.tick_count}  last={c.last_time_elapsed_cyc} cyc ({c.last_time_elapsed_us:.1f} us)  "
-                        f"max={c.max_time_elapsed_cyc} cyc  avg={c.avg_kcps} kcps  peak={c.peak_kcps} kcps  load={c.cpu_load_pct:.2f}%"
+                        f"  Core {c.core_id} ({freq_mhz:.0f}MHz): ticks={c.tick_count}  last={c.last_time_elapsed_cyc} cyc ({c.last_time_elapsed_us:.1f} us)  "
+                        f"max={c.max_time_elapsed_cyc} cyc  LL={c.avg_kcps}/{c.peak_kcps} kcps  DP={c.dp_avg_kcps}/{c.dp_peak_kcps} kcps  "
+                        f"load={c.cpu_load_pct:.2f}%  overruns={c.ll_deadline_violations}"
                     )
         if self.components:
-            lines.append("--- Per-Component Performance & Heap Telemetry ---")
+            lines.append("--- Per-Component Performance, Buffer Level & Heap Telemetry ---")
             for comp in self.components:
                 if comp.module_id == 0:
                     continue
                 label = comp.widget_name or f"{comp.module_name} (0x{comp.module_id:02x}:{comp.instance_id})"
                 heap_str = f"  heap={comp.heap_bytes}B" if comp.heap_bytes > 0 else ""
+                cpc_str = f"  cpc={comp.effective_cpc}(v={comp.cpc_violations})" if comp.effective_cpc > 0 else ""
+                lvl_str = ""
+                if comp.in_rms_db > -119.0 or comp.out_rms_db > -119.0:
+                    lvl_str = f"  in={comp.in_rms_db:+.1f}dB→out={comp.out_rms_db:+.1f}dB"
                 lines.append(
-                    f"  [{comp.domain} C{comp.core_id}] {label:<32} avg={comp.avg_kcps:5d} kcps  "
-                    f"peak={comp.peak_kcps:5d} kcps  iters={comp.iterations:4d}  cycles={comp.total_cycles}{heap_str}"
+                    f"  [{comp.domain} C{comp.core_id} {comp.mem_domain}] {label:<30} avg={comp.avg_kcps:5d} kcps  "
+                    f"peak={comp.peak_kcps:5d} kcps  iters={comp.iterations:4d}  cyc={comp.total_cycles}{cpc_str}{lvl_str}{heap_str}"
                 )
         if self.kcontrols:
             lines.append(f"--- Topology Kcontrols ({len(self.kcontrols)}) ---")
@@ -297,6 +379,12 @@ class TestbenchTelemetry:
                 lines.append(
                     f"  [numid={kc.numid:2d}] {kc.type_str:<5} {kc.name:<42} = [{val_str}] (widget: {kc.target_widget})"
                 )
+        if self.shell_platform_cfg:
+            lines.append("--- Platform Hardware Configuration ---")
+            lines.append(self.shell_platform_cfg)
+        if self.shell_sched_telem:
+            lines.append("--- Scheduler & Buffer Telemetry (sched-telem) ---")
+            lines.append(self.shell_sched_telem)
         return "\n".join(lines)
 
 
@@ -332,9 +420,14 @@ class TestbenchRemoteClient:
         self.req_id: int = 1
         self.protocol_log: List[str] = []
         self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
+        # Metadata populated when pipelines/modules are created purely via IPC4 (no -t topology loaded on server)
+        self.ipc_widget_map: Dict[int, Tuple[str, int]] = {}  # comp_id -> (widget_name, pipeline_id)
+        self.ipc_kcontrols: List[KcontrolTelemetryItem] = []
+        self.ipc_route_edges: List[Dict[str, Any]] = []
 
     def _log(self, msg: str) -> None:
         self.protocol_log.append(msg)
+        debug_log_line("SOFR", msg)
 
     def connect(self) -> bool:
         self.close()
@@ -493,6 +586,7 @@ class TestbenchRemoteClient:
         st, rdata = self.rpc(SOF_NET_OP_SHELL_EXEC, req)
         out = rdata.decode("utf-8", errors="replace") if rdata else ""
         self._log(f"[SOFR] OP_SHELL_EXEC '{cmd}' -> status={st} ({len(out)} bytes)")
+        debug_log_command("SOFR-SHELL", cmd, returncode=st, stdout=out)
         return (st, out)
 
     def pcm_control(
@@ -755,6 +849,273 @@ class TestbenchRemoteClient:
         self._log(f"[SOFR] OP_PROBE_CTL -> {len(pts)} probe point(s)")
         return pts
 
+    def probe_read_buffer(
+        self,
+        comp_id: int = 0,
+        max_bytes: int = 4096,
+    ) -> Tuple[int, int, List[float]]:
+        """Read live internal 32-bit PCM exit samples from module `comp_id` via SOF_PROBE_OP_READ_BUFFER.
+        Returns (status, resolved_comp_id, normalized_samples).
+        """
+        cap_bytes = max(64, min(8192, max_bytes))
+        req = struct.pack("<IIII", SOF_PROBE_OP_READ_BUFFER, comp_id, cap_bytes, 0)
+        st, rdata = self.rpc(SOF_NET_OP_PROBE_CTL, req)
+        if st != 0 or len(rdata) < 16:
+            return (st, comp_id, [])
+        _rop, resolved_id, copied_bytes, num_pts = struct.unpack_from("<IIII", rdata, 0)
+        # If target comp_id is a sink endpoint with 0 output pins, fall back to comp_id=0 (first active upstream module)
+        if copied_bytes == 0 and comp_id != 0:
+            req0 = struct.pack("<IIII", SOF_PROBE_OP_READ_BUFFER, 0, cap_bytes, 0)
+            st0, rdata0 = self.rpc(SOF_NET_OP_PROBE_CTL, req0)
+            if st0 == 0 and len(rdata0) >= 16:
+                st, rdata = st0, rdata0
+                _rop, resolved_id, copied_bytes, num_pts = struct.unpack_from("<IIII", rdata, 0)
+        payload = rdata[16 : 16 + copied_bytes]
+        n_smp = min(num_pts, len(payload) // 4)
+        samples: List[float] = []
+        if n_smp > 0:
+            ints = struct.unpack_from(f"<{n_smp}i", payload, 0)
+            samples = [max(-1.0, min(1.0, v / 2147483648.0)) for v in ints]
+        self._log(
+            f"[SOFR] OP_PROBE_CTL (READ_BUFFER comp=0x{resolved_id:06x}) -> {len(samples)} samples"
+        )
+        return (st, resolved_id, samples)
+
+    def pm_core_enable(self, core_id: int, enable: bool) -> Tuple[int, Dict[str, Any]]:
+        """Enable (`SOF_PM_OP_CORE_GET`) or disable (`SOF_PM_OP_CORE_PUT`) a DSP core."""
+        op = SOF_PM_OP_CORE_GET if enable else SOF_PM_OP_CORE_PUT
+        return self.pm_control(op, core_id=core_id)
+
+    def workload_sim_control(
+        self,
+        op: int = SOF_WORKLOAD_SIM_OP_GET,
+        mode: int = SOF_WORKLOAD_SIM_OFF,
+        default_mem_domain: int = SOF_WORKLOAD_MEM_SRAM,
+        dram_factor_x100: int = 160,
+        dram_cycles_per_word: int = 2,
+        core_freqs_hz: Optional[List[int]] = None,
+        target_comp_id: int = 0,
+        cpc_override: int = 0,
+        mem_domain_override: int = SOF_WORKLOAD_MEM_AUTO,
+    ) -> Optional[Dict[str, Any]]:
+        """Query or configure CPC/Frequency/SRAM-DRAM workload simulation (`SOF_NET_OP_WORKLOAD_SIM_CFG` 0x0029)."""
+        freqs = list(core_freqs_hz or [])
+        padded_freqs = (freqs + [0] * 8)[:8]
+        req = struct.pack(
+            "<5I8I3I",
+            op,
+            mode,
+            default_mem_domain,
+            dram_factor_x100,
+            dram_cycles_per_word,
+            *padded_freqs,
+            target_comp_id,
+            cpc_override,
+            mem_domain_override,
+        )
+        st, rdata = self.rpc(SOF_NET_OP_WORKLOAD_SIM_CFG, req)
+        if st != 0 or len(rdata) < 32:
+            return None
+        # Since SET/MOD_SET/RESET_OVERRIDES resets host scheduler telemetry on the server,
+        # advance 2 LL scheduler ticks so fresh simulated KCPS and exit samples are immediately populated.
+        if op != SOF_WORKLOAD_SIM_OP_GET:
+            self.exec_shell("step 2")
+            req_get = struct.pack("<5I8I3I", SOF_WORKLOAD_SIM_OP_GET, *([0] * 15))
+            st_g, rdata_g = self.rpc(SOF_NET_OP_WORKLOAD_SIM_CFG, req_get)
+            if st_g == 0 and len(rdata_g) >= 32:
+                rdata = rdata_g
+        (
+            rsp_status,
+            r_mode,
+            r_mem_dom,
+            r_sram_f,
+            r_dram_f,
+            r_dram_cpw,
+            r_ncores,
+            r_novr,
+        ) = struct.unpack_from("<i7I", rdata, 0)
+        core_stats: List[Dict[str, Any]] = []
+        off = 32
+        cstat_fmt = "<6I2Q2I2Q"
+        cstat_sz = struct.calcsize(cstat_fmt)
+        for cid in range(min(8, max(1, r_ncores))):
+            if off + cstat_sz > len(rdata):
+                break
+            (
+                c_act,
+                c_freq,
+                c_util_x100,
+                c_viol,
+                ll_avg_k,
+                ll_pk_k,
+                ll_avg_ns,
+                ll_pk_ns,
+                dp_avg_k,
+                dp_pk_k,
+                dp_avg_ns,
+                dp_pk_ns,
+            ) = struct.unpack_from(cstat_fmt, rdata, off)
+            off += cstat_sz
+            core_stats.append(
+                {
+                    "core_id": cid,
+                    "active": bool(c_act),
+                    "freq_hz": c_freq,
+                    "util_pct": c_util_x100 / 100.0,
+                    "ll_deadline_violations": c_viol,
+                    "ll_avg_kcps": ll_avg_k,
+                    "ll_peak_kcps": ll_pk_k,
+                    "ll_avg_exec_us": ll_avg_ns / 1000.0,
+                    "ll_peak_exec_us": ll_pk_ns / 1000.0,
+                    "dp_avg_kcps": dp_avg_k,
+                    "dp_peak_kcps": dp_pk_k,
+                    "dp_avg_exec_us": dp_avg_ns / 1000.0,
+                    "dp_peak_exec_us": dp_pk_ns / 1000.0,
+                }
+            )
+        op_names = {
+            SOF_WORKLOAD_SIM_OP_GET: "GET",
+            SOF_WORKLOAD_SIM_OP_SET: "SET",
+            SOF_WORKLOAD_SIM_OP_MOD_SET: f"MOD_SET(0x{target_comp_id:06x})",
+            SOF_WORKLOAD_SIM_OP_RESET_OVERRIDES: "RESET_OVERRIDES",
+        }
+        self._log(
+            f"[SOFR] OP_WORKLOAD_SIM_CFG ({op_names.get(op, str(op))}) -> mode={r_mode} "
+            f"mem={'DRAM' if r_mem_dom == 1 else 'SRAM'} overrides={r_novr}"
+        )
+        return {
+            "status": rsp_status,
+            "mode": r_mode,
+            "default_mem_domain": r_mem_dom,
+            "sram_factor_x100": r_sram_f,
+            "dram_factor_x100": r_dram_f,
+            "dram_cycles_per_word": r_dram_cpw,
+            "num_cores": r_ncores,
+            "num_overrides": r_novr,
+            "cores": core_stats,
+        }
+
+    def workload_sim_get(self) -> Optional[Dict[str, Any]]:
+        return self.workload_sim_control(op=SOF_WORKLOAD_SIM_OP_GET)
+
+    def workload_sim_set(
+        self,
+        mode: int,
+        default_mem_domain: int = SOF_WORKLOAD_MEM_SRAM,
+        dram_factor_x100: int = 160,
+        dram_cycles_per_word: int = 2,
+        core_freqs_hz: Optional[List[int]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self.workload_sim_control(
+            op=SOF_WORKLOAD_SIM_OP_SET,
+            mode=mode,
+            default_mem_domain=default_mem_domain,
+            dram_factor_x100=dram_factor_x100,
+            dram_cycles_per_word=dram_cycles_per_word,
+            core_freqs_hz=core_freqs_hz,
+        )
+
+    def workload_sim_set_module_override(
+        self,
+        target_comp_id: int,
+        cpc_override: int,
+        mem_domain_override: int = SOF_WORKLOAD_MEM_AUTO,
+    ) -> Optional[Dict[str, Any]]:
+        return self.workload_sim_control(
+            op=SOF_WORKLOAD_SIM_OP_MOD_SET,
+            target_comp_id=target_comp_id,
+            cpc_override=cpc_override,
+            mem_domain_override=mem_domain_override,
+        )
+
+    def workload_sim_reset(self) -> Optional[Dict[str, Any]]:
+        return self.workload_sim_control(op=SOF_WORKLOAD_SIM_OP_RESET_OVERRIDES)
+
+    def load_llext_module(
+        self,
+        so_path: str,
+        lib_id: int = 1,
+        mod_name: str = "",
+    ) -> Tuple[int, str]:
+        """Upload and dlopen() a shared library / LLEXT `.so` module image over `SOF_NET_OP_LLEXT_LOAD` (0x0030)."""
+        if not os.path.isfile(so_path):
+            return (-2, f"File not found: {so_path}")
+        with open(so_path, "rb") as fh:
+            so_bytes = fh.read()
+        mname = (mod_name or os.path.splitext(os.path.basename(so_path))[0]).encode("ascii", errors="ignore")[:63]
+        req = struct.pack(
+            "<4I64s",
+            0,  # mode
+            max(1, lib_id),
+            len(so_bytes),
+            1,  # issue_shell_cmd
+            mname.ljust(64, b"\x00"),
+        )
+        st, rdata = self.rpc(SOF_NET_OP_LLEXT_LOAD, req + so_bytes)
+        msg = f"LLEXT load status={st}"
+        if len(rdata) >= 520:
+            r_lid, _fw_st, sh_b = struct.unpack_from("<Ii512s", rdata, 0)
+            msg = sh_b.split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip() or f"Loaded lib_id={r_lid}"
+        self._log(f"[SOFR] OP_LLEXT_LOAD '{os.path.basename(so_path)}' (lib_id={lib_id}) -> {msg}")
+        return (st, msg)
+
+    def read_sram_window(
+        self,
+        win_id: int = SOF_CDEV_WIN_FW_REGS,
+        offset: int = 0,
+        size: int = 256,
+        slot_type: int = 0,
+    ) -> Tuple[int, bytes]:
+        """Read bytes from an emulated DSP SRAM window (`SOF_NET_OP_WIN_READ` 0x0021)."""
+        req_sz = max(16, min(4096, size))
+        req = struct.pack("<6I", win_id, slot_type, 0, offset, req_sz, 0)
+        st, rdata = self.rpc(SOF_NET_OP_WIN_READ, req)
+        self._log(f"[SOFR] OP_WIN_READ (win={win_id} off={offset} sz={req_sz}) -> status={st} ({len(rdata)}B)")
+        return (st, rdata)
+
+    def send_ipc4_tx(
+        self,
+        primary: int,
+        extension: int,
+        payload: bytes = b"",
+        rx_size: int = 0,
+        description: str = "",
+    ) -> Tuple[int, Dict[str, Any], bytes]:
+        """Send raw IPC4 message via `SOF_NET_OP_IPC_TX` (0x0010)."""
+        req = struct.pack("<5I", primary, extension, len(payload), rx_size, 0) + payload
+        st, rdata = self.rpc(SOF_NET_OP_IPC_TX, req)
+        desc_tag = f" {description}" if description else ""
+        if st == 0 and len(rdata) >= 16:
+            r_prim, r_ext, ipc_st, r_rx = struct.unpack_from("<IIiI", rdata, 0)
+            rx_bytes = rdata[16 : 16 + r_rx] if r_rx > 0 else b""
+            log_msg = (
+                f"[SOFR] OP_IPC_TX{desc_tag} (0x{primary:08x}, 0x{extension:08x}, len={len(payload)}B) "
+                f"-> ipc_status={ipc_st}"
+            )
+            self._log(log_msg)
+            debug_log_command(
+                "IPC4-TX",
+                f"{description or 'IPC_TX'} pri=0x{primary:08x} ext=0x{extension:08x} len={len(payload)}",
+                returncode=ipc_st,
+                stdout=f"reply_primary=0x{r_prim:08x} reply_extension=0x{r_ext:08x}",
+            )
+            return (
+                st,
+                {
+                    "reply_primary": r_prim,
+                    "reply_extension": r_ext,
+                    "ipc_status": ipc_st,
+                },
+                rx_bytes,
+            )
+        debug_log_command(
+            "IPC4-TX",
+            f"{description or 'IPC_TX'} pri=0x{primary:08x} ext=0x{extension:08x} len={len(payload)}",
+            returncode=st,
+            stderr="RPC error or empty response",
+        )
+        return (st, {}, b"")
+
     def get_telemetry_snapshot(self, query_mask: int = SOF_TELEM_FL_ALL) -> Optional[TestbenchTelemetry]:
         req = struct.pack("<II", query_mask, 0)
         st, raw_snap = self.rpc(SOF_NET_OP_TELEM_SNAPSHOT, req)
@@ -1012,22 +1373,77 @@ class TestbenchRemoteClient:
 
         # Kcontrols & Probes
         telem.kcontrols = self.list_kcontrols(0)
+        if not telem.kcontrols and self.ipc_kcontrols:
+            telem.kcontrols = list(self.ipc_kcontrols)
         telem.probes = self.query_probes(active_only=False)
 
-        # Enrich component widget names from probes & shell pipelines
+        # Enrich component widget names from probes, IPC widget map, & shell pipelines
         probe_by_id = {p["buffer_id"]: p["widget_name"] for p in telem.probes if p.get("widget_name")}
+        for cid, (wname, _pid) in self.ipc_widget_map.items():
+            if wname:
+                probe_by_id[cid] = wname
+
+        if telem.dapm_total_nodes == 0 and self.ipc_widget_map:
+            telem.dapm_total_nodes = len(self.ipc_widget_map)
+            telem.dapm_powered_nodes = len(self.ipc_widget_map)
+            telem.dapm_nodes = [
+                {
+                    "node_id": idx + 1,
+                    "name": wname,
+                    "widget_type": "IPC4_MOD",
+                    "power": True,
+                    "pipeline_id": pid,
+                }
+                for idx, (_cid, (wname, pid)) in enumerate(self.ipc_widget_map.items())
+            ]
+        if telem.dapm_total_edges == 0 and self.ipc_route_edges:
+            telem.dapm_total_edges = len(self.ipc_route_edges)
+            telem.dapm_active_edges = len(self.ipc_route_edges)
+            telem.dapm_edges = list(self.ipc_route_edges)
 
         _, sh_info = self.exec_shell("info")
         _, sh_pipes = self.exec_shell("pipelines")
         _, sh_stats = self.exec_shell("stats")
         _, sh_cycles = self.exec_shell("kernel cycles")
         _, sh_threads = self.exec_shell("kernel threads")
+        _, sh_plat = self.exec_shell("platform-cfg status")
+        _, sh_sched = self.exec_shell("sched-telem")
+        _, sh_modbuf = self.exec_shell("mod-buffers")
 
         telem.shell_info = sh_info.strip()
         telem.shell_pipelines = sh_pipes.strip()
         telem.shell_stats = sh_stats.strip()
         telem.shell_cycles = sh_cycles.strip()
         telem.shell_threads = sh_threads.strip()
+        telem.shell_platform_cfg = sh_plat.strip()
+        telem.shell_sched_telem = sh_sched.strip()
+        telem.shell_mod_buffers = sh_modbuf.strip()
+
+        # Query Workload Simulation state & per-core LL/DP stats over SOF_NET_OP_WORKLOAD_SIM_CFG (0x0029)
+        wsim = self.workload_sim_get()
+        if wsim:
+            telem.workload_sim_mode = int(wsim.get("mode", 0))
+            telem.default_mem_domain = int(wsim.get("default_mem_domain", 0))
+            telem.sram_factor_x100 = int(wsim.get("sram_factor_x100", 100))
+            telem.dram_factor_x100 = int(wsim.get("dram_factor_x100", 160))
+            telem.dram_cycles_per_word = int(wsim.get("dram_cycles_per_word", 2))
+            telem.num_workload_overrides = int(wsim.get("num_overrides", 0))
+            w_cores = wsim.get("cores", [])
+            for wc in w_cores:
+                cid = int(wc.get("core_id", 0))
+                if 0 <= cid < len(telem.cores):
+                    ct = telem.cores[cid]
+                    if wc.get("freq_hz", 0) > 0:
+                        ct.freq_hz = int(wc["freq_hz"])
+                    ct.ll_deadline_violations = int(wc.get("ll_deadline_violations", 0))
+                    ct.ll_avg_exec_us = float(wc.get("ll_avg_exec_us", 0.0))
+                    ct.ll_peak_exec_us = float(wc.get("ll_peak_exec_us", 0.0))
+                    ct.dp_avg_kcps = int(wc.get("dp_avg_kcps", 0))
+                    ct.dp_peak_kcps = int(wc.get("dp_peak_kcps", 0))
+                    ct.dp_avg_exec_us = float(wc.get("dp_avg_exec_us", 0.0))
+                    ct.dp_peak_exec_us = float(wc.get("dp_peak_exec_us", 0.0))
+                    if wc.get("util_pct", 0.0) > 0.0:
+                        ct.cpu_load_pct = float(wc["util_pct"])
 
         # Parse core assignment & widget names from `pipelines` shell output
         comp_core_map: Dict[int, int] = {}
@@ -1040,6 +1456,39 @@ class TestbenchRemoteClient:
                 comp_core_map[cid] = core_id
                 if wname and wname != "dynamic_mod":
                     probe_by_id[cid] = wname
+
+        # Parse per-module scheduling & entry/exit buffer RMS dBFS from `sched-telem` output
+        sched_mod_map: Dict[int, Dict[str, Any]] = {}
+        for line in telem.shell_sched_telem.splitlines():
+            m_mod = re.search(
+                r"\[0x([0-9a-fA-F]+)\s+(\S+)\s*\]\s+pipe=(\d+)\s+core=(\d+)\s+(LL|DP)\s+mem=(SRAM|DRAM).*?ibs=(\d+)\s+obs=(\d+)\s+cpc=(\d+)\(viol=(\d+)\)",
+                line,
+            )
+            if m_mod:
+                cid = int(m_mod.group(1), 16)
+                wname = m_mod.group(2)
+                if wname and wname != "comp":
+                    probe_by_id[cid] = wname
+                in_rms = -120.0
+                out_rms = -120.0
+                m_in = re.search(r"IN0:.*?rms=([+-]?\d+\.\d+)dBFS", line)
+                if m_in:
+                    in_rms = float(m_in.group(1))
+                m_out = re.search(r"OUT0:.*?rms=([+-]?\d+\.\d+)dBFS", line)
+                if m_out:
+                    out_rms = float(m_out.group(1))
+                sched_mod_map[cid] = {
+                    "pipeline_id": int(m_mod.group(3)),
+                    "core_id": int(m_mod.group(4)),
+                    "domain": m_mod.group(5),
+                    "mem_domain": m_mod.group(6),
+                    "ibs": int(m_mod.group(7)),
+                    "obs": int(m_mod.group(8)),
+                    "effective_cpc": int(m_mod.group(9)),
+                    "cpc_violations": int(m_mod.group(10)),
+                    "in_rms_db": in_rms,
+                    "out_rms_db": out_rms,
+                }
 
         # Parse per-module heap usage from `stats` shell output
         in_heap_sec = False
@@ -1058,9 +1507,31 @@ class TestbenchRemoteClient:
         telem.total_heap_bytes = total_heap
 
         for comp in telem.components:
-            comp.widget_name = probe_by_id.get(comp.resource_id, "")
+            raw_wname = probe_by_id.get(comp.resource_id, "")
+            # Strip any trailing byte/dB summary appended by probe point info if present
+            if " " in raw_wname:
+                raw_wname = raw_wname.split(" ", 1)[0]
+            comp.widget_name = raw_wname
+            if comp.resource_id in self.ipc_widget_map:
+                ipc_wname, ipc_pid = self.ipc_widget_map[comp.resource_id]
+                if ipc_wname:
+                    comp.widget_name = ipc_wname
+                if comp.pipeline_id == 0:
+                    comp.pipeline_id = ipc_pid
             if comp.resource_id in comp_core_map:
                 comp.core_id = comp_core_map[comp.resource_id]
+            sinfo = sched_mod_map.get(comp.resource_id)
+            if sinfo:
+                comp.pipeline_id = sinfo["pipeline_id"]
+                comp.core_id = sinfo["core_id"]
+                comp.domain = sinfo["domain"]
+                comp.mem_domain = sinfo["mem_domain"]
+                comp.ibs = sinfo["ibs"]
+                comp.obs = sinfo["obs"]
+                comp.effective_cpc = sinfo["effective_cpc"]
+                comp.cpc_violations = sinfo["cpc_violations"]
+                comp.in_rms_db = sinfo["in_rms_db"]
+                comp.out_rms_db = sinfo["out_rms_db"]
             if comp.widget_name and comp.widget_name in telem.module_heap:
                 comp.heap_bytes = telem.module_heap[comp.widget_name]
             elif comp.module_name in telem.module_heap:
@@ -1087,14 +1558,54 @@ class TestbenchRunner:
         self.live_proc: Optional[subprocess.Popen] = None
         self.live_client: Optional[TestbenchRemoteClient] = None
         self.live_port: int = 0
+        # Target hardware preset & CLI simulation parameters
+        self.platform_preset: str = "mtl"
+        self.num_cores_override: int = 0
+        self.mem_config_override: str = ""
+        self.workload_sim_mode: int = SOF_WORKLOAD_SIM_OFF  # 0=off, 1=virtual, 2=realtime
+        self.core_freq_override: str = ""
+        self.mem_domain_override: str = ""  # "" or "sram" or "dram:160:2"
+        self.trace_level: int = 0
+        self.copy_iterations: int = 0
+        self.remote_tone_freq_hz: int = 1000
+        # Active internal module probe tap (0 = disabled)
+        self.active_probe_comp_id: int = 0
+        self.active_probe_widget_name: str = ""
+        # Active IPC-created pipeline state on the persistent interactive server (started without -t)
+        self.active_ipc_plan: Optional[TplgIpc4Plan] = None
+        self.active_tplg_path: str = ""
+        self.active_pipeline_ids: List[int] = []
+        self._active_preset_applied: str = ""
+        self._ipc_lock = threading.Lock()
         # Cached parameters & buffers for real-time waveform streaming
         self.last_in_samples: List[float] = []
         self.last_out_raw_path: str = ""
         self.last_rate: int = 48000
+        self.last_rate_out: int = 48000
         self.last_channels: int = 2
+        self.last_channels_out: int = 2
         self.last_bits: int = 32
         self.last_signal_kind: str = "sine_997"
         self.rt_phase_idx: int = 0
+
+    @staticmethod
+    def map_platform_to_tb_preset(platform_id: str) -> str:
+        """Map topology2 platform architecture ID to sof-testbench4 `-A <preset>`."""
+        plat = (platform_id or "mtl").strip().lower()
+        preset_map = {
+            "tgl": "tgl",
+            "tgl-h": "tgl-h",
+            "adl": "tgl",
+            "rpl": "tgl",
+            "mtl": "mtl",
+            "arl": "arl",
+            "lnl": "lnl",
+            "ptl": "ptl",
+            "wcl": "wcl",
+            "nvl": "nvl",
+            "nvl-s": "nvl-s",
+        }
+        return preset_map.get(plat, "mtl")
 
     def _find_testbench_bin(self) -> str:
         sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
@@ -1213,23 +1724,513 @@ class TestbenchRunner:
         return (in_raw, in_wav, frames_ch0)
 
     def stop_live_session(self) -> None:
-        if self.live_client is not None:
-            try:
-                self.live_client.exec_shell("quit")
-            except Exception:
-                pass
-            self.live_client.close()
-            self.live_client = None
-        if self.live_proc is not None:
-            try:
-                self.live_proc.wait(timeout=1.5)
-            except Exception:
+        with self._ipc_lock:
+            if self.live_client is not None and self.active_ipc_plan is not None:
+                try:
+                    self._destroy_active_pipelines_unlocked()
+                except Exception:
+                    pass
+            if self.live_client is not None:
+                try:
+                    self.live_client.exec_shell("quit")
+                except Exception:
+                    pass
+                self.live_client.close()
+                self.live_client = None
+            if self.live_proc is not None:
+                try:
+                    self.live_proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        self.live_proc.kill()
+                    except Exception:
+                        pass
+                self.live_proc = None
+            self.live_port = 0
+            self.active_ipc_plan = None
+            self.active_tplg_path = ""
+            self.active_pipeline_ids = []
+            self._active_preset_applied = ""
+
+    def start_interactive_server(
+        self,
+        platform_preset: Optional[str] = None,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> bool:
+        """Ensure sof-testbench4 is running in interactive server mode (`-I -S <port> -W -A <preset>`)
+        WITHOUT loading any topology (`-t`), and apply the target platform preset.
+        """
+        eff_preset = self.map_platform_to_tb_preset(platform_preset or self.platform_preset)
+        self.platform_preset = eff_preset
+
+        with self._ipc_lock:
+            if (
+                self.live_client is not None
+                and self.live_proc is not None
+                and self.live_proc.poll() is None
+                and self.live_client.ping()
+            ):
+                if self._active_preset_applied != eff_preset:
+                    _st, out = self.live_client.exec_shell(f"platform-cfg preset {eff_preset}")
+                    self._active_preset_applied = eff_preset
+                    if log_callback and out.strip():
+                        log_callback(f"[SOFR :{self.live_port}] {out.strip()}")
+                return True
+
+            # Clean up any stale process before starting a fresh interactive server
+            if self.live_client is not None:
+                self.live_client.close()
+                self.live_client = None
+            if self.live_proc is not None:
                 try:
                     self.live_proc.kill()
                 except Exception:
                     pass
-            self.live_proc = None
-        self.live_port = 0
+                self.live_proc = None
+            self.active_ipc_plan = None
+            self.active_tplg_path = ""
+            self.active_pipeline_ids = []
+
+            port = self._allocate_free_port(SOF_NET_DEFAULT_PORT)
+            cmd = [
+                self.testbench_bin,
+                "-I",
+                "-S",
+                str(port),
+                "-W",
+                "-A",
+                eff_preset,
+                "-w",
+                str(self.workload_sim_mode if isinstance(self.workload_sim_mode, int) else 1),
+            ]
+            if self.num_cores_override > 0:
+                cmd.extend(["-N", str(self.num_cores_override)])
+            if self.mem_config_override.strip():
+                cmd.extend(["-m", self.mem_config_override.strip()])
+            if self.trace_level > 0:
+                cmd.extend(["-d", str(min(4, self.trace_level))])
+
+            cmd_str = " ".join(f'"{a}"' if " " in a else a for a in cmd)
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception as exc:
+                debug_log_command("SOF-TESTBENCH4-START", cmd_str, returncode=-1, stderr=str(exc))
+                if log_callback:
+                    log_callback(f"[ERROR] Failed to start interactive sof-testbench4: {exc}")
+                return False
+
+            client = TestbenchRemoteClient("127.0.0.1", port, timeout=3.0)
+            connected = False
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                if client.connect() and client.ping():
+                    connected = True
+                    break
+                time.sleep(0.01)
+
+            if not connected:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                debug_log_command("SOF-TESTBENCH4-START", cmd_str, returncode=-1, stderr="Failed to connect to SOFR server")
+                if log_callback:
+                    log_callback(f"[ERROR] Interactive sof-testbench4 failed to bind port {port}")
+                return False
+
+            self.live_proc = proc
+            self.live_client = client
+            self.live_port = port
+            client.exec_shell("pause")
+            _st_p, plat_out = client.exec_shell(f"platform-cfg preset {eff_preset}")
+            self._active_preset_applied = eff_preset
+            client.get_info()
+            client.set_perf_measurement_state(2)
+
+            start_msg = (
+                f"[SOFR :{port}] Started interactive sof-testbench4 (no topology loaded): $ {cmd_str}\n"
+                f"[SOFR :{port}] {plat_out.strip()}"
+            )
+            debug_log_command("SOF-TESTBENCH4-START", cmd_str, returncode=0, stdout=plat_out.strip())
+            if log_callback:
+                log_callback(start_msg)
+            return True
+
+    def _destroy_active_pipelines_unlocked(
+        self,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> List[str]:
+        """Destroy all currently active pipelines on the interactive server via IPC4 messages
+        (SET_PIPELINE_STATE(PAUSED) -> MOD_UNBIND -> SET_PIPELINE_STATE(RESET) -> DELETE_PIPELINE).
+        Caller must hold `self._ipc_lock`.
+        """
+        logs: List[str] = []
+        client = self.live_client
+        plan = self.active_ipc_plan
+        if client is None or plan is None:
+            self.active_ipc_plan = None
+            self.active_pipeline_ids = []
+            return logs
+
+        client.exec_shell("pause")
+        all_pipes = list(plan.playback_pipelines) + list(plan.capture_pipelines)
+        if not all_pipes:
+            self.active_ipc_plan = None
+            self.active_pipeline_ids = []
+            return logs
+
+        header = f"[IPC4] Destroying active pipelines {plan.selected_pipeline_ids} via IPC4…"
+        logs.append(header)
+        if log_callback:
+            log_callback(header)
+
+        # 1. Transition active pipelines to PAUSED
+        for pop in all_pipes:
+            pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_PAUSED)
+            desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
+            st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+            ipc_st = rdict.get("ipc_status", st)
+            line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+            logs.append(line)
+            if log_callback:
+                log_callback(line)
+
+        # 2. Unbind cross-pipeline modules (SOF_IPC4_MOD_UNBIND)
+        for rop in plan.routes:
+            if rop.is_inter_pipeline:
+                desc = (
+                    f"MOD_UNBIND({rop.src_name} [0x{rop.src_module_id:x}:{rop.src_instance_id} q{rop.src_queue}] "
+                    f"-> {rop.sink_name} [0x{rop.dst_module_id:x}:{rop.dst_instance_id} q{rop.dst_queue}])"
+                )
+                st, rdict, _ = client.send_ipc4_tx(
+                    rop.unbind_primary, rop.unbind_extension, description=desc
+                )
+                ipc_st = rdict.get("ipc_status", st)
+                line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+                logs.append(line)
+                if log_callback:
+                    log_callback(line)
+
+        # 3. Transition active pipelines to RESET
+        for pop in all_pipes:
+            pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RESET)
+            desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RESET)"
+            st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+            ipc_st = rdict.get("ipc_status", st)
+            line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+            logs.append(line)
+            if log_callback:
+                log_callback(line)
+
+        # 4. Delete pipelines (SOF_IPC4_GLB_DELETE_PIPELINE)
+        for pop in all_pipes:
+            pri, ext = encode_delete_pipeline(pop.instance_id)
+            desc = f"DELETE_PIPELINE(ppl={pop.instance_id} '{pop.name}')"
+            st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+            ipc_st = rdict.get("ipc_status", st)
+            line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+            logs.append(line)
+            if log_callback:
+                log_callback(line)
+
+        self.active_ipc_plan = None
+        self.active_pipeline_ids = []
+        client.ipc_widget_map.clear()
+        client.ipc_kcontrols.clear()
+        client.ipc_route_edges.clear()
+        return logs
+
+    def destroy_active_pipelines_via_ipc(
+        self,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> List[str]:
+        """Thread-safe wrapper to destroy currently active pipelines via IPC4."""
+        with self._ipc_lock:
+            return self._destroy_active_pipelines_unlocked(log_callback=log_callback)
+
+    def sync_selected_pipelines_via_ipc(
+        self,
+        tplg_path: str,
+        pipeline_ids: List[int],
+        rate: int = 48000,
+        rate_out: Optional[int] = None,
+        channels: int = 2,
+        channels_out: Optional[int] = None,
+        bits: int = 32,
+        in_raw_paths: Optional[List[str]] = None,
+        out_raw_paths: Optional[List[str]] = None,
+        platform_preset: Optional[str] = None,
+        force_recreate: bool = False,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[bool, List[str]]:
+        """Destroy any previously active pipelines via IPC4 and create the newly selected
+        pipelines (`pipeline_ids`) from `tplg_path` via IPC4 (`CREATE_PIPELINE`, `MOD_INIT_INSTANCE`,
+        `LARGE_CONFIG_SET`, `MOD_BIND`).
+        """
+        if not tplg_path or not os.path.isfile(tplg_path):
+            return (False, [f"[IPC4] Topology file not found: {tplg_path}"])
+
+        eff_rate_out = rate_out if (rate_out and rate_out > 0) else rate
+        eff_ch_out = channels_out if (channels_out and channels_out > 0) else channels
+        norm_pipes = [int(p) for p in (pipeline_ids or [1, 2])]
+
+        if not self.start_interactive_server(platform_preset=platform_preset, log_callback=log_callback):
+            return (False, ["[IPC4] Failed to start interactive sof-testbench4 server"])
+
+        with self._ipc_lock:
+            client = self.live_client
+            if client is None:
+                return (False, ["[IPC4] Interactive testbench client not connected"])
+
+            if (
+                not force_recreate
+                and self.active_ipc_plan is not None
+                and self.active_tplg_path == tplg_path
+                and self.active_pipeline_ids == norm_pipes
+            ):
+                return (True, [])
+
+            logs: List[str] = []
+            # 1. Destroy previously created pipelines via IPC4 if any are active
+            if self.active_ipc_plan is not None:
+                logs.extend(self._destroy_active_pipelines_unlocked(log_callback=log_callback))
+
+            # 2. Ensure input/output raw file paths exist and configure io-cfg on server
+            if not in_raw_paths:
+                default_in = os.path.join(self.work_dir, "tb_input.raw")
+                if not os.path.isfile(default_in):
+                    self.generate_input_signal("sine_997", rate, channels, bits, duration_sec=0.15)
+                in_raw_paths = [default_in]
+            if not out_raw_paths:
+                default_out = os.path.join(self.work_dir, "tb_output.raw")
+                out_raw_paths = [default_out]
+
+            pipe_arg = ",".join(str(p) for p in norm_pipes)
+            fmt_arg = f"S{bits}_LE"
+            in_arg = ",".join(in_raw_paths)
+            out_arg = ",".join(out_raw_paths)
+
+            client.exec_shell("pause")
+            io_cmd = (
+                f"io-cfg -i {in_arg} -o {out_arg} -p {pipe_arg} "
+                f"-r {rate} -R {eff_rate_out} -c {channels} -n {eff_ch_out} -b {fmt_arg}"
+            )
+            client.exec_shell(io_cmd)
+
+            # 3. Parse compiled .tplg and build the IPC4 creation & binding plan for norm_pipes
+            try:
+                parsed_tplg = TplgIpc4Parser.parse_file(tplg_path)
+                plan = build_ipc4_plan(
+                    parsed_tplg,
+                    norm_pipes,
+                    fs_in=rate,
+                    fs_out=eff_rate_out,
+                    channels_in=channels,
+                    channels_out=eff_ch_out,
+                    frame_fmt_name=fmt_arg,
+                )
+            except Exception as exc:
+                err_line = f"[IPC4] Failed to build IPC4 plan from {os.path.basename(tplg_path)}: {exc}"
+                logs.append(err_line)
+                if log_callback:
+                    log_callback(err_line)
+                return (False, logs)
+
+            create_hdr = (
+                f"[IPC4] Creating selected pipelines {norm_pipes} from {os.path.basename(tplg_path)} "
+                f"({len(plan.pipelines_by_id)} pipelines, {len(plan.widgets)} modules, {len(plan.routes)} bindings)…"
+            )
+            logs.append(create_hdr)
+            if log_callback:
+                log_callback(create_hdr)
+
+            # 4. Execute each IPC4 step (CREATE_PIPELINE, MOD_INIT, LARGE_CFG, MOD_BIND)
+            all_ok = True
+            for step in plan.steps:
+                st, rdict, _ = client.send_ipc4_tx(
+                    step.primary,
+                    step.extension,
+                    step.payload,
+                    description=step.description,
+                )
+                ipc_st = rdict.get("ipc_status", st)
+                line = f"  [IPC4-TX] {step.description} -> status={ipc_st}"
+                logs.append(line)
+                if log_callback:
+                    log_callback(line)
+                if st != 0 or ipc_st != 0:
+                    all_ok = False
+                    break
+
+            if not all_ok:
+                return (False, logs)
+
+            self.active_ipc_plan = plan
+            self.active_tplg_path = tplg_path
+            self.active_pipeline_ids = list(norm_pipes)
+
+            # Populate client IPC metadata maps for telemetry & live kcontrols
+            client.ipc_widget_map.clear()
+            for wop in plan.widgets:
+                cid = ((wop.instance_id & 0xFFFF) << 16) | (wop.module_id & 0xFFFF)
+                client.ipc_widget_map[cid] = (wop.name, wop.pipeline_id)
+
+            client.ipc_route_edges = [
+                {
+                    "edge_id": idx + 1,
+                    "src_node_id": ((r.src_instance_id & 0xFFFF) << 16) | (r.src_module_id & 0xFFFF),
+                    "dst_node_id": ((r.dst_instance_id & 0xFFFF) << 16) | (r.dst_module_id & 0xFFFF),
+                    "src_name": r.src_name,
+                    "dst_name": r.sink_name,
+                    "control_name": "",
+                    "kcontrol_numid": 0,
+                    "active": True,
+                }
+                for idx, r in enumerate(plan.routes)
+            ]
+
+            client.ipc_kcontrols = []
+            for idx, ctl in enumerate(plan.kcontrols, start=1):
+                if ctl.ctl_type == SND_SOC_TPLG_TYPE_MIXER:
+                    t_str = "BOOL" if ctl.max_val == 1 else "INT"
+                elif ctl.ctl_type == SND_SOC_TPLG_TYPE_ENUM:
+                    t_str = "ENUM"
+                else:
+                    t_str = "BYTES"
+                if ctl.ctl_type == SND_SOC_TPLG_TYPE_BYTES:
+                    default_vals: List[int] = []
+                else:
+                    default_vals = [ctl.default_step_value()] * max(1, ctl.num_channels)
+                client.ipc_kcontrols.append(
+                    KcontrolTelemetryItem(
+                        numid=idx,
+                        name=ctl.name,
+                        iface_str="MIXER",
+                        type_id=ctl.ctl_type,
+                        type_str=t_str,
+                        access_str="rw",
+                        count=max(1, ctl.num_channels),
+                        min_val=0,
+                        max_val=ctl.max_val,
+                        values=default_vals,
+                        enum_names=list(ctl.enum_texts),
+                        target_widget=ctl.widget_name,
+                        pipeline_id=ctl.pipeline_id,
+                    )
+                )
+
+            return (True, logs)
+
+    def apply_kcontrol_via_ipc(
+        self,
+        kcontrol_name: str,
+        values: List[int],
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[int, str]:
+        """Send live kcontrol update (volume/switch/enum) to an IPC-created module via SOF_IPC4_MOD_LARGE_CONFIG_SET."""
+        with self._ipc_lock:
+            if not self.live_client or not self.active_ipc_plan:
+                return (-1, "No active IPC pipelines in testbench")
+            matched: Optional[TplgKcontrolDesc] = None
+            for ctl in self.active_ipc_plan.kcontrols:
+                if ctl.name == kcontrol_name or kcontrol_name in ctl.name or ctl.name in kcontrol_name:
+                    matched = ctl
+                    break
+            if matched is None:
+                return (-2, f"Kcontrol '{kcontrol_name}' not found in active pipelines {self.active_pipeline_ids}")
+            chunks = encode_kcontrol_set_ipc(matched, values)
+            if not chunks:
+                return (-3, f"Unsupported kcontrol type for '{matched.name}'")
+            last_st = 0
+            for c_idx, (pri, ext, payload) in enumerate(chunks):
+                desc = (
+                    f"LARGE_CONFIG_SET(kctl='{matched.name}' on '{matched.widget_name}' "
+                    f"[0x{matched.module_id:x}:{matched.instance_id}] = {values})"
+                )
+                st, rdict, _ = self.live_client.send_ipc4_tx(pri, ext, payload, description=desc)
+                ipc_st = rdict.get("ipc_status", st)
+                last_st = ipc_st if st == 0 else st
+                msg = f"[IPC4-TX] {desc} -> status={last_st}"
+                if log_callback:
+                    log_callback(msg)
+            return (last_st, f"Updated '{matched.name}' = {values} via IPC4 (status={last_st})")
+
+    def apply_bytes_kcontrol_via_ipc(
+        self,
+        kcontrol_name: str,
+        blob_or_abi: bytes,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[int, str]:
+        """Send live BYTES kcontrol update to an IPC-created module via SOF_IPC4_MOD_LARGE_CONFIG_SET."""
+        with self._ipc_lock:
+            if not self.live_client or not self.active_ipc_plan:
+                return (-1, "No active IPC pipelines in testbench")
+            matched: Optional[TplgKcontrolDesc] = None
+            for ctl in self.active_ipc_plan.kcontrols:
+                if ctl.ctl_type == SND_SOC_TPLG_TYPE_BYTES and (
+                    ctl.name == kcontrol_name or kcontrol_name in ctl.name or ctl.name in kcontrol_name
+                ):
+                    matched = ctl
+                    break
+            if matched is None:
+                return (-2, f"Bytes kcontrol '{kcontrol_name}' not found in active pipelines")
+            param_id = matched.abi_type
+            payload_data = blob_or_abi
+            # If blob starts with struct sof_abi_hdr magic ("SOF\0" = 0x00464F53), strip 32-byte ABI header
+            if len(blob_or_abi) >= 32:
+                magic, ptype, psize = struct.unpack_from("<3I", blob_or_abi, 0)
+                if magic == 0x00464F53 and 32 + psize <= len(blob_or_abi):
+                    param_id = ptype
+                    payload_data = blob_or_abi[32 : 32 + psize]
+            chunks = encode_large_config_set_chunks(
+                matched.module_id, matched.instance_id, param_id, payload_data
+            )
+            last_st = 0
+            for pri, ext, chunk in chunks:
+                desc = (
+                    f"LARGE_CONFIG_SET(bytes='{matched.name}' on '{matched.widget_name}' "
+                    f"[0x{matched.module_id:x}:{matched.instance_id}], param_id={param_id}, {len(chunk)}B)"
+                )
+                st, rdict, _ = self.live_client.send_ipc4_tx(pri, ext, chunk, description=desc)
+                ipc_st = rdict.get("ipc_status", st)
+                last_st = ipc_st if st == 0 else st
+                if log_callback:
+                    log_callback(f"[IPC4-TX] {desc} -> status={last_st}")
+            return (last_st, f"Updated bytes '{matched.name}' ({len(payload_data)}B) via IPC4 (status={last_st})")
+
+    def set_pipeline_state_via_ipc(
+        self,
+        pipeline_id: int,
+        state_str: str,
+        log_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[int, str]:
+        """Send SOF_IPC4_GLB_SET_PIPELINE_STATE for `pipeline_id` via IPC4."""
+        st_map = {
+            "reset": SOF_IPC4_PIPELINE_STATE_RESET,
+            "pause": SOF_IPC4_PIPELINE_STATE_PAUSED,
+            "paused": SOF_IPC4_PIPELINE_STATE_PAUSED,
+            "run": SOF_IPC4_PIPELINE_STATE_RUNNING,
+            "running": SOF_IPC4_PIPELINE_STATE_RUNNING,
+        }
+        state_val = st_map.get(state_str.strip().lower(), SOF_IPC4_PIPELINE_STATE_PAUSED)
+        with self._ipc_lock:
+            if not self.live_client:
+                return (-1, "Interactive testbench not connected")
+            pri, ext = encode_set_pipeline_state(pipeline_id, state_val)
+            desc = f"SET_PIPELINE_STATE(ppl={pipeline_id}, {state_str.upper()})"
+            st, rdict, _ = self.live_client.send_ipc4_tx(pri, ext, description=desc)
+            ipc_st = rdict.get("ipc_status", st)
+            msg = f"[IPC4-TX] {desc} -> status={ipc_st}"
+            if log_callback:
+                log_callback(msg)
+            return (ipc_st if st == 0 else st, msg)
 
     def run_testbench(
         self,
@@ -1239,17 +2240,33 @@ class TestbenchRunner:
         rate: int = 48000,
         channels: int = 2,
         bits: int = 32,
+        rate_out: Optional[int] = None,
+        channels_out: Optional[int] = None,
         duration_sec: float = 0.15,
         wav_source: str = "",
+        extra_in_wavs: Optional[List[str]] = None,
+        num_outputs: int = 1,
+        platform_preset: Optional[str] = None,
         control_script: str = "",
         kcontrol_overrides: Optional[Dict[str, List[int]]] = None,
+        bytes_overrides: Optional[Dict[str, str]] = None,
         keep_alive: bool = False,
+        hot_reload_if_alive: bool = False,
         on_live_waveform: Optional[Callable[[List[float], List[float], int], None]] = None,
     ) -> TestbenchRunResult:
-        """Launch sof-testbench4 with `-S <port> -W`, configure and control it via the SOFR
-        network protocol, collect full DSP telemetry & processed audio, and return TestbenchRunResult.
+        """Drive the persistent interactive sof-testbench4 server (started WITHOUT -t):
+        1. Generate input signal .raw/.wav files.
+        2. Destroy any previously active pipelines via IPC4 and create the selected pipelines
+           (`pipeline_ids`) via IPC4 (`CREATE_PIPELINE`, `MOD_INIT_INSTANCE`, `LARGE_CONFIG_SET`, `MOD_BIND`).
+        3. Apply any kcontrol/bytes overrides via IPC4 `LARGE_CONFIG_SET`.
+        4. Transition selected pipelines to `PAUSED` then `RUNNING` via `SET_PIPELINE_STATE` IPC4.
+        5. Execute `run-ipc` to step the DSP scheduler until input EOF and collect telemetry & output audio.
+        6. Transition selected pipelines back to `PAUSED` via `SET_PIPELINE_STATE` IPC4 (keeping them resident).
         """
-        self.stop_live_session()
+        eff_rate_out = rate_out if (rate_out and rate_out > 0) else rate
+        eff_ch_out = channels_out if (channels_out and channels_out > 0) else channels
+        eff_preset = self.map_platform_to_tb_preset(platform_preset or self.platform_preset)
+        norm_pipes = [int(p) for p in (pipeline_ids or [1, 2])]
 
         in_raw, in_wav, in_norm = self.generate_input_signal(
             signal_kind=signal_kind,
@@ -1259,176 +2276,170 @@ class TestbenchRunner:
             duration_sec=duration_sec,
             wav_source=wav_source,
         )
+
+        # Support multiple comma-separated input raw files (-i in1,in2,...) up to 4
+        in_raw_list = [in_raw]
+        if extra_in_wavs:
+            for idx, ex_wav in enumerate(extra_in_wavs[:3], start=2):
+                ex_raw = os.path.join(self.work_dir, f"tb_input_{idx}.raw")
+                if ex_wav and os.path.isfile(ex_wav) and shutil.which("sox"):
+                    subprocess.run(
+                        [
+                            "sox",
+                            "--encoding",
+                            "signed-integer",
+                            ex_wav,
+                            "-L",
+                            "-r",
+                            str(rate),
+                            "-c",
+                            str(channels),
+                            "-b",
+                            "32" if bits == 24 else str(bits),
+                            ex_raw,
+                            "trim",
+                            "0",
+                            f"{duration_sec:.2f}",
+                        ],
+                        check=False,
+                        capture_output=True,
+                    )
+                else:
+                    shutil.copyfile(in_raw, ex_raw)
+                in_raw_list.append(ex_raw)
+
+        # Support multiple comma-separated output raw files (-o out1,out2,...) up to 4
         out_raw = os.path.join(self.work_dir, "tb_output.raw")
         out_wav = os.path.join(self.work_dir, "tb_output.wav")
-        if os.path.exists(out_raw):
-            os.remove(out_raw)
+        out_raw_list = [out_raw]
+        for idx in range(2, min(4, max(1, num_outputs)) + 1):
+            out_raw_list.append(os.path.join(self.work_dir, f"tb_output_{idx}.raw"))
+        for opath in out_raw_list:
+            if os.path.exists(opath):
+                os.remove(opath)
 
         self.last_in_samples = list(in_norm)
         self.last_out_raw_path = out_raw
         self.last_rate = rate
+        self.last_rate_out = eff_rate_out
         self.last_channels = channels
+        self.last_channels_out = eff_ch_out
         self.last_bits = bits
         self.last_signal_kind = signal_kind
         self.rt_phase_idx = 0
 
-        pipe_arg = ",".join(str(p) for p in pipeline_ids) if pipeline_ids else "1,2"
+        pipe_arg = ",".join(str(p) for p in norm_pipes)
         fmt_arg = f"S{bits}_LE"
-        port = self._allocate_free_port(SOF_NET_DEFAULT_PORT)
+        target_frames = max(256, int(eff_rate_out * duration_sec))
 
-        cmd = [
-            self.testbench_bin,
-            "-r",
-            str(rate),
-            "-R",
-            str(rate),
-            "-c",
-            str(channels),
-            "-n",
-            str(channels),
-            "-b",
-            fmt_arg,
-            "-p",
-            pipe_arg,
-            "-t",
-            tplg_path,
-            "-i",
-            in_raw,
-            "-o",
-            out_raw,
-            "-S",
-            str(port),
-            "-W",
-        ]
-        if control_script and os.path.isfile(control_script):
-            cmd.extend(["-s", control_script])
+        ipc_logs: List[str] = []
+        sync_ok, sync_lines = self.sync_selected_pipelines_via_ipc(
+            tplg_path=tplg_path,
+            pipeline_ids=norm_pipes,
+            rate=rate,
+            rate_out=eff_rate_out,
+            channels=channels,
+            channels_out=eff_ch_out,
+            bits=bits,
+            in_raw_paths=in_raw_list,
+            out_raw_paths=out_raw_list,
+            platform_preset=eff_preset,
+            force_recreate=True,
+        )
+        ipc_logs.extend(sync_lines)
+        port = self.live_port
+        cmd_str = (
+            f"[SOFR Interactive :{port} IPC4] platform={eff_preset} "
+            f"pipelines={pipe_arg} rate={rate}->{eff_rate_out} ch={channels}->{eff_ch_out} fmt={fmt_arg}"
+        )
 
-        cmd_str = " ".join(f'"{a}"' if " " in a else a for a in cmd)
-        target_frames = max(256, int(rate * duration_sec))
-
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+        if not sync_ok or self.live_client is None or self.active_ipc_plan is None:
+            err_txt = "\n".join(ipc_logs) or "Failed to create pipelines via IPC4"
+            debug_log_command("SOF-TESTBENCH4", cmd_str, returncode=1, stderr=err_txt)
+            return TestbenchRunResult(
+                success=False,
+                command=cmd_str,
+                in_wav_path=in_wav,
+                out_wav_path="",
+                in_samples=in_norm,
+                out_samples=[],
+                stdout="\n".join(ipc_logs),
+                stderr=err_txt,
+                summary_text=f"Status: FAIL (IPC4 Pipeline Creation Failed)  |  Pipelines: -p {pipe_arg}",
+                telemetry=None,
             )
 
-            client = TestbenchRemoteClient("127.0.0.1", port, timeout=2.0)
-            connected = False
-            deadline = time.monotonic() + 4.0
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    break
-                if client.connect() and client.ping():
-                    connected = True
-                    break
-                time.sleep(0.03)
+        try:
+            client = self.live_client
+            plan = self.active_ipc_plan
 
-            telemetry: Optional[TestbenchTelemetry] = None
-            captured_pcm_bytes = b""
+            # Apply any kcontrol overrides via IPC4 LARGE_CONFIG_SET
+            if kcontrol_overrides:
+                for kname, kvals in kcontrol_overrides.items():
+                    _st_k, k_msg = self.apply_kcontrol_via_ipc(kname, kvals)
+                    ipc_logs.append(f"  {k_msg}")
 
-            if connected:
-                # 1. Configure via SOFR Protocol
-                client.get_info()
-                client.set_perf_measurement_state(2)  # 2 = STARTED
+            # Apply any BYTES kcontrol file overrides via IPC4 LARGE_CONFIG_SET
+            if bytes_overrides:
+                for bname, bpath in bytes_overrides.items():
+                    if not bpath or not os.path.isfile(bpath):
+                        continue
+                    try:
+                        with open(bpath, "rb") as bfh:
+                            raw_blob = bfh.read(4096)
+                        _st_b, b_msg = self.apply_bytes_kcontrol_via_ipc(bname, raw_blob)
+                        ipc_logs.append(f"  {b_msg}")
+                    except Exception:
+                        pass
 
-                # Configure remote tone generator if requested
-                fmt_id = {16: SOF_PCM_FMT_S16_LE, 24: SOF_PCM_FMT_S24_LE, 32: SOF_PCM_FMT_S32_LE}.get(
-                    bits, SOF_PCM_FMT_S32_LE
-                )
-                if signal_kind == "remote_tone":
-                    client.pcm_control(
-                        SOF_PCM_OP_START_TONE,
-                        device="hw:0,0",
-                        rate=rate,
-                        channels=channels,
-                        freq_hz=1000,
-                        fmt_id=fmt_id,
-                    )
+            # Transition selected pipelines to PAUSED then RUNNING via IPC4 (matching tb_set_running_state)
+            with self._ipc_lock:
+                for pop in plan.playback_pipelines:
+                    pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_PAUSED)
+                    desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
+                    st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                    ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                for pop in plan.playback_pipelines:
+                    pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RUNNING)
+                    desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RUNNING)"
+                    st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                    ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
 
-                # Discover kcontrols and apply any kcontrol overrides over SOF_NET_OP_KCTL_SET
-                kctls = client.list_kcontrols(0)
-                if kcontrol_overrides:
-                    for kname, kvals in kcontrol_overrides.items():
-                        matched = next(
-                            (k for k in kctls if k.name == kname or kname in k.name),
-                            None,
-                        )
-                        if matched:
-                            client.set_kcontrol(
-                                numid=matched.numid,
-                                name=matched.name,
-                                values=kvals,
-                            )
-                        else:
-                            val_csv = ",".join(str(v) for v in kvals)
-                            client.exec_shell(f'amixer cset name="{kname}" {val_csv}')
+                # Capture pipelines transition in reverse order (sink to source) matching utils_ipc4.c
+                for pop in reversed(plan.capture_pipelines):
+                    pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_PAUSED)
+                    desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
+                    st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                    ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                for pop in reversed(plan.capture_pipelines):
+                    pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RUNNING)
+                    desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RUNNING)"
+                    st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                    ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
 
-                # 2. Control Execution via SOFR Protocol (ensure D0 active & wait for target_frames)
-                client.pm_control(SOF_PM_OP_WAKE_HOLD)
-                wait_deadline = time.monotonic() + max(2.0, duration_sec * 12.0)
-                while time.monotonic() < wait_deadline:
-                    if proc.poll() is not None:
-                        break
-                    st_p, p_stat, _ = client.pcm_control(SOF_PCM_OP_STATUS)
-                    frames_so_far = int(p_stat.get("frames_played", 0)) if st_p == 0 else 0
-                    if on_live_waveform is not None and os.path.isfile(out_raw) and os.path.getsize(out_raw) > 0:
-                        partial_out = self._read_raw_tail_normalized(out_raw, channels, bits, target_frames)
-                        if partial_out:
-                            on_live_waveform(in_norm[: len(partial_out)], partial_out, frames_so_far)
-                    if st_p == 0 and frames_so_far >= target_frames:
-                        break
-                    time.sleep(0.025)
+                # Step DSP scheduler on IPC-created pipelines until input EOF
+                _st_run, run_out = client.exec_shell("run-ipc", timeout_ms=8000)
 
-                # 3. Get Telemetry & Capture Audio Buffer via SOFR Protocol while DSP is in D0
+                # Collect full telemetry while pipelines are active
                 telemetry = client.collect_full_telemetry()
-                _, _, captured_pcm_bytes = client.pcm_control(
-                    SOF_PCM_OP_CAPTURE_BUFFER,
-                    device="hw:0,0",
-                    rate=rate,
-                    channels=channels,
-                    duration_ms=max(50, int(duration_sec * 1000)),
-                    fmt_id=SOF_PCM_FMT_S16_LE,
-                )
 
-                # Pause DSP at tick boundary (D3 hold release) after telemetry & audio capture
-                if not keep_alive:
-                    client.pm_control(SOF_PM_OP_RELEASE_HOLD)
+                # Transition pipelines back to PAUSED so they remain resident until selection changes
+                for pop in list(plan.playback_pipelines) + list(reversed(plan.capture_pipelines)):
+                    pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_PAUSED)
+                    desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
+                    st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                    ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
 
-                if signal_kind == "remote_tone" and not keep_alive:
-                    client.pcm_control(SOF_PCM_OP_STOP_TONE)
-
-                if keep_alive:
-                    self.live_proc = proc
-                    self.live_client = client
-                    self.live_port = port
-                else:
-                    # 4. Clean Shutdown via SOFR Protocol (`quit`)
-                    client.exec_shell("quit")
-                    client.close()
-
-            stdout_str = ""
-            stderr_str = ""
-            if not keep_alive:
-                try:
-                    stdout_str, stderr_str = proc.communicate(timeout=4.0)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    stdout_str, stderr_str = proc.communicate()
-
-            # Read output samples from out_raw (or fallback to SOFR captured PCM ring buffer)
             out_norm: List[float] = []
             if os.path.isfile(out_raw) and os.path.getsize(out_raw) > 0:
-                out_norm = self._read_raw_tail_normalized(out_raw, channels, bits, target_frames)
-            if not out_norm and captured_pcm_bytes:
-                out_norm = self._decode_s16_bytes_normalized(captured_pcm_bytes, channels)
-                if out_norm:
-                    self._write_raw_from_normalized(out_raw, out_norm, channels, bits)
+                out_norm = self._read_raw_head_normalized(out_raw, eff_ch_out, bits, target_frames)
 
-            ok = bool(connected and (len(out_norm) > 0 or (telemetry and telemetry.total_ll_ticks > 0)))
+            if on_live_waveform is not None and out_norm:
+                on_live_waveform(in_norm[: len(out_norm)], out_norm, len(out_norm))
+
+            ok = bool(len(out_norm) > 0 or (telemetry and telemetry.total_ll_ticks > 0))
             if ok and out_norm:
-                self._write_wav_from_normalized(out_wav, out_norm, rate)
+                self._write_wav_from_normalized(out_wav, out_norm, eff_rate_out)
 
             in_peak, in_rms = self._compute_metrics(in_norm)
             out_peak, out_rms = self._compute_metrics(out_norm)
@@ -1437,16 +2448,28 @@ class TestbenchRunner:
             if telemetry:
                 active_kcps = sum(c.avg_kcps for c in telemetry.cores if c.enabled)
                 telem_badge = (
-                    f"  |  SOFR :{port} Ticks={telemetry.total_ll_ticks} "
+                    f"  |  SOFR :{port} [{eff_preset.upper()}] Ticks={telemetry.total_ll_ticks} "
                     f"KCPS={active_kcps} Heap={telemetry.total_heap_bytes}B "
                     f"DAPM={telemetry.dapm_powered_nodes}/{telemetry.dapm_total_nodes}"
                 )
 
             summary = (
-                f"Status: {'PASS' if ok else 'FAIL'}  |  Pipelines: -p {pipe_arg}  |  "
+                f"Status: {'PASS' if ok else 'FAIL'} (IPC4)  |  Pipelines: -p {pipe_arg}  |  "
                 f"In: {len(in_norm)}f (Peak {in_peak:.1f}, RMS {in_rms:.1f} dBFS) → "
                 f"Out: {len(out_norm)}f (Peak {out_peak:.1f}, RMS {out_rms:.1f} dBFS)"
                 f"{telem_badge}"
+            )
+            stdout_str = "\n".join(ipc_logs) + ("\n" + run_out.strip() if run_out.strip() else "")
+            debug_log_command(
+                "SOF-TESTBENCH4",
+                cmd_str,
+                returncode=0 if ok else 1,
+                stdout=stdout_str,
+                stderr="",
+                extra=(
+                    f"{summary} | in[:6]={[round(x, 4) for x in in_norm[:6]]} "
+                    f"out[:6]={[round(x, 4) for x in out_norm[:6]]}"
+                ),
             )
             return TestbenchRunResult(
                 success=ok,
@@ -1460,11 +2483,19 @@ class TestbenchRunner:
                 in_rms_db=in_rms,
                 out_rms_db=out_rms,
                 stdout=stdout_str,
-                stderr=stderr_str,
+                stderr="",
                 summary_text=summary,
                 telemetry=telemetry,
             )
         except Exception as exc:
+            debug_log_command(
+                "SOF-TESTBENCH4",
+                cmd_str,
+                returncode=-1,
+                stdout="\n".join(ipc_logs),
+                stderr=str(exc),
+                extra="EXCEPTION",
+            )
             return TestbenchRunResult(
                 success=False,
                 command=cmd_str,
@@ -1472,9 +2503,9 @@ class TestbenchRunner:
                 out_wav_path="",
                 in_samples=in_norm,
                 out_samples=[],
-                stdout="",
+                stdout="\n".join(ipc_logs),
                 stderr=str(exc),
-                summary_text=f"Error executing testbench via SOFR protocol: {exc}",
+                summary_text=f"Error executing testbench via IPC4 protocol: {exc}",
                 telemetry=None,
             )
 
@@ -1482,7 +2513,7 @@ class TestbenchRunner:
         self,
         window_frames: int = 3600,
     ) -> Optional[Tuple[List[float], List[float], int, bool, bool]]:
-        """Poll real-time Input and Output waveform slices from the active live testbench session.
+        """Poll real-time Input and Output (or active Probe Tap) waveform slices from the active live testbench session.
         Returns (in_samples, out_samples, frames_played, dsp_active, tone_running) or None if disconnected.
         """
         if not self.live_client or not self.live_proc or self.live_proc.poll() is not None:
@@ -1490,7 +2521,7 @@ class TestbenchRunner:
 
         st, pcm_info, pcm_bytes = self.live_client.pcm_control(
             SOF_PCM_OP_CAPTURE_BUFFER,
-            duration_ms=max(40, int((window_frames / max(1, self.last_rate)) * 1000)),
+            duration_ms=max(40, int((window_frames / max(1, self.last_rate_out)) * 1000)),
         )
         if st != 0:
             return None
@@ -1522,14 +2553,27 @@ class TestbenchRunner:
                 rem = (start + window_frames) - n_in
                 in_slice = self.last_in_samples[start:] + self.last_in_samples[: min(n_in, rem)]
 
-        # Build live Output window from latest tail of tb_output.raw or SOFR PCM ring buffer
+        # If an internal module Probe Tap is active, read its live exit samples via SOF_PROBE_OP_READ_BUFFER
         out_slice: List[float] = []
-        if pcm_bytes and tone_running:
-            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels)
+        if self.active_probe_comp_id > 0:
+            pst, _rid, probe_s = self.live_client.probe_read_buffer(
+                comp_id=self.active_probe_comp_id,
+                max_bytes=8192,
+            )
+            if pst == 0 and probe_s:
+                if len(probe_s) >= window_frames:
+                    out_slice = probe_s[:window_frames]
+                else:
+                    reps = (window_frames // max(1, len(probe_s))) + 1
+                    out_slice = (probe_s * reps)[:window_frames]
+
+        # Build live Output window from latest tail of tb_output.raw or SOFR PCM ring buffer
+        if not out_slice and pcm_bytes and tone_running:
+            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels_out)
         if not out_slice and self.last_out_raw_path and os.path.isfile(self.last_out_raw_path):
             raw_tail = self._read_raw_tail_normalized(
                 self.last_out_raw_path,
-                self.last_channels,
+                self.last_channels_out,
                 self.last_bits,
                 max(window_frames * 2, 7200),
             )
@@ -1545,7 +2589,7 @@ class TestbenchRunner:
                         rem = (start + window_frames) - n_out
                         out_slice = raw_tail[start:] + raw_tail[: min(n_out, rem)]
         if not out_slice and pcm_bytes:
-            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels)
+            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels_out)
 
         return (in_slice, out_slice, frames_played, dsp_active, tone_running)
 
@@ -1578,6 +2622,45 @@ class TestbenchRunner:
                 for s in samples:
                     v = max(-2147483648, min(2147483647, int(s * scale)))
                     f.write(struct.pack("<" + "i" * channels, *([v] * channels)))
+
+    @staticmethod
+    def _read_raw_head_normalized(
+        raw_path: str,
+        channels: int,
+        bits: int,
+        max_frames: int = 7200,
+    ) -> List[float]:
+        """Read up to the first `max_frames` frames from byte offset 0 of a raw PCM file normalized to [-1.0, 1.0]."""
+        if not os.path.isfile(raw_path):
+            return []
+        ch = max(1, channels)
+        frame_sz = (2 if bits == 16 else 4) * ch
+        try:
+            file_sz = os.path.getsize(raw_path)
+            total_frames = file_sz // frame_sz
+            if total_frames <= 0:
+                return []
+            frames_to_read = min(total_frames, max_frames)
+            with open(raw_path, "rb") as f:
+                data = f.read(frames_to_read * frame_sz)
+        except Exception:
+            return []
+
+        n = len(data) // frame_sz
+        out: List[float] = []
+        if bits == 16:
+            for i in range(n):
+                vals = struct.unpack_from("<" + "h" * ch, data, i * frame_sz)
+                out.append(vals[0] / 32768.0)
+        elif bits == 24:
+            for i in range(n):
+                vals = struct.unpack_from("<" + "i" * ch, data, i * frame_sz)
+                out.append(max(-1.0, min(1.0, vals[0] / 8388608.0)))
+        else:
+            for i in range(n):
+                vals = struct.unpack_from("<" + "i" * ch, data, i * frame_sz)
+                out.append(vals[0] / 2147483648.0)
+        return out
 
     @staticmethod
     def _read_raw_tail_normalized(

@@ -3,7 +3,135 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import datetime
+import os
+import sys
+import threading
+import traceback
+from typing import Any, Callable, Dict, IO, List, Optional, Set, Tuple
+
+
+_DEBUG_LOCK = threading.Lock()
+_DEBUG_ENABLED: bool = False
+_DEBUG_LOG_PATH: str = ""
+_DEBUG_FH: Optional[IO[str]] = None
+_ORIG_EXCEPTHOOK = sys.excepthook
+_ORIG_THREAD_EXCEPTHOOK = getattr(threading, "excepthook", None)
+
+
+def _now_ts() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def enable_debug_logging(log_path: str = "tplg2-gui-debug.log") -> str:
+    """Enable GUI debug logging of all user actions and command outputs to `log_path`."""
+    global _DEBUG_ENABLED, _DEBUG_LOG_PATH, _DEBUG_FH
+    abs_path = os.path.abspath(log_path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with _DEBUG_LOCK:
+        if _DEBUG_FH is not None:
+            try:
+                _DEBUG_FH.close()
+            except Exception:
+                pass
+        _DEBUG_FH = open(abs_path, "w", encoding="utf-8", buffering=1)
+        _DEBUG_LOG_PATH = abs_path
+        _DEBUG_ENABLED = True
+        _DEBUG_FH.write(
+            f"================================================================================\n"
+            f"SOF Topology2 Studio GUI — Debug Session Log\n"
+            f"Started : {_now_ts()}\n"
+            f"PID     : {os.getpid()}\n"
+            f"CWD     : {os.getcwd()}\n"
+            f"Argv    : {' '.join(sys.argv)}\n"
+            f"LogFile : {abs_path}\n"
+            f"================================================================================\n"
+        )
+        _DEBUG_FH.flush()
+
+    def _custom_excepthook(exc_type: Any, exc_value: Any, exc_tb: Any) -> None:
+        tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        debug_log_line("EXCEPTION", f"Uncaught exception:\n{tb_str.rstrip()}")
+        _ORIG_EXCEPTHOOK(exc_type, exc_value, exc_tb)
+
+    def _custom_thread_excepthook(args: Any) -> None:
+        tb_str = "".join(
+            traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        )
+        tname = getattr(args.thread, "name", "thread")
+        debug_log_line("THREAD-EXCEPTION", f"Uncaught exception in {tname}:\n{tb_str.rstrip()}")
+        if _ORIG_THREAD_EXCEPTHOOK is not None:
+            _ORIG_THREAD_EXCEPTHOOK(args)
+
+    sys.excepthook = _custom_excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _custom_thread_excepthook
+
+    return abs_path
+
+
+def is_debug_enabled() -> bool:
+    return _DEBUG_ENABLED
+
+
+def get_debug_log_path() -> str:
+    return _DEBUG_LOG_PATH
+
+
+def debug_log_line(tag: str, message: str) -> None:
+    """Write a timestamped line or multi-line entry to the debug log file if enabled."""
+    if not _DEBUG_ENABLED or _DEBUG_FH is None:
+        return
+    ts = _now_ts()
+    with _DEBUG_LOCK:
+        try:
+            lines = str(message).splitlines() or [""]
+            _DEBUG_FH.write(f"[{ts}] [{tag}] {lines[0]}\n")
+            for extra_line in lines[1:]:
+                _DEBUG_FH.write(f"    {extra_line}\n")
+            _DEBUG_FH.flush()
+        except Exception:
+            pass
+
+
+def debug_log_action(category: str, action: str, details: str = "") -> None:
+    """Log an interactive user action (menu, button, canvas drag/click, kcontrol, attribute edit, etc.)."""
+    if not _DEBUG_ENABLED or _DEBUG_FH is None:
+        return
+    suffix = f" | {details}" if details else ""
+    debug_log_line(f"USER:{category}", f"{action}{suffix}")
+
+
+def debug_log_command(
+    subsystem: str,
+    command: str,
+    returncode: Optional[int] = None,
+    stdout: str = "",
+    stderr: str = "",
+    extra: str = "",
+) -> None:
+    """Log an external command or SOFR protocol operation alongside its full output."""
+    if not _DEBUG_ENABLED or _DEBUG_FH is None:
+        return
+    ts = _now_ts()
+    with _DEBUG_LOCK:
+        try:
+            rc_part = f" (rc={returncode})" if returncode is not None else ""
+            ex_part = f" [{extra}]" if extra else ""
+            _DEBUG_FH.write(f"[{ts}] [CMD:{subsystem}] $ {command}{rc_part}{ex_part}\n")
+            if stdout and stdout.strip():
+                _DEBUG_FH.write("  --- stdout ---\n")
+                for l in stdout.rstrip().splitlines():
+                    _DEBUG_FH.write(f"  {l}\n")
+            if stderr and stderr.strip():
+                _DEBUG_FH.write("  --- stderr ---\n")
+                for l in stderr.rstrip().splitlines():
+                    _DEBUG_FH.write(f"  {l}\n")
+            _DEBUG_FH.flush()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -311,6 +439,7 @@ class GraphViewModel:
     containers: Dict[int, PipelineContainer] = field(default_factory=dict)
     root_config: ConfigNode = field(default_factory=lambda: ConfigNode("root", node_type="object"))
     dirty: bool = False
+    graph_structure_modified: bool = False
     target_variant: Optional[CMakeTargetVariant] = None
 
     def clone(self) -> "GraphViewModel":
@@ -325,6 +454,7 @@ class GraphViewModel:
             containers={pid: c.clone() for pid, c in self.containers.items()},
             root_config=self.root_config.clone(),
             dirty=self.dirty,
+            graph_structure_modified=self.graph_structure_modified,
             target_variant=self.target_variant,
         )
 

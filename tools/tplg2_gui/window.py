@@ -27,7 +27,14 @@ from .compiler import (
 from .graph_canvas import TopologyGraphCanvas
 from .layout import _compute_node_geometry, layout_graph
 from .left_panes import LeftNavigationPanel
-from .model import ConfigNode, GraphNode, GraphViewModel
+from .model import (
+    ConfigNode,
+    GraphNode,
+    GraphViewModel,
+    debug_log_action,
+    debug_log_command,
+    debug_log_line,
+)
 from .parser import Topology2Workspace
 from .right_inspector import RightAttributeInspector
 from .serializer import (
@@ -37,11 +44,19 @@ from .serializer import (
 )
 from .testbench import (
     KcontrolTelemetryItem,
+    SOF_CDEV_WIN_DEBUG,
+    SOF_CDEV_WIN_FW_REGS,
+    SOF_CDEV_WIN_PERF,
     SOF_PCM_OP_CAPTURE_BUFFER,
     SOF_PCM_OP_START_TONE,
     SOF_PCM_OP_STOP_TONE,
     SOF_PM_OP_RELEASE_HOLD,
     SOF_PM_OP_WAKE_HOLD,
+    SOF_WORKLOAD_MEM_DRAM,
+    SOF_WORKLOAD_MEM_SRAM,
+    SOF_WORKLOAD_SIM_OFF,
+    SOF_WORKLOAD_SIM_REALTIME,
+    SOF_WORKLOAD_SIM_VIRTUAL,
     TestbenchRunResult,
     TestbenchRunner,
     TestbenchTelemetry,
@@ -80,6 +95,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         win_key = Gtk.EventControllerKey.new()
         win_key.connect("key-pressed", self._on_window_key_pressed)
         self.add_controller(win_key)
+        self.connect("close-request", self._on_window_close_request)
 
         self.workspace: Optional[Topology2Workspace] = None
         self.compiler: Optional[TopologyCompiler] = None
@@ -89,6 +105,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.last_telemetry: Optional[TestbenchTelemetry] = None
         self._discovered_kcontrols: List[KcontrolTelemetryItem] = []
         self._pending_kctl_overrides: Dict[str, List[int]] = {}
+        self._pending_bytes_overrides: Dict[str, str] = {}
+        self._syncing_remote_controls: bool = False
         self._log_line_diagnostics: Dict[int, CompileDiagnostic] = {}
         self._last_compile_diagnostics: List[CompileDiagnostic] = []
         self._last_conf_path: str = ""
@@ -96,6 +114,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self._last_allocated_height: int = 0
         self._rt_timer_id: Optional[int] = None
         self._rt_poll_busy: bool = False
+        self._pipeline_sync_seq: int = 0
         self.graph_tabs: List[GraphTabPage] = []
         self._new_file_counter: int = 0
         self.target_platform: str = "mtl"
@@ -107,6 +126,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_graph_modified=self._on_graph_modified,
             on_history_changed=self._update_undo_redo_buttons,
             on_kcontrol_changed=self._on_canvas_kcontrol_changed,
+            on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
+            on_testbench_io_changed=self._on_canvas_testbench_io_changed,
         )
 
         self._build_header_bar()
@@ -448,6 +469,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def action_select_target_platform(self, platform_id: str) -> None:
         """Select the target SoC platform definition (tgl, adl, mtl, lnl, ptl, nvl) for testbench compilation."""
         plat = platform_id.strip().lower()
+        debug_log_action("TARGET-PLATFORM", f"Select target platform '{plat}'")
         self.target_platform = plat
         plat_conf_map = {
             "tgl": "platform/intel/tgl.conf",
@@ -466,6 +488,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if self.compiler:
             self.compiler.target_platform = plat
             self.compiler.extra_platform_conf = self.target_platform_def_path
+        if self.tb_runner:
+            self.tb_runner.platform_preset = plat
+            if self.tb_runner.live_client:
+                tb_preset = TestbenchRunner.map_platform_to_tb_preset(plat)
+                st, out = self.tb_runner.live_client.exec_shell(f"platform-cfg preset {tb_preset}")
+                self.append_log(f"[SOFR] $ platform-cfg preset {tb_preset} (status={st})\n{out.strip()}")
+                self._on_refresh_telemetry_clicked(None)
 
         # Update PLATFORM variable in the active tab's GraphViewModel if present
         active = self.get_active_tab()
@@ -867,18 +896,23 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.right_notebook.append_page(telem_box, Gtk.Label(label="SOFR Telemetry"))
 
         # Right Notebook Tab 3: Remote Control & Kcontrols (SOFR Protocol)
+        ctl_scroll = Gtk.ScrolledWindow()
+        ctl_scroll.set_vexpand(True)
+        ctl_scroll.set_hexpand(True)
+        ctl_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
         ctl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         ctl_box.set_margin_start(6)
         ctl_box.set_margin_end(6)
         ctl_box.set_margin_top(6)
         ctl_box.set_margin_bottom(6)
 
-        # Section 1: DSP Power, Execution, Tone & Telemetry Poll Controls (2 compact rows)
+        # Section 1: DSP Power, Execution, Tone, Hot-Reload & Telemetry Poll Controls
         dsp_hdr = Gtk.Label(label="DSP Power, Tone & Execution Control", xalign=0.0)
         dsp_hdr.add_css_class("heading")
         ctl_box.append(dsp_hdr)
 
-        exec_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        exec_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         btn_wake = Gtk.Button(label="▶ Resume (D0)")
         btn_wake.set_hexpand(True)
         btn_wake.set_tooltip_text("SOF_NET_OP_PM_CTL: SOF_PM_OP_WAKE_HOLD")
@@ -891,41 +925,152 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         btn_pause.connect("clicked", lambda _b: self._on_remote_pm_ctl(SOF_PM_OP_RELEASE_HOLD))
         exec_row1.append(btn_pause)
 
-        btn_step = Gtk.Button(label="⏭ Step 10 Ticks")
+        btn_step = Gtk.Button(label="⏭ Step 10")
         btn_step.set_hexpand(True)
         btn_step.set_tooltip_text("SOF_NET_OP_SHELL_EXEC: step 10")
         btn_step.connect("clicked", lambda _b: self._on_remote_shell_preset("step 10"))
         exec_row1.append(btn_step)
+
+        self.hot_reload_btn = Gtk.ToggleButton(label="🔥 Hot-Reload")
+        self.hot_reload_btn.set_active(False)
+        self.hot_reload_btn.set_tooltip_text(
+            "When Keep Server (-W) is active, hot-reload compiled topologies via 'tplg-load' & 'io-cfg' without restarting sof-testbench4"
+        )
+        exec_row1.append(self.hot_reload_btn)
         ctl_box.append(exec_row1)
 
-        exec_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.remote_tone_btn = Gtk.ToggleButton(label="🎵 1kHz Tone")
-        self.remote_tone_btn.set_hexpand(True)
+        exec_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.remote_tone_btn = Gtk.ToggleButton(label="🎵 Tone")
         self.remote_tone_btn.set_tooltip_text("SOF_NET_OP_PCM_CTL: START_TONE / STOP_TONE")
         self.remote_tone_btn.connect("toggled", self._on_remote_tone_toggled)
         exec_row2.append(self.remote_tone_btn)
 
-        btn_poll = Gtk.Button(label="🔄 Refresh Telemetry")
+        self.remote_tone_spin = Gtk.SpinButton.new_with_range(20, 20000, 100)
+        self.remote_tone_spin.set_value(1000)
+        self.remote_tone_spin.set_tooltip_text("Tone generator frequency (Hz) for START_TONE")
+        self.remote_tone_spin.connect("value-changed", self._on_remote_tone_freq_changed)
+        exec_row2.append(self.remote_tone_spin)
+
+        btn_poll = Gtk.Button(label="🔄 Refresh")
         btn_poll.set_hexpand(True)
-        btn_poll.set_tooltip_text("Poll SOF_NET_OP_TELEM_SNAPSHOT & SOF_PCM_OP_CAPTURE_BUFFER")
+        btn_poll.set_tooltip_text("Poll SOF_NET_OP_TELEM_SNAPSHOT, OP_WORKLOAD_SIM_CFG & SOF_PCM_OP_CAPTURE_BUFFER")
         btn_poll.connect("clicked", self._on_refresh_telemetry_clicked)
         exec_row2.append(btn_poll)
 
-        btn_stop_srv = Gtk.Button(label="⏹ Stop Server")
-        btn_stop_srv.set_hexpand(True)
+        btn_stop_srv = Gtk.Button(label="⏹ Stop")
         btn_stop_srv.set_tooltip_text("Send SOF_NET_OP_SHELL_EXEC 'quit' to stop live testbench server")
         btn_stop_srv.connect("clicked", self._on_stop_live_server_clicked)
         exec_row2.append(btn_stop_srv)
         ctl_box.append(exec_row2)
 
-        # Section 2: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
+        # Section 2: Platform & Workload Simulation (SOF_NET_OP_WORKLOAD_SIM_CFG)
+        wsim_hdr = Gtk.Label(label="Workload Simulation & Core Gating (OP_WORKLOAD_SIM_CFG)", xalign=0.0)
+        wsim_hdr.add_css_class("heading")
+        ctl_box.append(wsim_hdr)
+
+        wsim_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        wsim_row1.append(Gtk.Label(label="Sim:"))
+        self.wsim_mode_combo = Gtk.DropDown.new_from_strings(
+            ["Off (Host Measured)", "Virtual CPC Sim", "Real-Time Paced"]
+        )
+        self.wsim_mode_combo.set_selected(0)
+        self.wsim_mode_combo.set_hexpand(True)
+        self.wsim_mode_combo.set_tooltip_text("Workload simulation mode (-w off|virtual|realtime / OP_WORKLOAD_SIM_CFG)")
+        self.wsim_mode_combo.connect("notify::selected", self._on_wsim_config_changed)
+        wsim_row1.append(self.wsim_mode_combo)
+
+        wsim_row1.append(Gtk.Label(label="Mem:"))
+        self.wsim_mem_combo = Gtk.DropDown.new_from_strings(
+            ["SRAM (1.0x)", "DRAM (1.6x+2c)"]
+        )
+        self.wsim_mem_combo.set_selected(0)
+        self.wsim_mem_combo.set_tooltip_text("Default memory domain penalty (-M sram|dram / OP_WORKLOAD_SIM_CFG)")
+        self.wsim_mem_combo.connect("notify::selected", self._on_wsim_config_changed)
+        wsim_row1.append(self.wsim_mem_combo)
+        ctl_box.append(wsim_row1)
+
+        wsim_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        wsim_row2.append(Gtk.Label(label="MHz:"))
+        self.wsim_freq_spin = Gtk.SpinButton.new_with_range(0, 2400, 50)
+        self.wsim_freq_spin.set_value(400)
+        self.wsim_freq_spin.set_tooltip_text("Simulated DSP core clock frequency in MHz (0 = platform default)")
+        self.wsim_freq_spin.connect("value-changed", self._on_wsim_config_changed)
+        wsim_row2.append(self.wsim_freq_spin)
+
+        self.core_toggle_btns: List[Gtk.ToggleButton] = []
+        for cid in range(4):
+            cbtn = Gtk.ToggleButton(label=f"C{cid}")
+            cbtn.set_active(cid == 0)
+            cbtn.set_tooltip_text(f"Enable/disable DSP Core {cid} via SOF_PM_OP_CORE_GET / CORE_PUT")
+            cbtn.connect("toggled", lambda b, idx=cid: self._on_core_toggle_clicked(idx, b))
+            self.core_toggle_btns.append(cbtn)
+            wsim_row2.append(cbtn)
+
+        btn_wsim_rst = Gtk.Button(label="↺ Reset Sim")
+        btn_wsim_rst.set_tooltip_text("Reset workload simulation counters & scheduler telemetry (OP_WORKLOAD_SIM_CFG RESET)")
+        btn_wsim_rst.connect("clicked", self._on_reset_wsim_clicked)
+        wsim_row2.append(btn_wsim_rst)
+        ctl_box.append(wsim_row2)
+
+        # Section 3: Pipeline State, LLEXT Loader, Trace Level & SRAM Window Inspector
+        adv_hdr = Gtk.Label(label="Pipeline State, LLEXT & SRAM Windows", xalign=0.0)
+        adv_hdr.add_css_class("heading")
+        ctl_box.append(adv_hdr)
+
+        ppl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        ppl_row.append(Gtk.Label(label="Pipe:"))
+        self.remote_pipe_spin = Gtk.SpinButton.new_with_range(1, 32, 1)
+        self.remote_pipe_spin.set_value(1)
+        self.remote_pipe_spin.set_tooltip_text("Target pipeline ID for ppl-state control")
+        ppl_row.append(self.remote_pipe_spin)
+
+        for p_lbl, p_st in (("▶ Run", "running"), ("⏸ Pause", "paused"), ("⏹ Reset", "reset")):
+            b_ps = Gtk.Button(label=p_lbl)
+            b_ps.set_hexpand(True)
+            b_ps.set_tooltip_text(f"Set pipeline state to '{p_st}' via 'ppl-state <id> {p_st}'")
+            b_ps.connect("clicked", lambda _b, s=p_st: self._on_remote_ppl_state_clicked(s))
+            ppl_row.append(b_ps)
+        ctl_box.append(ppl_row)
+
+        llext_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        btn_llext = Gtk.Button(label="📦 Load LLEXT (.so)…")
+        btn_llext.set_hexpand(True)
+        btn_llext.set_tooltip_text("Dynamically load a shared library module via SOF_NET_OP_LLEXT_LOAD (0x0030)")
+        btn_llext.connect("clicked", self._on_load_llext_clicked)
+        llext_row.append(btn_llext)
+
+        llext_row.append(Gtk.Label(label="Log:"))
+        self.trace_lvl_combo = Gtk.DropDown.new_from_strings(
+            ["0: Off", "1: Err", "2: Warn", "3: Info", "4: Dbg"]
+        )
+        self.trace_lvl_combo.set_selected(2)
+        self.trace_lvl_combo.set_tooltip_text("Set testbench trace log level (-d / 'loglevel 0..4')")
+        self.trace_lvl_combo.connect("notify::selected", self._on_trace_level_changed)
+        llext_row.append(self.trace_lvl_combo)
+        ctl_box.append(llext_row)
+
+        win_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        win_row.append(Gtk.Label(label="SRAM:"))
+        for w_lbl, w_id in (
+            ("Win0 FW_REGS", SOF_CDEV_WIN_FW_REGS),
+            ("Win2 TELEM", SOF_CDEV_WIN_DEBUG),
+            ("Win3 PERF", SOF_CDEV_WIN_PERF),
+        ):
+            b_win = Gtk.Button(label=w_lbl)
+            b_win.set_hexpand(True)
+            b_win.set_tooltip_text(f"Read raw 256-byte SRAM Window {w_id} via SOF_NET_OP_WIN_READ (0x0021)")
+            b_win.connect("clicked", lambda _b, wid=w_id, wname=w_lbl: self._on_read_sram_window_clicked(wid, wname))
+            win_row.append(b_win)
+        ctl_box.append(win_row)
+
+        # Section 4: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
         sh_hdr = Gtk.Label(label="Remote Testbench Shell (OP_SHELL_EXEC)", xalign=0.0)
         sh_hdr.add_css_class("heading")
         ctl_box.append(sh_hdr)
 
         sh_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.remote_shell_entry = Gtk.Entry()
-        self.remote_shell_entry.set_placeholder_text("info, pipelines, controls, stats, kernel cycles…")
+        self.remote_shell_entry.set_placeholder_text("info, pipelines, controls, stats, platform-cfg, workload-sim…")
         self.remote_shell_entry.set_hexpand(True)
         self.remote_shell_entry.connect("activate", lambda _e: self._on_run_remote_shell_clicked(None))
         sh_row.append(self.remote_shell_entry)
@@ -935,14 +1080,22 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         sh_row.append(btn_sh_run)
         ctl_box.append(sh_row)
 
-        sh_presets_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        sh_presets_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         for sh_cmd in ("info", "pipelines", "stats", "kernel cycles", "kernel threads"):
             b_pre = Gtk.Button(label=sh_cmd)
             b_pre.connect("clicked", lambda _b, c=sh_cmd: self._on_remote_shell_preset(c))
-            sh_presets_row.append(b_pre)
-        ctl_box.append(sh_presets_row)
+            sh_presets_row1.append(b_pre)
+        ctl_box.append(sh_presets_row1)
 
-        self.right_notebook.append_page(ctl_box, Gtk.Label(label="Remote Control"))
+        sh_presets_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        for sh_cmd in ("platform-cfg status", "workload-sim status", "sched-telem", "mod-buffers"):
+            b_pre2 = Gtk.Button(label=sh_cmd)
+            b_pre2.connect("clicked", lambda _b, c=sh_cmd: self._on_remote_shell_preset(c))
+            sh_presets_row2.append(b_pre2)
+        ctl_box.append(sh_presets_row2)
+
+        ctl_scroll.set_child(ctl_box)
+        self.right_notebook.append_page(ctl_scroll, Gtk.Label(label="Remote Control"))
 
         right_panel_frame = Gtk.Frame()
         right_panel_frame.add_css_class("high-level-panel")
@@ -992,6 +1145,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def load_topology2_directory(self, path: str) -> None:
         abs_path = os.path.abspath(path)
+        debug_log_action("LOAD-WORKSPACE", f"Load topology2 directory '{abs_path}'")
         self.append_log(f"Scanning Topology2 directory: {abs_path} …")
         ws = Topology2Workspace(abs_path)
         ws.scan_all()
@@ -1001,6 +1155,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.compiler.target_harness = self.target_harness_kind
         self.compiler.extra_platform_conf = self.target_platform_def_path
         self.tb_runner = TestbenchRunner(abs_path)
+        self.tb_runner.platform_preset = self.target_platform
+        # Start sof-testbench4 in interactive server mode on startup WITHOUT loading any topology (-t),
+        # and set the target platform preset.
+        self.tb_runner.start_interactive_server(
+            platform_preset=self.target_platform,
+            log_callback=self.append_log,
+        )
         self.left_panel.populate(ws)
         self._populate_target_menu()
 
@@ -1074,6 +1235,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_graph_modified=self._on_graph_modified,
             on_history_changed=self._update_undo_redo_buttons,
             on_kcontrol_changed=self._on_canvas_kcontrol_changed,
+            on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
+            on_testbench_io_changed=self._on_canvas_testbench_io_changed,
         )
         new_canvas.set_graph(vm, self.workspace)
 
@@ -1128,6 +1291,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.graph_notebook.set_tab_reorderable(view_stack, True)
         self.graph_tabs.append(tab_page)
         self.graph_notebook.set_current_page(pnum)
+        debug_log_action(
+            "TAB-OPEN",
+            f"Opened tab '{vm.title}'",
+            f"key={tab_key} kind={pane_kind} nodes={len(vm.nodes)} routes={len(vm.edges)}",
+        )
         self._sync_ui_to_active_tab()
         return tab_page
 
@@ -1155,6 +1323,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.graph_notebook.set_current_page(pnum)
 
         if btn.get_active():
+            debug_log_action("TAB-MODE", f"Switch tab '{tab_page.primary_id}' to Text Editor mode")
             btn.set_label("🕸 Graph")
             btn.set_tooltip_text("Switch back to Visual Graph Diagram (Ctrl+T)")
             if tab_page.text_needs_refresh_from_graph or not tab_page.text_editor.get_text().strip():
@@ -1167,6 +1336,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 f"(Edit .conf text directly — changes sync to diagram)"
             )
         else:
+            debug_log_action("TAB-MODE", f"Switch tab '{tab_page.primary_id}' to Visual Graph mode")
             btn.set_label("</> Text")
             btn.set_tooltip_text(
                 "Switch between Visual Graph Diagram and Colorized Topology2 (.conf) Text Editor (Ctrl+T)"
@@ -1215,7 +1385,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 target_variant=target_variant,
             )
             layout_graph(new_vm)
+            debug_log_action(
+                "TEXT-COMMIT",
+                f"Committed edited .conf text for '{fallback_title}'",
+                f"chars={len(new_text)} nodes={len(new_vm.nodes)} routes={len(new_vm.edges)}",
+            )
         except Exception as exc:
+            debug_log_action("TEXT-COMMIT-ERROR", f"Parse error in '{fallback_title}'", str(exc))
             return False, str(exc)
 
         # Record undo snapshot on canvas before replacing view model
@@ -1254,6 +1430,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _close_graph_tab(self, tab_page: GraphTabPage) -> bool:
         """Close the specified GraphTabPage in the Main Graph Notebook."""
+        debug_log_action("TAB-CLOSE", f"Close tab '{tab_page.primary_id}'", f"key={tab_page.tab_key}")
         pnum = self.graph_notebook.page_num(tab_page.view_stack)
         if tab_page in self.graph_tabs:
             self.graph_tabs.remove(tab_page)
@@ -1294,6 +1471,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _sync_ui_to_tab(self, tab: GraphTabPage) -> None:
         vm = tab.canvas.vm
+        self._pending_kctl_overrides.clear()
+        self._pending_bytes_overrides.clear()
         self._update_undo_redo_buttons()
         self._update_active_tab_header()
         if vm is None:
@@ -1326,6 +1505,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.status_lbl.set_text(
             f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
         )
+        self._sync_selected_pipelines_to_testbench()
 
     def _on_left_pane_item_selected(
         self,
@@ -1335,6 +1515,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     ) -> None:
         if not self.workspace:
             return
+        debug_log_action(
+            "LEFT-PANE-SELECT",
+            f"Select {pane_kind} '{primary_id}'",
+            f"secondary={secondary_id or ''}",
+        )
         try:
             tab_key = f"{pane_kind}:{primary_id}:{secondary_id or ''}"
             # If already open in a tab, switch to it directly without rebuilding
@@ -1767,8 +1952,68 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         return (sig_kind, wav_src, sig_label, rate, channels, bits)
 
+    def _extract_graph_io_config(self) -> Tuple[Optional[int], Optional[int], List[str], int]:
+        """Extract (rate_out, channels_out, extra_in_wavs, num_outputs) for asymmetric & multi-I/O graphs."""
+        rate_out: Optional[int] = None
+        ch_out: Optional[int] = None
+        extra_in_wavs: List[str] = []
+        num_outputs: int = 1
+
+        vm = self.canvas.vm
+        if not vm:
+            return (rate_out, ch_out, extra_in_wavs, num_outputs)
+
+        # Collect any additional testbench-source nodes with valid WAV files
+        source_nodes = [
+            n for n in vm.nodes.values()
+            if n.class_category == "TestbenchIO" and n.class_name == "testbench-source"
+        ]
+        enabled_sources = [
+            n for n in source_nodes
+            if str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        primary_src = enabled_sources[0] if enabled_sources else None
+        for sn in source_nodes:
+            if sn is primary_src:
+                continue
+            if str(sn.config.get_scalar("enabled", "false")).lower() == "true":
+                fp = str(sn.config.get_scalar("file_path", "")).strip()
+                if fp and os.path.isfile(fp):
+                    extra_in_wavs.append(fp)
+
+        enabled_sinks = [
+            n for n in vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and n.class_name == "testbench-sink"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        if len(enabled_sinks) > 1:
+            num_outputs = len(enabled_sinks)
+
+        # Inspect sink / DAI endpoint for output rate & channels (e.g. SRC 48k -> 16k or upmix/downmix)
+        sink_candidates: List[GraphNode] = []
+        if enabled_sinks and enabled_sinks[0].parent_node_id and enabled_sinks[0].parent_node_id in vm.nodes:
+            sink_candidates.append(vm.nodes[enabled_sinks[0].parent_node_id])
+        for n in vm.nodes.values():
+            if n.class_category not in ("Control", "TestbenchIO") and not n.out_ports and n not in sink_candidates:
+                sink_candidates.append(n)
+
+        for cand in sink_candidates:
+            for ch in cand.config.children:
+                if "output_audio_format" in ch.key or "input_audio_format" in ch.key:
+                    ro = str(ch.get_scalar("out_rate") or ch.get_scalar("in_rate") or "").strip()
+                    co = str(ch.get_scalar("out_channels") or ch.get_scalar("in_channels") or "").strip()
+                    if ro.isdigit() and int(ro) > 0:
+                        rate_out = int(ro)
+                    if co.isdigit() and int(co) > 0:
+                        ch_out = int(co)
+                    if rate_out or ch_out:
+                        return (rate_out, ch_out, extra_in_wavs, num_outputs)
+
+        return (rate_out, ch_out, extra_in_wavs, num_outputs)
+
     def _update_waveform_stream_labels(self) -> None:
-        """Update Input and Output waveform lane labels from active TestbenchIO or pipeline endpoints."""
+        """Update Input and Output waveform lane labels from active TestbenchIO, Probe Tap, or pipeline endpoints."""
         _sig_kind, _wav_src, sig_label, rate, channels, bits = self._extract_graph_stream_params()
 
         in_lbl = "INPUT PCM: Source (Host/DAI)"
@@ -1811,7 +2056,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 if host_in:
                     in_lbl = f"INPUT PCM: {host_in[0].id} (Pipe {host_in[0].pipeline_id or 1})"
 
-            if enabled_sinks:
+            if self.canvas.active_probe_node_id and self.canvas.active_probe_node_id in vm.nodes:
+                pnode = vm.nodes[self.canvas.active_probe_node_id]
+                cid = self.canvas.live_node_telemetry.get(pnode.id, {}).get("comp_id", 0)
+                out_lbl = f"PROBE TAP: {pnode.title} (comp_id={cid})"
+            elif enabled_sinks:
                 knode = enabled_sinks[0]
                 out_lbl = f"OUTPUT PCM: {knode.title} ({knode.subtitle})"
             else:
@@ -1945,6 +2194,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_node_attribute_edited(self, config: ConfigNode, key: str, new_val: str) -> None:
         if not self.canvas.vm:
             return
+        debug_log_action(
+            "ATTR-EDIT",
+            f"Edited attribute '{key}' = '{new_val}'",
+            f"config={config.key} node={self.canvas.selected_node_id or 'root'}",
+        )
         self.canvas.vm.dirty = True
         # Update node input/output format badges and geometry if format or stream_name changed
         if self.canvas.selected_node_id and self.canvas.selected_node_id in self.canvas.vm.nodes:
@@ -1956,6 +2210,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                         self.canvas.select_testbench_io_radio(node.id)
                     finally:
                         self.canvas._suppress_auto_history = False
+                elif key in ("enabled", "target_pipelines"):
+                    self._sync_selected_pipelines_to_testbench(force_recreate=True)
                 elif key == "io_type" and new_val.strip().lower() == "sig_gen" and node.class_name == "testbench-source":
                     if not node.config.get_scalar("signal_type"):
                         node.config.set_scalar(
@@ -1971,6 +2227,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                             node.subtitle,
                         )
             else:
+                if key == "included_param_file" and node.class_category == "Control":
+                    self.canvas.vm.graph_structure_modified = True
+                    if new_val.strip():
+                        node.badges = [os.path.basename(new_val.strip().strip('"'))]
                 node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
                 node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
             _compute_node_geometry(node)
@@ -1983,6 +2243,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_undo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.undo_description
         if self.canvas.undo():
+            debug_log_action("UNDO", f"Undid '{desc}'")
             self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
             self._update_active_tab_header()
@@ -1991,6 +2252,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_redo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.redo_description
         if self.canvas.redo():
+            debug_log_action("REDO", f"Redid '{desc}'")
             self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
             self._update_active_tab_header()
@@ -2059,6 +2321,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.canvas.vm or not self.compiler:
             return
         vm = self.canvas.vm
+        debug_log_action(
+            "COMPILE-CLICKED",
+            f"Compile '{vm.title}'",
+            f"kind={vm.view_kind} platform={self.target_platform} struct_modified={vm.graph_structure_modified}",
+        )
         self.left_panel.set_compile_tab_title("Compile ⏳")
         self.left_panel.show_compile_pane()
         self.compile_pane_status_lbl.set_text(f"Compiling {vm.title} …")
@@ -2078,6 +2345,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.canvas.vm or not self.compiler or not self.tb_runner:
             return
         vm = self.canvas.vm
+        debug_log_action(
+            "RUN-TESTBENCH-CLICKED",
+            f"Compile & Run '{vm.title}' in sof-testbench4",
+            f"kind={vm.view_kind} platform={self.target_platform} struct_modified={vm.graph_structure_modified}",
+        )
         self.left_panel.set_compile_tab_title("Compile ⏳")
         self.left_panel.show_compile_pane()
         self.compile_pane_status_lbl.set_text(f"Compiling {vm.title} for Testbench …")
@@ -2092,20 +2364,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _collect_kcontrol_overrides(self) -> Dict[str, List[int]]:
-        """Collect any kcontrol overrides from Control nodes on the graph and pending UI edits."""
-        overrides: Dict[str, List[int]] = dict(self._pending_kctl_overrides)
-        if not self.canvas.vm:
-            return overrides
-        for node in self.canvas.vm.nodes.values():
-            if node.class_category != "Control":
-                continue
-            cname = node.config.get_scalar("name", "")
-            val_str = node.config.get_scalar("value", "") or node.config.get_scalar("volume", "")
-            if cname and val_str:
-                vals = [int(x.strip()) for x in str(val_str).split(",") if x.strip().lstrip("-").isdigit()]
-                if vals:
-                    overrides[str(cname).strip('"')] = vals
-        return overrides
+        """Collect any pending user-modified kcontrol overrides."""
+        return dict(self._pending_kctl_overrides)
 
     def _on_compile_finished(self, res: CompileResult, run_tb_after: bool) -> bool:
         self.compile_btn.set_sensitive(True)
@@ -2152,13 +2412,17 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         if not run_tb_after:
             self.run_tb_btn.set_sensitive(True)
+            self._sync_selected_pipelines_to_testbench(force_recreate=True)
             return False
 
         # Resolve testbench signal, format, and pipeline IDs from the active Main Graph panel
         sig_kind, wav_src, _sig_lbl, rate, channels, bits = self._extract_graph_stream_params()
+        rate_out, ch_out, extra_in_wavs, num_outputs = self._extract_graph_io_config()
         pipes = list(res.pipeline_ids) if res.pipeline_ids else [1, 2]
         kctl_overrides = self._collect_kcontrol_overrides()
+        bytes_overrides = dict(self._pending_bytes_overrides)
         keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
+        hot_reload = bool(hasattr(self, "hot_reload_btn") and self.hot_reload_btn.get_active())
         self._stop_realtime_waveform_timer()
         self._update_waveform_stream_labels()
         self.wf_status_lbl.set_text("Waveforms [● Running Testbench…]")
@@ -2186,8 +2450,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 duration_sec=0.15,
                 wav_source=wav_src,
                 kcontrol_overrides=kctl_overrides,
+                bytes_overrides=bytes_overrides,
                 keep_alive=keep_alive,
                 on_live_waveform=on_live_progress,
+                extra_in_wavs=extra_in_wavs,
+                num_outputs=num_outputs,
+                rate_out=rate_out,
+                channels_out=ch_out,
+                hot_reload_if_alive=hot_reload,
             )
             GLib.idle_add(self._on_testbench_finished, tb_res)
 
@@ -2256,18 +2526,151 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         # Sync live telemetry kcontrol values onto matching graph Control nodes
         if self.canvas.vm and self._discovered_kcontrols:
             for kc in self._discovered_kcontrols:
-                if not kc.values:
+                if not kc.values or kc.type_str == "BYTES":
                     continue
                 for gnode in self.canvas.vm.nodes.values():
-                    if gnode.class_category == "Control":
+                    if gnode.class_category == "Control" and gnode.category != "control_bytes":
                         gname = str(gnode.config.get_scalar("name", "")).strip('"')
                         if gname and (gname == kc.name or gname in kc.name or kc.name in gname):
-                            gnode.config.set_scalar("value", str(kc.values[0]), origin="instance")
-            self.canvas.queue_draw()
+                            if kc.max_val > 1:
+                                gnode.config.set_scalar("max", str(kc.max_val), origin="default")
+                            if gname not in self._pending_kctl_overrides and kc.name not in self._pending_kctl_overrides:
+                                gnode.config.set_scalar("value", str(kc.values[0]), origin="default")
+        # Populate live node telemetry & DAPM power overlay badges on the active graph canvas
+        self.canvas.set_live_telemetry_overlay(telem)
+
+        # Sync Remote Control tab widgets with live telemetry state
+        self._syncing_remote_controls = True
+        try:
+            if hasattr(self, "core_toggle_btns"):
+                for cid, cbtn in enumerate(self.core_toggle_btns):
+                    cbtn.set_active(bool(telem.enabled_cores_mask & (1 << cid)))
+            if hasattr(self, "wsim_mode_combo") and 0 <= telem.workload_sim_mode <= 2:
+                self.wsim_mode_combo.set_selected(telem.workload_sim_mode)
+            if hasattr(self, "wsim_mem_combo") and 0 <= telem.default_mem_domain <= 1:
+                self.wsim_mem_combo.set_selected(telem.default_mem_domain)
+            if hasattr(self, "wsim_freq_spin") and telem.cores and telem.cores[0].freq_hz > 0:
+                self.wsim_freq_spin.set_value(float(telem.cores[0].freq_hz) / 1e6)
+        finally:
+            self._syncing_remote_controls = False
 
     # -------------------------------------------------------------------------
-    # Main Graph Canvas Kcontrol Live Server Synchronization
+    # Main Graph Canvas Probe Tap, Pipeline IPC4 Sync & Kcontrol Live Server Synchronization
     # -------------------------------------------------------------------------
+
+    def _on_window_close_request(self, _win: Gtk.Window) -> bool:
+        """Cleanly destroy active IPC pipelines and stop the interactive sof-testbench4 server on exit."""
+        self._stop_realtime_waveform_timer()
+        if self.tb_runner:
+            self.tb_runner.stop_live_session()
+        return False
+
+    def _on_canvas_testbench_io_changed(self, pipeline_ids: List[int]) -> None:
+        """Called when the user changes the selected TestbenchIO pipeline chain on the Main Graph Canvas."""
+        debug_log_action(
+            "PIPELINE-SELECT-CHANGED",
+            f"Selected pipelines {pipeline_ids} in Main Window",
+        )
+        self._update_waveform_stream_labels()
+        self._sync_selected_pipelines_to_testbench(
+            force_recreate=False,
+            explicit_pipeline_ids=pipeline_ids,
+        )
+
+    def _sync_selected_pipelines_to_testbench(
+        self,
+        force_recreate: bool = False,
+        explicit_pipeline_ids: Optional[List[int]] = None,
+    ) -> None:
+        """Compile the active graph if needed and destroy old pipelines / create the currently
+        selected pipelines in the interactive sof-testbench4 server via IPC4 messages.
+        """
+        if not self.canvas.vm or not self.compiler or not self.tb_runner:
+            return
+        vm = self.canvas.vm.clone()
+        _sig_kind, _wav_src, _sig_lbl, rate, channels, bits = self._extract_graph_stream_params()
+        rate_out, ch_out, _extra_in_wavs, _num_outputs = self._extract_graph_io_config()
+        target_plat = self.target_platform
+        self._pipeline_sync_seq += 1
+        seq = self._pipeline_sync_seq
+
+        def sync_worker() -> None:
+            if seq != self._pipeline_sync_seq or not self.compiler or not self.tb_runner:
+                return
+            res = self.compiler.compile_graph(vm)
+            if not res.success or not res.tplg_path or not os.path.isfile(res.tplg_path):
+                return
+            if seq != self._pipeline_sync_seq:
+                return
+            pipes = (
+                list(explicit_pipeline_ids)
+                if explicit_pipeline_ids
+                else (list(res.pipeline_ids) if res.pipeline_ids else [1, 2])
+            )
+            ok, ipc_lines = self.tb_runner.sync_selected_pipelines_via_ipc(
+                tplg_path=res.tplg_path,
+                pipeline_ids=pipes,
+                rate=rate,
+                rate_out=rate_out,
+                channels=channels,
+                channels_out=ch_out,
+                bits=bits,
+                platform_preset=target_plat,
+                force_recreate=force_recreate,
+            )
+            telem = (
+                self.tb_runner.live_client.collect_full_telemetry()
+                if (ok and self.tb_runner.live_client)
+                else None
+            )
+
+            def apply_on_main() -> bool:
+                if seq != self._pipeline_sync_seq:
+                    return False
+                self.last_compiled_tplg = res.tplg_path
+                for line in ipc_lines:
+                    self.append_log(line)
+                if telem is not None:
+                    self._apply_telemetry_to_ui(telem)
+                if ipc_lines:
+                    pipe_str = ",".join(str(p) for p in pipes)
+                    self.status_lbl.set_text(
+                        f"IPC4 synced pipelines [{pipe_str}] on interactive sof-testbench4 ({target_plat.upper()})"
+                    )
+                return False
+
+            GLib.idle_add(apply_on_main)
+
+        threading.Thread(target=sync_worker, daemon=True).start()
+
+    def _on_canvas_probe_tap_toggled(
+        self,
+        node_id: Optional[str],
+        comp_id: int,
+        widget_name: str,
+    ) -> None:
+        """Called when the user clicks the [TAP] probe pill on a module node in the Main Graph Canvas."""
+        if self.tb_runner:
+            self.tb_runner.active_probe_comp_id = comp_id if node_id else None
+            self.tb_runner.active_probe_widget_name = widget_name if node_id else ""
+        self._update_waveform_stream_labels()
+
+        if node_id is None:
+            self.status_lbl.set_text("Disabled module probe tap — bottom oscilloscope restored to main PCM output.")
+            if self.tb_runner and self.tb_runner.live_client:
+                self._on_refresh_telemetry_clicked(None)
+            return
+
+        self.status_lbl.set_text(
+            f"Probe Tap active on '{widget_name}' (comp_id={comp_id}) — bottom oscilloscope showing module exit PCM"
+        )
+        if self.tb_runner and self.tb_runner.live_client:
+            st, _res_id, tap_samples = self.tb_runner.live_client.probe_read_buffer(comp_id=comp_id, max_bytes=4096)
+            self.append_log(
+                f"[SOFR] Live OP_PROBE_CTL READ_BUFFER comp_id={comp_id} ('{widget_name}') -> status={st}, {len(tap_samples)} samples"
+            )
+            if tap_samples:
+                self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, tap_samples)
 
     def _on_canvas_kcontrol_changed(self, node: GraphNode) -> None:
         """Called when the user interacts with a Control widget directly on the Main Graph Canvas."""
@@ -2284,7 +2687,33 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         kname = str(node.config.get_scalar("name", "")).strip('"') or node.title
         if node.category == "control_bytes":
             bfile = str(node.config.get_scalar("included_param_file", "")).strip('"')
-            self.status_lbl.set_text(f"Updated bytes control '{kname}' → {bfile}")
+            if bfile:
+                self._pending_bytes_overrides[kname] = bfile
+            if self.tb_runner and self.tb_runner.live_client and bfile:
+                abs_b = bfile
+                if not os.path.isabs(abs_b) and self.workspace:
+                    cand = os.path.join(self.workspace.root_dir, bfile)
+                    if os.path.isfile(cand):
+                        abs_b = cand
+                matched_kc = next(
+                    (kc for kc in self._discovered_kcontrols if kc.name == kname or kname in kc.name or kc.name in kname),
+                    None,
+                )
+                target_name = matched_kc.name if matched_kc else kname
+                numid = matched_kc.numid if matched_kc else 0
+                if os.path.isfile(abs_b):
+                    try:
+                        with open(abs_b, "rb") as bf:
+                            raw_blob = bf.read(4096)
+                        st_ipc, ipc_msg = self.tb_runner.apply_bytes_kcontrol_via_ipc(
+                            target_name, raw_blob, log_callback=self.append_log
+                        )
+                        self.append_log(f"[IPC4] Live Bytes Kcontrol '{target_name}' <- {abs_b}: {ipc_msg}")
+                    except OSError:
+                        pass
+                self.status_lbl.set_text(f"Live Bytes control '{target_name}' updated via IPC4 from {os.path.basename(bfile)}")
+            else:
+                self.status_lbl.set_text(f"Updated bytes control '{kname}' → {bfile} (queued for next run)")
             return
 
         if node.category == "control_enum":
@@ -2310,20 +2739,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 break
 
         if self.tb_runner and self.tb_runner.live_client:
-            numid = matched_kc.numid if matched_kc else 0
             target_name = matched_kc.name if matched_kc else kname
             ch_cnt = max(1, getattr(matched_kc, "count", len(vals))) if matched_kc else len(vals)
             send_vals = [ival] * ch_cnt
             self._pending_kctl_overrides[target_name] = send_vals
-            st, _ = self.tb_runner.live_client.set_kcontrol(
-                numid=numid,
-                name=target_name,
-                values=send_vals,
+            st, ipc_msg = self.tb_runner.apply_kcontrol_via_ipc(
+                target_name, send_vals, log_callback=self.append_log
             )
-            self.append_log(
-                f"[SOFR] Live OP_KCTL_SET numid={numid} '{target_name}' = {send_vals} -> status={st}"
-            )
-            self.status_lbl.set_text(f"Live Kcontrol '{target_name}' = {send_vals} (status={st})")
+            self.status_lbl.set_text(f"Live Kcontrol '{target_name}' = {send_vals} via IPC4 (status={st})")
         else:
             self.status_lbl.set_text(
                 f"Updated Kcontrol '{kname}' = {vals} (queued for next Testbench run)"
@@ -2340,10 +2763,133 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_remote_tone_toggled(self, btn: Gtk.ToggleButton) -> None:
         if not self.tb_runner or not self.tb_runner.live_client:
             return
+        freq_hz = int(self.remote_tone_spin.get_value()) if hasattr(self, "remote_tone_spin") else 1000
+        self.tb_runner.remote_tone_freq_hz = freq_hz
         op = SOF_PCM_OP_START_TONE if btn.get_active() else SOF_PCM_OP_STOP_TONE
-        st, info, _ = self.tb_runner.live_client.pcm_control(op, freq_hz=1000)
-        self.append_log(f"[SOFR] Live OP_PCM_CTL tone={'ON' if btn.get_active() else 'OFF'} -> status={st} {info}")
+        st, info, _ = self.tb_runner.live_client.pcm_control(op, freq_hz=freq_hz)
+        self.append_log(
+            f"[SOFR] Live OP_PCM_CTL tone={'ON' if btn.get_active() else 'OFF'} ({freq_hz} Hz) -> status={st} {info}"
+        )
         self._on_refresh_telemetry_clicked(None)
+
+    def _on_remote_tone_freq_changed(self, spin: Gtk.SpinButton) -> None:
+        freq_hz = int(spin.get_value())
+        if self.tb_runner:
+            self.tb_runner.remote_tone_freq_hz = freq_hz
+            if self.tb_runner.live_client and self.remote_tone_btn.get_active():
+                st, info, _ = self.tb_runner.live_client.pcm_control(SOF_PCM_OP_START_TONE, freq_hz=freq_hz)
+                self.append_log(f"[SOFR] Updated live tone frequency to {freq_hz} Hz -> status={st} {info}")
+                self._on_refresh_telemetry_clicked(None)
+
+    def _on_wsim_config_changed(self, *_args: object) -> None:
+        if self._syncing_remote_controls or not self.tb_runner:
+            return
+        mode_idx = int(self.wsim_mode_combo.get_selected())
+        mem_idx = int(self.wsim_mem_combo.get_selected())
+        freq_mhz = int(self.wsim_freq_spin.get_value())
+
+        mode_names = {0: "off", 1: "virtual", 2: "realtime"}
+        mem_names = {0: "sram", 1: "dram"}
+        self.tb_runner.workload_sim_mode = mode_names.get(mode_idx, "off")
+        self.tb_runner.mem_domain_override = mem_names.get(mem_idx, "sram")
+        self.tb_runner.core_freq_override = freq_mhz
+
+        if self.tb_runner.live_client:
+            info = self.tb_runner.live_client.workload_sim_set(
+                mode=mode_idx,
+                default_mem_domain=mem_idx,
+                core_freqs_hz=[freq_mhz * 1000000] * 8,
+            )
+            st = info.get("status", 0) if info else -1
+            self.append_log(
+                f"[SOFR] Live OP_WORKLOAD_SIM_CFG mode={mode_names.get(mode_idx)} mem={mem_names.get(mem_idx)} freq={freq_mhz}MHz -> status={st}"
+            )
+            self._on_refresh_telemetry_clicked(None)
+        else:
+            self.status_lbl.set_text(
+                f"Workload Sim configured: mode={mode_names.get(mode_idx)}, mem={mem_names.get(mem_idx)}, {freq_mhz} MHz"
+            )
+
+    def _on_core_toggle_clicked(self, core_id: int, btn: Gtk.ToggleButton) -> None:
+        if self._syncing_remote_controls:
+            return
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to toggle DSP cores live.")
+            return
+        en = btn.get_active()
+        st, info = self.tb_runner.live_client.pm_core_enable(core_id, en)
+        self.append_log(
+            f"[SOFR] Live OP_PM_CTL Core {core_id} {'GET (ENABLE)' if en else 'PUT (DISABLE)'} -> status={st} {info}"
+        )
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_reset_wsim_clicked(self, _btn: Gtk.Button) -> None:
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to reset simulation stats.")
+            return
+        info = self.tb_runner.live_client.workload_sim_reset()
+        st = info.get("status", 0) if info else -1
+        self.tb_runner.live_client.exec_shell("sched-telem-reset")
+        self.append_log(f"[SOFR] Reset Workload Simulation & Scheduler Telemetry -> status={st}")
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_remote_ppl_state_clicked(self, state_str: str) -> None:
+        pid = int(self.remote_pipe_spin.get_value()) if hasattr(self, "remote_pipe_spin") else 1
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Interactive testbench server not connected.")
+            return
+        st, ipc_msg = self.tb_runner.set_pipeline_state_via_ipc(
+            pid, state_str, log_callback=self.append_log
+        )
+        self.status_lbl.set_text(f"Pipeline {pid} state -> {state_str} via IPC4 (status={st})")
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_load_llext_clicked(self, _btn: Gtk.Button) -> None:
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Select LLEXT Shared Library (.so) Module")
+        dialog.open(self, None, self._on_llext_file_selected)
+
+    def _on_llext_file_selected(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            gfile = dialog.open_finish(result)
+            if not gfile:
+                return
+            so_path = gfile.get_path()
+            if not so_path:
+                return
+            if self.tb_runner and self.tb_runner.live_client:
+                mod_name = os.path.splitext(os.path.basename(so_path))[0]
+                st, info = self.tb_runner.live_client.load_llext_module(so_path, lib_id=1, mod_name=mod_name)
+                self.append_log(f"[SOFR] Live OP_LLEXT_LOAD '{so_path}' -> status={st} {info}")
+                self.status_lbl.set_text(f"Loaded LLEXT module '{mod_name}' (status={st})")
+                self._on_refresh_telemetry_clicked(None)
+            else:
+                self.status_lbl.set_text(f"Selected LLEXT module: {so_path} (start live server to load)")
+        except Exception:
+            pass
+
+    def _on_trace_level_changed(self, *_args: object) -> None:
+        lvl = int(self.trace_lvl_combo.get_selected()) if hasattr(self, "trace_lvl_combo") else 2
+        if self.tb_runner:
+            self.tb_runner.trace_level = lvl
+            if self.tb_runner.live_client:
+                st, out = self.tb_runner.live_client.exec_shell(f"loglevel {lvl}")
+                self.append_log(f"[SOFR] $ loglevel {lvl} (status={st})\n{out.strip()}")
+
+    def _on_read_sram_window_clicked(self, win_id: int, win_label: str) -> None:
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to inspect SRAM windows.")
+            return
+        st, raw = self.tb_runner.live_client.read_sram_window(win_id=win_id, offset=0, size=256)
+        hex_lines: List[str] = [f"[SOFR] OP_WIN_READ {win_label} (win_id={win_id}, status={st}, {len(raw)} bytes):"]
+        for row_off in range(0, min(len(raw), 128), 16):
+            chunk = raw[row_off:row_off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            asc_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            hex_lines.append(f"  0x{row_off:04x}: {hex_part:<48}  |{asc_part}|")
+        self.append_log("\n".join(hex_lines))
+        self.left_panel.show_compile_pane()
+        self.status_lbl.set_text(f"Read {len(raw)} bytes from SRAM {win_label} (see Console Log)")
 
     def _on_remote_shell_preset(self, cmd: str) -> None:
         self.remote_shell_entry.set_text(cmd)
@@ -2366,14 +2912,22 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         telem = self.tb_runner.live_client.collect_full_telemetry()
         if telem:
             self._apply_telemetry_to_ui(telem)
-            _, _, pcm_bytes = self.tb_runner.live_client.pcm_control(
-                SOF_PCM_OP_CAPTURE_BUFFER,
-                duration_ms=150,
-            )
-            if pcm_bytes:
-                out_norm = self.tb_runner._decode_s16_bytes_normalized(pcm_bytes, telem.pcm_channels)
-                if out_norm:
-                    self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, out_norm)
+            if self.tb_runner.active_probe_comp_id is not None:
+                _, _, tap_samples = self.tb_runner.live_client.probe_read_buffer(
+                    comp_id=self.tb_runner.active_probe_comp_id,
+                    max_bytes=4096,
+                )
+                if tap_samples:
+                    self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, tap_samples)
+            else:
+                _, _, pcm_bytes = self.tb_runner.live_client.pcm_control(
+                    SOF_PCM_OP_CAPTURE_BUFFER,
+                    duration_ms=150,
+                )
+                if pcm_bytes:
+                    out_norm = self.tb_runner._decode_s16_bytes_normalized(pcm_bytes, telem.pcm_channels)
+                    if out_norm:
+                        self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, out_norm)
 
     def _on_stop_live_server_clicked(self, _btn: Gtk.Button) -> None:
         self._stop_realtime_waveform_timer()
@@ -2393,6 +2947,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             return
         player = shutil.which("aplay") or shutil.which("pw-play")
         if player:
+            debug_log_command("AUDIO-PLAY", f"{player} {self.last_output_wav}", returncode=0)
             subprocess.Popen([player, self.last_output_wav])
             self.status_lbl.set_text(f"Playing {self.last_output_wav} …")
         else:
@@ -2434,6 +2989,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         text: str,
         diagnostics: Optional[List[CompileDiagnostic]] = None,
     ) -> None:
+        if text.strip():
+            debug_log_line("GUI-LOG", text.rstrip("\n"))
         buf = self.log_view.get_buffer()
         diag_pool = diagnostics if diagnostics is not None else self._last_compile_diagnostics
 

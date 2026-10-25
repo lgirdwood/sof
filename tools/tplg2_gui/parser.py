@@ -2089,6 +2089,8 @@ class Topology2Workspace:
             elif st.stmt_type == "include":
                 inc_path = self.resolve_include(st.key, search_dirs)
                 if inc_path:
+                    if cfg.category_info == "Control.bytes" or "components/" in st.key:
+                        cfg.set_scalar("included_param_file", st.key, origin="instance")
                     self._apply_override_stmts_to_config(cfg, self.get_ast(inc_path), defines)
                 else:
                     cfg.set_scalar("included_conf", st.key, origin="instance")
@@ -2153,7 +2155,30 @@ class Topology2Workspace:
 
     def attach_widget_kcontrol_nodes(self, vm: GraphViewModel, parent_node: GraphNode) -> None:
         """Instantiate child kcontrol GraphNodes below parent_node for each control in Object.Control."""
+        default_bytes_files = {
+            "eqiir": "include/components/eqiir/bandpass.conf",
+            "eqfir": "include/components/eqfir/loudness.conf",
+            "drc": "include/components/drc/enabled.conf",
+            "dcblock": "include/components/dcblock/default.conf",
+            "tdfb": "include/components/tdfb/default.conf",
+            "multiband_drc": "include/components/multiband_drc/default.conf",
+            "crossover": "include/components/crossover/default.conf",
+            "aria": "include/components/aria/param_2.conf",
+            "micsel": "include/components/micsel/passthrough.conf",
+        }
+
         ctrl_group = parent_node.config.get_child("Object.Control")
+        if parent_node.class_name in default_bytes_files:
+            if ctrl_group is None:
+                ctrl_group = ConfigNode(key="Object.Control", node_type="object", category_info="controls")
+                parent_node.config.children.append(ctrl_group)
+            if not any(c.key.startswith("bytes") for c in ctrl_group.children):
+                def_bfile = default_bytes_files[parent_node.class_name]
+                b_cfg = ConfigNode(key="bytes.1", node_type="object", category_info="Control.bytes", origin="default")
+                if os.path.isfile(os.path.join(self.root_dir, def_bfile)):
+                    b_cfg.set_scalar("included_param_file", def_bfile, origin="default")
+                ctrl_group.children.insert(0, b_cfg)
+
         if not ctrl_group or not ctrl_group.children:
             return
 
@@ -2178,6 +2203,23 @@ class Topology2Workspace:
             if has_any_named and not kname and vm.view_kind not in ("module", "base_class"):
                 # Skip unused class template control slots that were not instantiated/named in this pipeline
                 continue
+            if not has_any_named and not kname:
+                # For newly added or standalone widgets, skip secondary uninstantiated mixer/enum slots in bench harness
+                if vm.view_kind not in ("module", "base_class") and cinst != "1":
+                    continue
+                w_up = parent_node.class_name.upper()
+                inst_suffix = f" {parent_node.instance_id}" if str(parent_node.instance_id) not in ("", "1") else ""
+                if ctype == "mixer":
+                    is_sw = str(ctrl_cfg.get_scalar("max", "")).strip() == "1"
+                    ctl_kind = "switch" if is_sw else "volume"
+                    kname = f"Analog Playback {w_up}{inst_suffix} {ctl_kind}"
+                elif ctype == "bytes":
+                    kname = f"Analog Playback {w_up}{inst_suffix} bytes"
+                elif ctype == "enum":
+                    kname = f"Analog Playback {w_up}{inst_suffix} enum"
+                else:
+                    kname = f"Analog Playback {w_up}{inst_suffix} {ctype}"
+                ctrl_cfg.set_scalar("name", kname, origin="default")
 
             title = f"{ctype}.{cinst}: {kname}" if kname else f"{ctype}.{cinst}"
 
@@ -2207,6 +2249,11 @@ class Topology2Workspace:
             elif ctype == "bytes":
                 subtitle = "Control.bytes (TLV/Blob)"
                 pfile = str(ctrl_cfg.get_scalar("included_param_file", "")).strip()
+                if not pfile and parent_node.class_name in default_bytes_files:
+                    cand_rel = default_bytes_files[parent_node.class_name]
+                    if os.path.isfile(os.path.join(self.root_dir, cand_rel)):
+                        pfile = cand_rel
+                        ctrl_cfg.set_scalar("included_param_file", pfile, origin="default")
                 max_val = str(ctrl_cfg.get_scalar("max", "")).strip()
                 if pfile:
                     badges.append(os.path.basename(pfile))

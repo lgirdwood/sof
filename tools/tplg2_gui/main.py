@@ -2,6 +2,7 @@
 """Entry point for the GTK4 Topology2 Visual Editor & Testbench Runner."""
 
 from __future__ import annotations
+import argparse
 import sys
 from typing import List, Optional
 
@@ -10,6 +11,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, Gtk
 
+from .model import debug_log_action, enable_debug_logging, get_debug_log_path, is_debug_enabled
 from .window import Topology2MainWindow
 
 
@@ -127,13 +129,43 @@ class Topology2GuiApp(Gtk.Application):
         if not self.win:
             self.win = Topology2MainWindow(self, initial_dir=self.initial_dir)
             self.win.maximize()
+            if is_debug_enabled():
+                self.win.append_log(f"[DEBUG] Action & Command debug logging active: {get_debug_log_path()}")
         self.win.present()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
-    initial_dir = args[0] if args else None
-    app = Topology2GuiApp(initial_dir=initial_dir)
+    parser = argparse.ArgumentParser(
+        prog="tplg2-gui.py",
+        description="SOF Topology2 GTK4 Visual Graph Editor & Testbench Studio",
+    )
+    parser.add_argument(
+        "initial_dir",
+        nargs="?",
+        default=None,
+        help="Optional path to tools/topology/topology2 directory",
+    )
+    parser.add_argument(
+        "-d",
+        "--debug",
+        action="store_true",
+        help="Enable debug logging of all user actions and command outputs to a text file (default: tplg2-gui-debug.log)",
+    )
+    parser.add_argument(
+        "--debug-file",
+        default="tplg2-gui-debug.log",
+        metavar="FILE",
+        help="Path to the debug log file (implies --debug when explicitly specified)",
+    )
+    raw_args = list(argv if argv is not None else sys.argv[1:])
+    parsed = parser.parse_args(raw_args)
+
+    if parsed.debug or any(a.startswith("--debug-file") for a in raw_args):
+        log_path = enable_debug_logging(parsed.debug_file)
+        print(f"[tplg2-gui] Debug logging enabled -> {log_path}", flush=True)
+        debug_log_action("APP", "Application startup", f"initial_dir={parsed.initial_dir or '(auto)'}")
+
+    app = Topology2GuiApp(initial_dir=parsed.initial_dir)
     return app.run([sys.argv[0]])
 
 
