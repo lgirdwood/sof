@@ -48,6 +48,21 @@
    * When built for the Xtensa simulator (`xt-run` via `scripts/rebuild-testbench.sh -p <platform>`, or manually with `-DTESTBENCH_XTENSA_SIM=ON`), CMake automatically selects the pure standard-C cooperative schedulers (`ll_schedule.c` and `dp_schedule.c`) instead of `ll_schedule_pthread.c` and `dp_schedule_pthread.c`.
    * This eliminates dependencies on `<pthread.h>`, `-lpthread`, `<sched.h>`, and `clock_gettime` that are unavailable in the Xtensa newlib (`-mlsp=sim`) runtime, while executing DP modules synchronously inside `scheduler_dp_ll_tick()` so their instruction cycles are included in `XT_RSR_CCOUNT()` profiling.
 
+#### Network Remote Control & Telemetry Interface (`remote_server.c`)
+
+`sof-testbench4` exposes the `sof-remote` TCP binary framing protocol (`SOF_NET_MAGIC = 0x534F4652` `'SOFR'`, `SOF_NET_VERSION = 1`, default TCP port `9998`) via `-S <port>` and `-W`:
+
+ * **Supported Opcodes**:
+   * `SOF_NET_OP_PING`, `SOF_NET_OP_GET_INFO`, `SOF_NET_OP_PM_CTL` (`query`, `release`/D3 pause, `wake`/D0 resume)
+   * `SOF_NET_OP_IPC_TX` (direct IPC4 message dispatch) and `SOF_NET_OP_IPC_LARGE_CFG` (BaseFW params 9, 12, 14, 15, 17, 18, 30 and live module `LARGE_CONFIG_GET`/`SET`)
+   * `SOF_NET_OP_WIN_INFO`, `SOF_NET_OP_WIN_READ`, `SOF_NET_OP_WIN_WRITE`, `SOF_NET_OP_WINSTREAM_IO` (emulated SRAM Windows 0–3 and debug slots)
+   * `SOF_NET_OP_TELEM_SNAPSHOT` (single-RPC composite telemetry snapshot consumed by `tools/softop/softop.py` and `sof-remote telem`)
+   * `SOF_NET_OP_SHELL_EXEC` (`info`, `pipelines`, `modules`, `tplg-load <file> [p1,p2,...]`, `ppl-create`, `ppl-state`, `ppl-delete`, `mod-bind`, `mod-unbind`, `mod-delete`, `controls`, live `amixer cset ...`, live `sof-ctl ...`, `stats`, `heap`, `kernel cycles`, `kernel threads`, `pause`, `resume`, `step [N]`, `loglevel <0..4>`, `quit`)
+   * `SOF_NET_OP_LLEXT_LOAD` (upload and load dynamic `.so` / `.llext` module images via `dlopen` / LLEXT table registration)
+   * `SOF_NET_OP_PROBE_CTL` (enumerate and read inter-component `struct comp_buffer` audio streams as probe points)
+   * `SOF_NET_OP_PCM_CTL` (`start-tone`, `stop-tone`, `status`, and `capture` from output streams)
+ * **Tick-Boundary Synchronization**: All network RPCs that inspect or mutate IPC/module/topology state acquire `g_tb_lock` between 1 ms LL ticks (`tb_remote_tick_begin()` / `tb_remote_tick_end()`), guaranteeing thread safety across multi-core LL and DP worker threads.
+
 ### Command-Line Options
 
 ```
@@ -69,6 +84,8 @@ Options to control test:
   -C <number of copy() iterations>
   -P <number of dynamic pipeline iterations>
   -s <script file to set controls, with amixer and sleep commands>
+  -S <port> Start sof-remote TCP server on <port> (default port: 9998)
+  -W Keep testbench running continuously for remote network control
 
 Options for input and output format override:
   -b <input_format>, S16_LE, S24_LE, or S32_LE
@@ -153,6 +170,51 @@ tools/testbench/build_testbench/install/bin/sof-testbench4 -r 48000 -R 48000 -c 
 tools/testbench/build_testbench/install/bin/sof-testbench4 -r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
   -t tools/build_tools/topology/topology2/development/sof-mtl-nocodec-dp-core-test.tplg \
   -p 5,6,7,8,11,12 -i pb_in.raw,cap1_in.raw,cap2_in.raw -o pb_out.raw,cap1_out.raw,cap2_out.raw
+
+# Interactive Remote Server Mode (connect with sof-remote or tools/softop/softop.py)
+tools/testbench/build_testbench/sof-testbench4 \
+  -t tools/build_tools/topology/topology2/target/sof-ipc4-tplg/sof-hda-generic.tplg \
+  -p 1,2 -S 9998 -W
+
+# In another terminal, query and control testbench over TCP:
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 info
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 telem
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 cards
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 pcm-caps
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 dapm /tmp/tb_dapm.dot
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 compr caps
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl list
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl get 1
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl set 1 28 28
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "pipelines"
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "controls"
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "amixer cset name=\"Pre Mixer Analog Playback Volume\" 20,20"
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 pcm start-tone hw:0,0 1000
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 pcm capture hw:0,0 100
+python3 tools/softop/softop.py --remote 127.0.0.1:9998
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "quit"
+```
+
+### Comprehensive Topology & Module Test Suite
+
+`tools/testbench/run_test_suite.sh` executes 67 automated test cases across 5 progressive tiers:
+
+ * **Tier 1 (46 tests)**: All 26 built-in SOF audio processing modules (`dcblock`, `drc`, `drc_multiband`, `dolby-dax`, `eqfir`, `eqiir`, `gain`, `igo_nr`, `level_multiplier`, `mfcc`, `mfccmel`, `micsel`, `micsel_multich`, `rtnr`, `sound_dose`, `tdfb`, `template_comp`, `aria`, `src`, `src_lite`, `asrc`, `crossover`, `google_ctc_audio_processing`, `google_rtc_audio_processing`, `phase_vocoder`, `stft_process`, `mixin`/`mixout`, `host-copier`/`dai-copier`/`module-copier`) across `S32_LE`, `S24_LE`, `S16_LE`, rate conversion (`44.1 kHz <-> 48 kHz`), and multi-channel (`4ch -> 2ch`).
+ * **Tier 2 (7 tests)**: Simple to complex multi-pipeline DAG topologies (3x HDMI passthrough, 3-pipeline cascaded `aria->gain->mixin->mixout`, 6-module EFX chain, 1-to-2 fan-out crossover, 2-to-1 fan-in Google RTC AEC, 4ch DMIC `tdfb->drc->eqiir->gain`, and 11-pipeline 6-input/5-output concurrent `sof-hda-generic.tplg`).
+ * **Tier 3 (6 tests)**: Combinations of Low-Latency (`LL`) and Data Processing (`DP`) modules (single-thread DP `phase_vocoder`, full-duplex dual-thread DP `phase_vocoder` and `stft_process` `192/48`, `512/128`, `1536/240`, and 6-pipeline LL + 2 DP `src` threads).
+ * **Tier 4 (6 tests)**: Multi-Core LL and Cross-Core DP execution across DSP Cores 0, 1, and 2 (`sof-mtl-nocodec.tplg`, `sof-hda-src-generic-dp.tplg`, `sof-mtl-nocodec-dp-core-test.tplg`, `sof-lnl-nocodec-dp-core-test.tplg`, `sof-ptl-nocodec-dp-core-test.tplg`, and `sof-mtl-rt1019-rt5682-dax.tplg`).
+ * **Tier 5 (2 tests)**: Runtime control scripts (`-s` with `amixer` and `sof-ctl`) and live `SOFR` v1 TCP remote control & 3-core telemetry inspection (`-S <port> -W` with `sof-remote`).
+
+```
+# Run the complete 67-test suite
+tools/testbench/run_test_suite.sh
+
+# Run a single tier (1..5) or filter by regex
+tools/testbench/run_test_suite.sh --tier 4
+tools/testbench/run_test_suite.sh --filter "mcore|fanout|fanin"
+
+# Or run via CTest from the testbench build directory
+ctest --test-dir tools/testbench/build_testbench --output-on-failure
 ```
 
 ### Apply controls to simulation

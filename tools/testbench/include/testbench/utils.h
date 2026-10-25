@@ -106,6 +106,8 @@ struct testbench_prm {
 	bool copy_check;
 	int trace_level;
 	int dynamic_pipeline_iterations;
+	int server_port;
+	bool server_wait;
 	char *pipeline_string;
 	int output_file_index;
 	int input_file_index;
@@ -173,6 +175,7 @@ int tb_pipeline_reset(struct ipc *ipc, struct pipeline *p);
 int tb_pipeline_start(struct ipc *ipc, struct pipeline *p);
 int tb_pipeline_stop(struct ipc *ipc, struct pipeline *p);
 int tb_read_controls(struct testbench_prm *tp, int64_t *sleep_ns);
+int tb_apply_control_line(struct testbench_prm *tp, const char *raw_line);
 int tb_set_bytes_control(struct testbench_prm *tp, struct tb_ctl *ctl, uint32_t *data);
 int tb_set_enum_control(struct testbench_prm *tp, struct tb_ctl *ctl, char *control_params);
 int tb_set_reset_state(struct testbench_prm *tp);

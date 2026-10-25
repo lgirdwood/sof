@@ -22,9 +22,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "testbench/utils.h"
 #include "testbench/file.h"
 #include "testbench/file_ipc4.h"
+#include "testbench/remote_server.h"
 #include "../../src/audio/copier/copier.h"
 
 SOF_DEFINE_REG_UUID(file);
@@ -79,6 +81,75 @@ static void sign_extend_source_s24(const struct audio_stream *source, int sample
 	}
 }
 
+static int generate_tone_s32(struct file_comp_data *cd, const struct audio_stream *sink,
+			     int samples, uint32_t freq_hz, int fmt)
+{
+	int32_t *snk = (int32_t *)sink->w_ptr;
+	int nch = cd->fs.channels > 0 ? cd->fs.channels : 2;
+	int rate = cd->fs.rate > 0 ? cd->fs.rate : 48000;
+	double step = 2.0 * M_PI * (double)freq_hz / (double)rate;
+	double scale = (fmt == SOF_IPC_FRAME_S24_4LE) ? (16000.0 * 256.0) : (16000.0 * 65536.0);
+	size_t bytes = samples * sizeof(int32_t);
+	int copied = 0;
+
+	while (bytes >= nch * sizeof(int32_t)) {
+		size_t bytes_snk = audio_stream_bytes_without_wrap(sink, snk);
+		int frames_avail = FILE_BYTES_TO_S32_SAMPLES(MIN(bytes, bytes_snk)) / nch;
+		int f, c;
+
+		if (frames_avail <= 0)
+			frames_avail = 1;
+		for (f = 0; f < frames_avail && bytes >= nch * sizeof(int32_t); f++) {
+			int32_t val = (int32_t)(scale * sin(cd->fs.tone_phase));
+
+			cd->fs.tone_phase += step;
+			if (cd->fs.tone_phase >= 2.0 * M_PI)
+				cd->fs.tone_phase -= 2.0 * M_PI;
+			for (c = 0; c < nch; c++) {
+				*snk = val;
+				snk = audio_stream_wrap(sink, snk + 1);
+				bytes -= sizeof(int32_t);
+				copied++;
+			}
+		}
+	}
+	return copied;
+}
+
+static int generate_tone_s16(struct file_comp_data *cd, const struct audio_stream *sink,
+			     int samples, uint32_t freq_hz)
+{
+	int16_t *snk = (int16_t *)sink->w_ptr;
+	int nch = cd->fs.channels > 0 ? cd->fs.channels : 2;
+	int rate = cd->fs.rate > 0 ? cd->fs.rate : 48000;
+	double step = 2.0 * M_PI * (double)freq_hz / (double)rate;
+	size_t bytes = samples * sizeof(int16_t);
+	int copied = 0;
+
+	while (bytes >= nch * sizeof(int16_t)) {
+		size_t bytes_snk = audio_stream_bytes_without_wrap(sink, snk);
+		int frames_avail = FILE_BYTES_TO_S16_SAMPLES(MIN(bytes, bytes_snk)) / nch;
+		int f, c;
+
+		if (frames_avail <= 0)
+			frames_avail = 1;
+		for (f = 0; f < frames_avail && bytes >= nch * sizeof(int16_t); f++) {
+			int16_t val = (int16_t)(16000.0 * sin(cd->fs.tone_phase));
+
+			cd->fs.tone_phase += step;
+			if (cd->fs.tone_phase >= 2.0 * M_PI)
+				cd->fs.tone_phase -= 2.0 * M_PI;
+			for (c = 0; c < nch; c++) {
+				*snk = val;
+				snk = audio_stream_wrap(sink, snk + 1);
+				bytes -= sizeof(int16_t);
+				copied++;
+			}
+		}
+	}
+	return copied;
+}
+
 /*
  * Read 32-bit samples from binary file
  */
@@ -90,6 +161,10 @@ static int read_binary_s32(struct file_comp_data *cd, const struct audio_stream 
 	size_t bytes = samples * sizeof(int32_t);
 	int ret;
 	int samples_copied = 0;
+	uint32_t tone_freq = 0;
+
+	if (tb_remote_is_tone_active(&tone_freq))
+		return generate_tone_s32(cd, sink, samples, tone_freq, cd->frame_fmt);
 
 	while (bytes) {
 		bytes_snk = audio_stream_bytes_without_wrap(sink, snk);
@@ -120,6 +195,7 @@ static int write_binary_s32(struct file_comp_data *cd, const struct audio_stream
 	size_t bytes = samples * sizeof(int32_t);
 	int ret;
 	int samples_copied = 0;
+	int shift = (cd->frame_fmt == SOF_IPC_FRAME_S24_4LE) ? 8 : 16;
 
 	while (bytes) {
 		bytes_src = audio_stream_bytes_without_wrap(source, src);
@@ -129,6 +205,8 @@ static int write_binary_s32(struct file_comp_data *cd, const struct audio_stream
 			cd->fs.write_failed = true;
 			return samples_copied;
 		}
+		tb_remote_record_output_samples_s32(src, ret, cd->fs.channels,
+						    cd->fs.rate, shift);
 		samples_copied += ret;
 		bytes -= ret * sizeof(int32_t);
 		src = audio_stream_wrap(source, src + ret);
@@ -259,6 +337,10 @@ static int read_binary_s16(struct file_comp_data *cd, const struct audio_stream 
 	size_t bytes = samples * sizeof(int16_t);
 	int ret;
 	int samples_copied = 0;
+	uint32_t tone_freq = 0;
+
+	if (tb_remote_is_tone_active(&tone_freq))
+		return generate_tone_s16(cd, sink, samples, tone_freq);
 
 	while (bytes) {
 		bytes_snk = audio_stream_bytes_without_wrap(sink, snk);
@@ -298,6 +380,7 @@ static int write_binary_s16(struct file_comp_data *cd, const struct audio_stream
 			cd->fs.write_failed = true;
 			return samples_copied;
 		}
+		tb_remote_record_output_samples_s16(src, ret, cd->fs.channels, cd->fs.rate);
 
 		samples_copied += ret;
 		bytes -= ret * sizeof(int16_t);
@@ -741,8 +824,17 @@ static int file_process(struct processing_module *mod,
 	int samples = 0;
 	int ret = 0;
 
-	if (cd->fs.reached_eof)
-		return 0;
+	if (cd->fs.reached_eof) {
+		uint32_t tone_freq = 0;
+
+		if (tb_remote_is_tone_active(&tone_freq)) {
+			cd->fs.reached_eof = false;
+			cd->fs.copy_timeout = false;
+			cd->copies_timeout_count = 0;
+		} else {
+			return 0;
+		}
+	}
 
 	/* Note: a SOF_COMP_DAI does not have input_buffers and output buffers set */
 	tb_getcycles(&cycles0);
@@ -815,6 +907,7 @@ static int file_process(struct processing_module *mod,
 
 	if (samples) {
 		cd->copies_timeout_count = 0;
+		cd->fs.copy_timeout = false;
 	} else {
 		cd->copies_timeout_count++;
 		if (cd->copies_timeout_count == FILE_MAX_COPIES_TIMEOUT) {

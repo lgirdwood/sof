@@ -14,6 +14,7 @@
 #include "testbench/trace.h"
 #include "testbench/file.h"
 #include "testbench/utils.h"
+#include "testbench/remote_server.h"
 
 #include <ctype.h>
 #include <getopt.h>
@@ -134,7 +135,9 @@ static void print_usage(char *executable)
 	       TB_MAX_PIPELINES_NUM);
 	printf("  -C <number of copy() iterations>\n");
 	printf("  -P <number of dynamic pipeline iterations>\n");
-	printf("  -s <script file to set controls, with amixer and sleep commands>\n\n");
+	printf("  -s <script file to set controls, with amixer and sleep commands>\n");
+	printf("  -S <port> Start sof-remote TCP server on <port> (default port: 9998)\n");
+	printf("  -W Keep testbench running continuously for remote network control\n\n");
 	printf("Options for input and output format override:\n");
 	printf("  -b <input_format>, S16_LE, S24_LE, or S32_LE\n");
 	printf("  -c <input channels>\n");
@@ -152,7 +155,7 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 	int option = 0;
 	int ret = 0;
 
-	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:")) != -1) {
+	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:S:W")) != -1) {
 		switch (option) {
 		/* input sample file */
 		case 'i':
@@ -225,6 +228,20 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 		/* control script file name */
 		case 's':
 			tp->control_file = strdup(optarg);
+			break;
+
+		/* start sof-remote TCP server on port */
+		case 'S':
+			tp->server_port = atoi(optarg);
+			if (tp->server_port <= 0)
+				tp->server_port = 9998;
+			break;
+
+		/* keep testbench running continuously for remote control */
+		case 'W':
+			tp->server_wait = true;
+			if (tp->server_port <= 0)
+				tp->server_port = 9998;
 			break;
 
 		/* print usage */
@@ -342,39 +359,51 @@ static int pipline_test(struct testbench_prm *tp)
 		printf("		           Test Start %d\n", dp_count);
 		printf("==========================================================\n");
 
-		err = tb_load_topology(tp);
-		if (err < 0) {
-			fprintf(stderr, "error: topology load %d failed %d\n", dp_count, err);
-			break;
+		if (tp->tplg_file) {
+			err = tb_load_topology(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: topology load %d failed %d\n", dp_count, err);
+				break;
+			}
+
+			err = tb_set_up_all_pipelines(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: pipelines set up %d failed %d\n", dp_count, err);
+				break;
+			}
+
+			err = tb_set_running_state(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: pipelines state set %d failed %d\n", dp_count, err);
+				break;
+			}
+
+			err = tb_find_file_components(tp); /* Track file comp status during copying */
+			if (err < 0) {
+				fprintf(stderr, "error: file component find failed %d\n", err);
+				break;
+			}
 		}
 
-		err = tb_set_up_all_pipelines(tp);
-		if (err < 0) {
-			fprintf(stderr, "error: pipelines set up %d failed %d\n", dp_count, err);
-			break;
-		}
-
-		err = tb_set_running_state(tp);
-		if (err < 0) {
-			fprintf(stderr, "error: pipelines state set %d failed %d\n", dp_count, err);
-			break;
-		}
-
-		err = tb_find_file_components(tp); /* Track file comp status during copying */
-		if (err < 0) {
-			fprintf(stderr, "error: file component find failed %d\n", err);
-			break;
+		if (tp->server_port > 0) {
+			err = tb_remote_server_start(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: remote server start failed %d\n", err);
+				break;
+			}
 		}
 
 		/* Use first file writer to create simulation time. Calculate coefficient
 		 * to calculate current time from file write samples count
 		 */
 		out_stat = tp->fw[0].state;
-		if (!out_stat) {
+		if (!out_stat && !tp->server_wait) {
 			fprintf(stderr, "error: no active output file component found\n");
+			tb_remote_server_stop();
 			break;
 		}
-		samples_to_ns = 1.0e9 / ((float)out_stat->channels * out_stat->rate);
+		samples_to_ns = out_stat ?
+				(1.0e9 / ((float)out_stat->channels * out_stat->rate)) : 0.0f;
 
 		/* Apply initial controls time to call again controls handler */
 		err = tb_read_controls(tp, &next_control_ns);
@@ -394,7 +423,7 @@ static int pipline_test(struct testbench_prm *tp)
 			if (tb_schedule_pipeline_check_state(tp))
 				break;
 
-			if (next_control_ns) {
+			if (next_control_ns && out_stat) {
 				time_ns = (int64_t)(samples_to_ns * out_stat->n);
 				if (time_ns >= next_control_ns) {
 					err = tb_read_controls(tp, &next_control_ns);
@@ -410,29 +439,37 @@ static int pipline_test(struct testbench_prm *tp)
 			}
 		}
 
-		tb_schedule_pipeline_check_state(tp); /* Once more to flush out remaining data */
+		if (!tp->server_wait)
+			tb_schedule_pipeline_check_state(tp); /* Once more to flush out remaining data */
 		tb_gettime(&td1);
 		delta_t = (td1.tv_sec - td0.tv_sec) * 1000000;
 		delta_t += (td1.tv_nsec - td0.tv_nsec) / 1000;
 		tb_collect_heap_usage(tp, heap_usage_records, &heap_usage_records_count);
 
 out:
-		err = tb_set_reset_state(tp);
-		if (err < 0) {
-			fprintf(stderr, "error: pipeline reset %d failed %d\n",
-				dp_count, err);
-			break;
+		if (tp->server_port > 0)
+			tb_remote_server_stop();
+
+		if (tp->tplg_file) {
+			err = tb_set_reset_state(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: pipeline reset %d failed %d\n",
+					dp_count, err);
+				break;
+			}
+
+			test_pipeline_stats(tp, delta_t, heap_usage_records,
+					    heap_usage_records_count);
+
+			err = tb_free_all_pipelines(tp);
+			if (err < 0) {
+				fprintf(stderr, "error: free pipelines %d failed %d\n",
+					dp_count, err);
+				break;
+			}
+
+			tb_free_topology(tp);
 		}
-
-		test_pipeline_stats(tp, delta_t, heap_usage_records, heap_usage_records_count);
-
-		err = tb_free_all_pipelines(tp);
-		if (err < 0) {
-			fprintf(stderr, "error: free pipelines %d failed %d\n", dp_count, err);
-			break;
-		}
-
-		tb_free_topology(tp);
 		dp_count++;
 	}
 
@@ -466,11 +503,43 @@ int main(int argc, char **argv)
 	if (!tp->channels_out)
 		tp->channels_out = tp->channels_in;
 
+	if (tp->server_port > 0) {
+		if (!tp->fs_in)
+			tp->fs_in = 48000;
+		if (!tp->bits_in) {
+			tp->bits_in = strdup("S16_LE");
+			tp->frame_fmt = tplg_find_format(tp->bits_in);
+		}
+		if (!tp->input_file_num) {
+			FILE *sfp = fopen("/tmp/sof_tb_srv_in.raw", "wb");
+
+			if (sfp) {
+				uint8_t zero[3840] = {0};
+
+				for (i = 0; i < 20; i++)
+					fwrite(zero, 1, sizeof(zero), sfp);
+				fclose(sfp);
+			}
+			for (i = 0; i < TB_MAX_INPUT_FILE_NUM; i++)
+				tp->input_file[i] = strdup("/tmp/sof_tb_srv_in.raw");
+			tp->input_file_num = TB_MAX_INPUT_FILE_NUM;
+		}
+		if (!tp->output_file_num) {
+			for (i = 0; i < TB_MAX_OUTPUT_FILE_NUM; i++) {
+				char path[64];
+
+				snprintf(path, sizeof(path), "/tmp/sof_tb_srv_out_%d.raw", i);
+				tp->output_file[i] = strdup(path);
+			}
+			tp->output_file_num = TB_MAX_OUTPUT_FILE_NUM;
+		}
+	}
+
 	if (!tp->fs_out)
 		tp->fs_out = tp->fs_in;
 
 	/* check mandatory args */
-	if (!tp->tplg_file) {
+	if (!tp->tplg_file && tp->server_port <= 0) {
 		fprintf(stderr, "topology file not specified, use -t file.tplg\n");
 		print_usage(argv[0]);
 		ret = EXIT_FAILURE;

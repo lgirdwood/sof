@@ -56,6 +56,9 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 	sys_comp_module_eq_iir_interface_init();
 	sys_comp_module_file_interface_init();
 	sys_comp_module_gain_interface_init();
+#if CONFIG_COMP_GOOGLE_CTC_AUDIO_PROCESSING
+	sys_comp_module_google_ctc_audio_processing_interface_init();
+#endif
 	sys_comp_module_google_rtc_audio_processing_interface_init();
 	sys_comp_module_igo_nr_interface_init();
 	sys_comp_module_level_multiplier_interface_init();
@@ -69,9 +72,11 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 	sys_comp_module_selector_interface_init();
 	sys_comp_module_sound_dose_interface_init();
 	sys_comp_module_src_interface_init();
+	sys_comp_module_src_lite_interface_init();
 	sys_comp_module_stft_process_interface_init();
 	sys_comp_module_tdfb_interface_init();
 	sys_comp_module_template_interface_init();
+	sys_comp_module_tone_interface_init();
 	sys_comp_module_volume_interface_init();
 
 	/* other necessary initializations */

@@ -37,6 +37,9 @@ add_executable(${testbench}
 	topology_ipc3.c
 	topology_ipc4.c
 )
+if(NOT TESTBENCH_XTENSA_SIM)
+	target_sources(${testbench} PRIVATE remote_server.c)
+endif()
 
 sof_append_relative_path_definitions(${testbench})
 
@@ -132,3 +135,17 @@ set_target_properties(${testbench}
 	INSTALL_RPATH "${sof_install_directory}/lib"
 	INSTALL_RPATH_USE_LINK_PATH TRUE
 )
+
+if(NOT TESTBENCH_XTENSA_SIM)
+	enable_testing()
+	add_test(NAME testbench_tier1_modules
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_test_suite.sh --tier 1)
+	add_test(NAME testbench_tier2_complex_dags
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_test_suite.sh --tier 2)
+	add_test(NAME testbench_tier3_ll_dp
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_test_suite.sh --tier 3)
+	add_test(NAME testbench_tier4_multicore
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_test_suite.sh --tier 4)
+	add_test(NAME testbench_tier5_controls_remote
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/run_test_suite.sh --tier 5)
+endif()

@@ -697,6 +697,13 @@ int tb_set_up_widget_base_config(struct testbench_prm *tp, struct tplg_comp_info
 			src->sink_rate = comp_info->out_audio_fmt.sampling_frequency;
 	}
 
+	if (comp_info->type == SND_SOC_TPLG_DAPM_ASRC) {
+		struct ipc4_asrc_module_cfg *asrc = comp_info->ipc_payload;
+
+		if (!asrc->out_freq)
+			asrc->out_freq = comp_info->out_audio_fmt.sampling_frequency;
+	}
+
 	/* Copy ext config for process type */
 	if (comp_info->module_id == TB_PROCESS_MODULE_ID) {
 		base_cfg = comp_info->ipc_payload;
@@ -831,7 +838,7 @@ out:
 
 static int tb_new_asrc(struct testbench_prm *tp)
 {
-	struct ipc4_asrc_module_cfg asrc;
+	struct ipc4_asrc_module_cfg asrc = { 0 };
 	struct tplg_context *ctx = &tp->tplg;
 	struct tplg_comp_info *comp_info = ctx->current_comp_info;
 	struct snd_soc_tplg_ctl_hdr *tplg_ctl;
