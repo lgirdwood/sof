@@ -221,19 +221,59 @@ struct host_mod_telem {
 	struct host_mod_pin_telem out_pins[TB_TELEM_MAX_PINS];
 };
 
+/* Hardware platform preset descriptor */
+struct host_platform_preset {
+	const char *name;
+	const char *aliases;
+	const char *desc;
+	uint32_t hw_ip_version;		/* 2=cAVS2.5, 4=ACE1.5, 5=ACE2.0, 6=ACE3.0, 7=ACE4.0 */
+	uint32_t num_cores;
+	uint32_t freq_hz;
+	size_t hpsram_size_bytes;
+	size_t lpsram_size_bytes;
+	size_t dram_size_bytes;
+};
+
+/* Runtime hardware platform configuration & live memory allocation state */
+struct host_platform_hw_cfg {
+	char platform_name[32];
+	char arch_desc[48];
+	uint32_t hw_ip_version;
+	uint32_t num_cores;		/* Active platform core count (1..TB_TELEM_MAX_CORES) */
+	uint32_t enabled_cores_mask;	/* Bitmask of enabled cores */
+	uint32_t default_freq_hz;	/* Nominal DSP core clock frequency in Hz */
+	size_t hpsram_size_bytes;	/* Total L2 HPSRAM capacity in bytes */
+	size_t lpsram_size_bytes;	/* Total L2 LPSRAM capacity in bytes */
+	size_t dram_size_bytes;		/* Total L3 IMR/DRAM capacity in bytes */
+	uint32_t sram_bank_size;	/* SRAM EBB bank size in bytes (65536) */
+	bool enforce_mem_limit;		/* Reject allocations exceeding configured capacity */
+
+	/* Live heap allocation tracking across rmalloc/rzalloc/rballoc/sof_heap_alloc */
+	size_t hpsram_used_bytes;
+	size_t hpsram_peak_bytes;
+	size_t lpsram_used_bytes;
+	size_t lpsram_peak_bytes;
+	size_t dram_used_bytes;
+	size_t dram_peak_bytes;
+	uint64_t total_alloc_calls;
+	uint64_t total_free_calls;
+	uint32_t alloc_failures;
+};
+
 /* Global testbench scheduling and buffer telemetry state */
 struct host_sched_telemetry {
 	bool enabled;
 	uint32_t num_cores;
 	uint32_t num_pipes;
 	uint32_t num_mods;
+	struct host_platform_hw_cfg hw_cfg;
 	struct host_workload_sim_cfg sim_cfg;
 	struct host_core_telem cores[TB_TELEM_MAX_CORES];
 	struct host_pipe_telem pipes[TB_TELEM_MAX_PIPES];
 	struct host_mod_telem mods[TB_TELEM_MAX_MODS];
 };
 
-/* Reset all telemetry counters (preserves workload simulation configuration) */
+/* Reset all telemetry counters (preserves workload simulation & platform configuration) */
 void host_telem_reset(void);
 
 /* Enable or disable telemetry collection (enabled by default) */
@@ -241,6 +281,28 @@ void host_telem_set_enabled(bool enabled);
 
 /* Retrieve pointer to global telemetry structure */
 struct host_sched_telemetry *host_telem_get(void);
+
+/* Hardware platform configuration & preset APIs */
+const struct host_platform_preset *host_platform_get_presets(size_t *out_count);
+const struct host_platform_preset *host_platform_find_preset(const char *name);
+int host_platform_apply_preset(const char *name);
+int host_platform_set_core_count(uint32_t num_cores);
+uint32_t host_platform_get_core_count(void);
+void host_platform_set_memory(size_t hpsram_bytes, size_t lpsram_bytes,
+			      size_t dram_bytes, bool enforce_limit);
+size_t host_platform_get_hpsram_size(void);
+size_t host_platform_get_lpsram_size(void);
+size_t host_platform_get_dram_size(void);
+void host_platform_reset_mem_stats(void);
+bool host_platform_account_alloc(uint32_t flags, size_t bytes);
+void host_platform_account_free(size_t bytes);
+
+/* Host arch_cpu_* runtime backing functions */
+int host_cpu_num_cores(void);
+int host_cpu_enable_core(int id);
+void host_cpu_disable_core(int id);
+int host_cpu_is_core_enabled(int id);
+int host_cpu_enabled_cores(void);
 
 /* Workload execution time simulation configuration APIs */
 void host_workload_sim_set_mode(uint32_t mode);

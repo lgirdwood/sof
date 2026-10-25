@@ -308,9 +308,13 @@ static void print_usage(const char *prog)
 	       "  large-cfg-get <mod> <inst> <param> [sz] [out_file]  Get IPC4 large config\n"
 	       "  large-cfg-set <mod> <inst> <param> <hex_or_file>    Set IPC4 large config\n"
 	       "  llext-load <file.llext|.so> [lib_id] [name]   Load dynamic module (SOF_NET_OP_LLEXT_LOAD)\n\n"
-	       "Interactive Topology, Pipeline & Module Construction:\n"
-	       "  run-test -t <tplg> [-p <pipes>] [-i <in>] [-o <out>] [-r <rate>] [-R <rate>]\n"
-	       "           [-c <ch>] [-n <ch>] [-b <fmt>] [-s <ctl>] [-w <m>] [-F <f>] [-M <m>]\n"
+	       "Interactive Topology, Pipeline, Platform & Module Construction:\n"
+	       "  platform-cfg [status | presets | preset <name> | cores <N> |\n"
+	       "                mem <hpsram[,lpsram[,dram]]> | freq <mhz_or_hz | core:freq,...>]\n"
+	       "                                                Configure/query platform hardware specs\n"
+	       "  run-test -t <tplg> [-A <plat>] [-N <cores>] [-m <mem>] [-F <freq>] [-p <pipes>]\n"
+	       "           [-i <in>] [-o <out>] [-r <rate>] [-R <rate>] [-c <ch>] [-n <ch>]\n"
+	       "           [-b <fmt>] [-s <ctl>] [-w <m>] [-M <m>]\n"
 	       "                                                Run full topology test in persistent server\n"
 	       "  io-cfg [-i <in>] [-o <out>] [-r <rate>] [-R <rate>] [-c <ch>] [-n <ch>] [-b <fmt>]\n"
 	       "  tplg-load <file.tplg> [p1,p2,...]             Load topology and start pipelines\n"
@@ -741,8 +745,9 @@ static int dispatch_command(int sock, int argc, char **argv)
 				       wrsp->dram_factor_x100 / 100, wrsp->dram_factor_x100 % 100,
 				       wrsp->dram_cycles_per_word, wrsp->num_overrides);
 				for (uint32_t c = 0; c < wrsp->num_cores && c < 8; c++) {
-					printf("  [Core %u] freq=%u MHz active=%u util=%u.%02u%% overruns=%u LL=%u/%u kcps DP=%u/%u kcps\n",
+					printf("  [Core %u] freq=%u.%03u MHz active=%u util=%u.%02u%% overruns=%u LL=%u/%u kcps DP=%u/%u kcps\n",
 					       c, wrsp->cores[c].freq_hz / 1000000U,
+					       (wrsp->cores[c].freq_hz % 1000000U) / 1000U,
 					       wrsp->cores[c].active,
 					       wrsp->cores[c].total_util_x100 / 100,
 					       wrsp->cores[c].total_util_x100 % 100,

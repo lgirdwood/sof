@@ -124,10 +124,17 @@ __cold static int ipc4_comp_new_config(struct comp_ipc_config *ipc_config,
 		return -EEXIST;
 	}
 
+#if CONFIG_LIBRARY
+	if (module_init->extension.r.core_id >= (uint32_t)arch_cpu_num_cores()) {
+#else
 	if (module_init->extension.r.core_id >= CONFIG_CORE_COUNT) {
+#endif
 		tr_err(&ipc_tr, "ipc: comp->core = %u", (uint32_t)module_init->extension.r.core_id);
 		return -EINVAL;
 	}
+#if CONFIG_LIBRARY
+	cpu_enable_core(module_init->extension.r.core_id);
+#endif
 
 	memset(ipc_config, 0, sizeof(*ipc_config));
 	ipc_config->id = comp_id;
@@ -535,11 +542,18 @@ __cold int ipc_pipeline_new(struct ipc *ipc, ipc_pipe_new *_pipe_desc)
 
 	tr_dbg(&ipc_tr, "ipc: pipeline id = %u", (uint32_t)pipe_desc->primary.r.instance_id);
 
+#if CONFIG_LIBRARY
+	if (pipe_desc->extension.r.core_id >= (uint32_t)arch_cpu_num_cores()) {
+#else
 	if (pipe_desc->extension.r.core_id >= CONFIG_CORE_COUNT) {
+#endif
 		tr_err(&ipc_tr, "invalid pipeline core ID: %u",
 		       (uint32_t)pipe_desc->extension.r.core_id);
 		return IPC4_INVALID_CORE_ID;
 	}
+#if CONFIG_LIBRARY
+	cpu_enable_core(pipe_desc->extension.r.core_id);
+#endif
 
 	/* pass IPC to target core */
 	if (!cpu_is_me(pipe_desc->extension.r.core_id))

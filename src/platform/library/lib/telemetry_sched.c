@@ -19,7 +19,10 @@
 #include <sof/audio/sink_api.h>
 #include <sof/audio/pipeline.h>
 #include <sof/audio/module_adapter/module/generic.h>
+#include <rtos/alloc.h>
+#include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 #include <time.h>
 
@@ -36,9 +39,124 @@ static volatile char g_telem_lock;
 #define TELEM_UNLOCK()	do {} while (0)
 #endif
 
+static const struct host_platform_preset g_platform_presets[] = {
+	{
+		.name              = "tgl",
+		.aliases           = "cavs25,adl,rpl,tigerlake,alderlake,raptorlake",
+		.desc              = "Intel Tiger Lake / Alder Lake cAVS 2.5 (Xtensa LX6)",
+		.hw_ip_version     = 2,
+		.num_cores         = 4,
+		.freq_hz           = 400000000U,
+		.hpsram_size_bytes = 2944UL * 1024UL,	/* 46 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "tgl-h",
+		.aliases           = "cavs25_tgph,tgph",
+		.desc              = "Intel Tiger Lake-H cAVS 2.5 (Xtensa LX6, 2-Core)",
+		.hw_ip_version     = 2,
+		.num_cores         = 2,
+		.freq_hz           = 400000000U,
+		.hpsram_size_bytes = 2944UL * 1024UL,
+		.lpsram_size_bytes = 64UL * 1024UL,
+		.dram_size_bytes   = 16384UL * 1024UL,
+	},
+	{
+		.name              = "mtl",
+		.aliases           = "arl,arls,ace15,ace15_mtpm,meteorlake,arrowlake",
+		.desc              = "Intel Meteor Lake / Arrow Lake ACE 1.5 (Xtensa LX7)",
+		.hw_ip_version     = 4,
+		.num_cores         = 3,
+		.freq_hz           = 393216000U,
+		.hpsram_size_bytes = 2816UL * 1024UL,	/* 44 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "lnl",
+		.aliases           = "ace20,ace20_lnl,lunarlake",
+		.desc              = "Intel Lunar Lake ACE 2.0 (Xtensa LX7)",
+		.hw_ip_version     = 5,
+		.num_cores         = 5,
+		.freq_hz           = 393216000U,
+		.hpsram_size_bytes = 2816UL * 1024UL,	/* 44 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "ptl",
+		.aliases           = "ace30,ace30_ptl,pantherlake",
+		.desc              = "Intel Panther Lake ACE 3.0 (Xtensa LX7)",
+		.hw_ip_version     = 6,
+		.num_cores         = 5,
+		.freq_hz           = 442368000U,
+		.hpsram_size_bytes = 4608UL * 1024UL,	/* 72 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "wcl",
+		.aliases           = "ace30_wcl,wildcatlake",
+		.desc              = "Intel Wildcat Lake ACE 3.0 (Xtensa LX7)",
+		.hw_ip_version     = 6,
+		.num_cores         = 3,
+		.freq_hz           = 614400000U,
+		.hpsram_size_bytes = 3456UL * 1024UL,	/* 54 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "nvl",
+		.aliases           = "ace40,ace40_nvl,novalake",
+		.desc              = "Intel Nova Lake ACE 4.0 (Xtensa LX7)",
+		.hw_ip_version     = 7,
+		.num_cores         = 4,
+		.freq_hz           = 614400000U,
+		.hpsram_size_bytes = 4608UL * 1024UL,	/* 72 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "nvl-s",
+		.aliases           = "ace40_nvls,nvls",
+		.desc              = "Intel Nova Lake-S ACE 4.0 (Xtensa LX7, 2-Core)",
+		.hw_ip_version     = 7,
+		.num_cores         = 2,
+		.freq_hz           = 438857000U,
+		.hpsram_size_bytes = 4608UL * 1024UL,	/* 72 x 64 KB EBB banks */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 1 x 64 KB EBB bank */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB IMR */
+	},
+	{
+		.name              = "default",
+		.aliases           = "host,sof-testbench4,generic",
+		.desc              = "SOF Host Testbench Default (8-Core Virtual DSP)",
+		.hw_ip_version     = 4,
+		.num_cores         = TB_TELEM_MAX_CORES,
+		.freq_hz           = (uint32_t)TB_DSP_NOMINAL_HZ,
+		.hpsram_size_bytes = 47UL * 65536UL,	/* 3008 KB (47 x 64 KB) */
+		.lpsram_size_bytes = 64UL * 1024UL,	/* 64 KB */
+		.dram_size_bytes   = 16384UL * 1024UL,	/* 16 MB */
+	},
+};
+
 static struct host_sched_telemetry g_sched_telem = {
 	.enabled = true,
 	.num_cores = TB_TELEM_MAX_CORES,
+	.hw_cfg = {
+		.platform_name      = "sof-testbench4",
+		.arch_desc          = "SOF Host Testbench Default (8-Core Virtual DSP)",
+		.hw_ip_version      = 4,
+		.num_cores          = TB_TELEM_MAX_CORES,
+		.enabled_cores_mask = (1U << TB_TELEM_MAX_CORES) - 1U,
+		.default_freq_hz    = (uint32_t)TB_DSP_NOMINAL_HZ,
+		.hpsram_size_bytes  = 47UL * 65536UL,
+		.lpsram_size_bytes  = 64UL * 1024UL,
+		.dram_size_bytes    = 16384UL * 1024UL,
+		.sram_bank_size     = 65536U,
+		.enforce_mem_limit  = false,
+	},
 	.sim_cfg = {
 		.mode = HOST_WORKLOAD_SIM_OFF,
 		.default_mem_domain = HOST_MEM_DOMAIN_SRAM,
@@ -50,7 +168,34 @@ static struct host_sched_telemetry g_sched_telem = {
 
 static void ensure_sim_cfg_defaults(void)
 {
+	uint32_t max_mask;
 	int c;
+
+	if (g_sched_telem.hw_cfg.num_cores == 0 ||
+	    g_sched_telem.hw_cfg.num_cores > TB_TELEM_MAX_CORES)
+		g_sched_telem.hw_cfg.num_cores = TB_TELEM_MAX_CORES;
+	g_sched_telem.num_cores = g_sched_telem.hw_cfg.num_cores;
+
+	max_mask = (1U << g_sched_telem.hw_cfg.num_cores) - 1U;
+	if ((g_sched_telem.hw_cfg.enabled_cores_mask & max_mask) == 0)
+		g_sched_telem.hw_cfg.enabled_cores_mask = max_mask;
+	else
+		g_sched_telem.hw_cfg.enabled_cores_mask &= max_mask;
+	g_sched_telem.hw_cfg.enabled_cores_mask |= 1U; /* Core 0 is always enabled */
+
+	if (g_sched_telem.hw_cfg.default_freq_hz == 0)
+		g_sched_telem.hw_cfg.default_freq_hz = (uint32_t)TB_DSP_NOMINAL_HZ;
+	if (g_sched_telem.hw_cfg.hpsram_size_bytes == 0)
+		g_sched_telem.hw_cfg.hpsram_size_bytes = 47UL * 65536UL;
+	if (g_sched_telem.hw_cfg.lpsram_size_bytes == 0)
+		g_sched_telem.hw_cfg.lpsram_size_bytes = 64UL * 1024UL;
+	if (g_sched_telem.hw_cfg.dram_size_bytes == 0)
+		g_sched_telem.hw_cfg.dram_size_bytes = 16384UL * 1024UL;
+	if (g_sched_telem.hw_cfg.sram_bank_size == 0)
+		g_sched_telem.hw_cfg.sram_bank_size = 65536U;
+	if (g_sched_telem.hw_cfg.platform_name[0] == '\0')
+		snprintf(g_sched_telem.hw_cfg.platform_name,
+			 sizeof(g_sched_telem.hw_cfg.platform_name), "sof-testbench4");
 
 	if (g_sched_telem.sim_cfg.sram_factor_x100 == 0)
 		g_sched_telem.sim_cfg.sram_factor_x100 = 100;
@@ -61,7 +206,8 @@ static void ensure_sim_cfg_defaults(void)
 
 	for (c = 0; c < TB_TELEM_MAX_CORES; c++) {
 		if (g_sched_telem.sim_cfg.core_freq_hz[c] == 0)
-			g_sched_telem.sim_cfg.core_freq_hz[c] = (uint32_t)TB_DSP_NOMINAL_HZ;
+			g_sched_telem.sim_cfg.core_freq_hz[c] =
+				g_sched_telem.hw_cfg.default_freq_hz;
 		g_sched_telem.cores[c].freq_hz = g_sched_telem.sim_cfg.core_freq_hz[c];
 		g_sched_telem.cores[c].ll_budget_cycles =
 			g_sched_telem.cores[c].freq_hz / 1000U;
@@ -71,16 +217,273 @@ static void ensure_sim_cfg_defaults(void)
 void host_telem_reset(void)
 {
 	struct host_workload_sim_cfg saved_cfg;
+	struct host_platform_hw_cfg saved_hw;
 
 	TELEM_LOCK();
 	ensure_sim_cfg_defaults();
 	saved_cfg = g_sched_telem.sim_cfg;
+	saved_hw = g_sched_telem.hw_cfg;
 	memset(&g_sched_telem, 0, sizeof(g_sched_telem));
 	g_sched_telem.enabled = true;
-	g_sched_telem.num_cores = TB_TELEM_MAX_CORES;
+	g_sched_telem.hw_cfg = saved_hw;
+	g_sched_telem.num_cores = saved_hw.num_cores;
 	g_sched_telem.sim_cfg = saved_cfg;
 	ensure_sim_cfg_defaults();
 	TELEM_UNLOCK();
+}
+
+const struct host_platform_preset *host_platform_get_presets(size_t *out_count)
+{
+	if (out_count)
+		*out_count = ARRAY_SIZE(g_platform_presets);
+	return g_platform_presets;
+}
+
+const struct host_platform_preset *host_platform_find_preset(const char *name)
+{
+	size_t i, nlen;
+
+	if (!name || !*name)
+		return NULL;
+	nlen = strlen(name);
+
+	for (i = 0; i < ARRAY_SIZE(g_platform_presets); i++) {
+		const struct host_platform_preset *p = &g_platform_presets[i];
+		const char *cur = p->aliases;
+
+		if (strcasecmp(p->name, name) == 0)
+			return p;
+
+		while (cur && *cur) {
+			const char *comma = strchr(cur, ',');
+			size_t alen = comma ? (size_t)(comma - cur) : strlen(cur);
+
+			if (alen == nlen && strncasecmp(cur, name, nlen) == 0)
+				return p;
+			cur = comma ? (comma + 1) : NULL;
+		}
+	}
+	return NULL;
+}
+
+int host_platform_apply_preset(const char *name)
+{
+	const struct host_platform_preset *p = host_platform_find_preset(name);
+	int c;
+
+	if (!p)
+		return -1;
+
+	TELEM_LOCK();
+	ensure_sim_cfg_defaults();
+	snprintf(g_sched_telem.hw_cfg.platform_name,
+		 sizeof(g_sched_telem.hw_cfg.platform_name), "%s", p->name);
+	snprintf(g_sched_telem.hw_cfg.arch_desc,
+		 sizeof(g_sched_telem.hw_cfg.arch_desc), "%s", p->desc);
+	g_sched_telem.hw_cfg.hw_ip_version = p->hw_ip_version;
+	g_sched_telem.hw_cfg.num_cores =
+		(p->num_cores <= TB_TELEM_MAX_CORES) ? p->num_cores : TB_TELEM_MAX_CORES;
+	g_sched_telem.num_cores = g_sched_telem.hw_cfg.num_cores;
+	g_sched_telem.hw_cfg.enabled_cores_mask =
+		(1U << g_sched_telem.hw_cfg.num_cores) - 1U;
+	g_sched_telem.hw_cfg.default_freq_hz = p->freq_hz;
+	g_sched_telem.hw_cfg.hpsram_size_bytes = p->hpsram_size_bytes;
+	g_sched_telem.hw_cfg.lpsram_size_bytes = p->lpsram_size_bytes;
+	g_sched_telem.hw_cfg.dram_size_bytes = p->dram_size_bytes;
+	g_sched_telem.hw_cfg.sram_bank_size = 65536U;
+	g_sched_telem.hw_cfg.enforce_mem_limit =
+		(strcasecmp(p->name, "default") != 0);
+
+	for (c = 0; c < TB_TELEM_MAX_CORES; c++) {
+		g_sched_telem.sim_cfg.core_freq_hz[c] = p->freq_hz;
+		g_sched_telem.cores[c].freq_hz = p->freq_hz;
+		g_sched_telem.cores[c].ll_budget_cycles = p->freq_hz / 1000U;
+	}
+	TELEM_UNLOCK();
+	return 0;
+}
+
+int host_platform_set_core_count(uint32_t num_cores)
+{
+	if (num_cores == 0 || num_cores > TB_TELEM_MAX_CORES)
+		return -1;
+
+	TELEM_LOCK();
+	ensure_sim_cfg_defaults();
+	g_sched_telem.hw_cfg.num_cores = num_cores;
+	g_sched_telem.num_cores = num_cores;
+	g_sched_telem.hw_cfg.enabled_cores_mask = (1U << num_cores) - 1U;
+	TELEM_UNLOCK();
+	return 0;
+}
+
+uint32_t host_platform_get_core_count(void)
+{
+	ensure_sim_cfg_defaults();
+	return g_sched_telem.hw_cfg.num_cores;
+}
+
+void host_platform_set_memory(size_t hpsram_bytes, size_t lpsram_bytes,
+			      size_t dram_bytes, bool enforce_limit)
+{
+	TELEM_LOCK();
+	ensure_sim_cfg_defaults();
+	if (hpsram_bytes > 0)
+		g_sched_telem.hw_cfg.hpsram_size_bytes = hpsram_bytes;
+	if (lpsram_bytes > 0)
+		g_sched_telem.hw_cfg.lpsram_size_bytes = lpsram_bytes;
+	if (dram_bytes > 0)
+		g_sched_telem.hw_cfg.dram_size_bytes = dram_bytes;
+	g_sched_telem.hw_cfg.enforce_mem_limit = enforce_limit;
+	TELEM_UNLOCK();
+}
+
+size_t host_platform_get_hpsram_size(void)
+{
+	ensure_sim_cfg_defaults();
+	return g_sched_telem.hw_cfg.hpsram_size_bytes;
+}
+
+size_t host_platform_get_lpsram_size(void)
+{
+	ensure_sim_cfg_defaults();
+	return g_sched_telem.hw_cfg.lpsram_size_bytes;
+}
+
+size_t host_platform_get_dram_size(void)
+{
+	ensure_sim_cfg_defaults();
+	return g_sched_telem.hw_cfg.dram_size_bytes;
+}
+
+void host_platform_reset_mem_stats(void)
+{
+	TELEM_LOCK();
+	g_sched_telem.hw_cfg.hpsram_used_bytes = 0;
+	g_sched_telem.hw_cfg.hpsram_peak_bytes = 0;
+	g_sched_telem.hw_cfg.lpsram_used_bytes = 0;
+	g_sched_telem.hw_cfg.lpsram_peak_bytes = 0;
+	g_sched_telem.hw_cfg.dram_used_bytes = 0;
+	g_sched_telem.hw_cfg.dram_peak_bytes = 0;
+	g_sched_telem.hw_cfg.total_alloc_calls = 0;
+	g_sched_telem.hw_cfg.total_free_calls = 0;
+	g_sched_telem.hw_cfg.alloc_failures = 0;
+	TELEM_UNLOCK();
+}
+
+bool host_platform_account_alloc(uint32_t flags, size_t bytes)
+{
+	bool ok = true;
+
+	TELEM_LOCK();
+	ensure_sim_cfg_defaults();
+
+	if ((flags & SOF_MEM_FLAG_LOW_POWER) != 0) {
+		if (g_sched_telem.hw_cfg.enforce_mem_limit &&
+		    g_sched_telem.hw_cfg.lpsram_used_bytes + bytes >
+		    g_sched_telem.hw_cfg.lpsram_size_bytes) {
+			g_sched_telem.hw_cfg.alloc_failures++;
+			ok = false;
+		} else {
+			g_sched_telem.hw_cfg.lpsram_used_bytes += bytes;
+			if (g_sched_telem.hw_cfg.lpsram_used_bytes >
+			    g_sched_telem.hw_cfg.lpsram_peak_bytes)
+				g_sched_telem.hw_cfg.lpsram_peak_bytes =
+					g_sched_telem.hw_cfg.lpsram_used_bytes;
+			g_sched_telem.hw_cfg.total_alloc_calls++;
+		}
+	} else if ((flags & SOF_MEM_FLAG_L3) != 0 ||
+		   g_sched_telem.sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) {
+		if (g_sched_telem.hw_cfg.enforce_mem_limit &&
+		    g_sched_telem.hw_cfg.dram_used_bytes + bytes >
+		    g_sched_telem.hw_cfg.dram_size_bytes) {
+			g_sched_telem.hw_cfg.alloc_failures++;
+			ok = false;
+		} else {
+			g_sched_telem.hw_cfg.dram_used_bytes += bytes;
+			if (g_sched_telem.hw_cfg.dram_used_bytes >
+			    g_sched_telem.hw_cfg.dram_peak_bytes)
+				g_sched_telem.hw_cfg.dram_peak_bytes =
+					g_sched_telem.hw_cfg.dram_used_bytes;
+			/* Also mirror in HPSRAM peak if running from SRAM/DRAM unified pool */
+			g_sched_telem.hw_cfg.hpsram_used_bytes += bytes;
+			if (g_sched_telem.hw_cfg.hpsram_used_bytes >
+			    g_sched_telem.hw_cfg.hpsram_peak_bytes)
+				g_sched_telem.hw_cfg.hpsram_peak_bytes =
+					g_sched_telem.hw_cfg.hpsram_used_bytes;
+			g_sched_telem.hw_cfg.total_alloc_calls++;
+		}
+	} else {
+		if (g_sched_telem.hw_cfg.enforce_mem_limit &&
+		    g_sched_telem.hw_cfg.hpsram_used_bytes + bytes >
+		    g_sched_telem.hw_cfg.hpsram_size_bytes) {
+			g_sched_telem.hw_cfg.alloc_failures++;
+			ok = false;
+		} else {
+			g_sched_telem.hw_cfg.hpsram_used_bytes += bytes;
+			if (g_sched_telem.hw_cfg.hpsram_used_bytes >
+			    g_sched_telem.hw_cfg.hpsram_peak_bytes)
+				g_sched_telem.hw_cfg.hpsram_peak_bytes =
+					g_sched_telem.hw_cfg.hpsram_used_bytes;
+			g_sched_telem.hw_cfg.total_alloc_calls++;
+		}
+	}
+	TELEM_UNLOCK();
+	return ok;
+}
+
+void host_platform_account_free(size_t bytes)
+{
+	TELEM_LOCK();
+	if (g_sched_telem.hw_cfg.hpsram_used_bytes >= bytes)
+		g_sched_telem.hw_cfg.hpsram_used_bytes -= bytes;
+	else
+		g_sched_telem.hw_cfg.hpsram_used_bytes = 0;
+
+	if (g_sched_telem.hw_cfg.dram_used_bytes >= bytes)
+		g_sched_telem.hw_cfg.dram_used_bytes -= bytes;
+	else
+		g_sched_telem.hw_cfg.dram_used_bytes = 0;
+
+	g_sched_telem.hw_cfg.total_free_calls++;
+	TELEM_UNLOCK();
+}
+
+int host_cpu_num_cores(void)
+{
+	ensure_sim_cfg_defaults();
+	return (int)g_sched_telem.hw_cfg.num_cores;
+}
+
+int host_cpu_enable_core(int id)
+{
+	ensure_sim_cfg_defaults();
+	if (id < 0 || (uint32_t)id >= g_sched_telem.hw_cfg.num_cores)
+		return -1;
+	g_sched_telem.hw_cfg.enabled_cores_mask |= (1U << id);
+	return 0;
+}
+
+void host_cpu_disable_core(int id)
+{
+	ensure_sim_cfg_defaults();
+	if (id <= 0 || (uint32_t)id >= g_sched_telem.hw_cfg.num_cores)
+		return;
+	g_sched_telem.hw_cfg.enabled_cores_mask &= ~(1U << id);
+}
+
+int host_cpu_is_core_enabled(int id)
+{
+	ensure_sim_cfg_defaults();
+	if (id < 0 || (uint32_t)id >= g_sched_telem.hw_cfg.num_cores)
+		return 0;
+	return (g_sched_telem.hw_cfg.enabled_cores_mask & (1U << id)) ? 1 : 0;
+}
+
+int host_cpu_enabled_cores(void)
+{
+	ensure_sim_cfg_defaults();
+	return (int)g_sched_telem.hw_cfg.enabled_cores_mask;
 }
 
 void host_telem_set_enabled(bool enabled)
@@ -120,12 +523,15 @@ void host_workload_sim_set_core_freq(int core, uint32_t freq_hz)
 	TELEM_LOCK();
 	ensure_sim_cfg_defaults();
 	if (core < 0) {
+		g_sched_telem.hw_cfg.default_freq_hz = freq_hz;
 		for (c = 0; c < TB_TELEM_MAX_CORES; c++) {
 			g_sched_telem.sim_cfg.core_freq_hz[c] = freq_hz;
 			g_sched_telem.cores[c].freq_hz = freq_hz;
 			g_sched_telem.cores[c].ll_budget_cycles = freq_hz / 1000U;
 		}
 	} else if (core < TB_TELEM_MAX_CORES) {
+		if (core == 0)
+			g_sched_telem.hw_cfg.default_freq_hz = freq_hz;
 		g_sched_telem.sim_cfg.core_freq_hz[core] = freq_hz;
 		g_sched_telem.cores[core].freq_hz = freq_hz;
 		g_sched_telem.cores[core].ll_budget_cycles = freq_hz / 1000U;

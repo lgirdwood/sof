@@ -142,8 +142,11 @@ static void print_usage(char *executable)
 	printf("  -S <port> Start sof-remote TCP server on <port> (default port: 9998)\n");
 	printf("  -W Keep testbench running continuously for remote network control\n");
 	printf("  -I Run testbench in interactive network server mode (default port: 9998)\n");
+	printf("  -A <platform|list> Apply hardware platform preset (tgl,tgl-h,mtl,arl,lnl,ptl,wcl,nvl,nvl-s)\n");
+	printf("  -N <num_cores> Set DSP core count (1..%d)\n", TB_TELEM_MAX_CORES);
+	printf("  -m <hpsram[,lpsram[,dram]]> Set platform memory sizes (e.g. 2816K,64K,16M)\n");
 	printf("  -w <0|1|2|off|virtual|realtime> Enable CPC workload execution time simulation\n");
-	printf("  -F <freq_mhz | core:freq_mhz,...> Set target DSP core clock frequency in MHz\n");
+	printf("  -F <freq_mhz | core:freq_mhz,...> Set target DSP core clock frequency in MHz/kHz/Hz\n");
 	printf("  -M <sram|dram[:penalty_x100[:cycles_per_word]]> Set workload memory domain\n\n");
 	printf("Options for input and output format override:\n");
 	printf("  -b <input_format>, S16_LE, S24_LE, or S32_LE\n");
@@ -155,6 +158,49 @@ static void print_usage(char *executable)
 	printf("  -h\n\n");
 	printf("Example Usage:\n");
 	printf("%s -r 48000 -c 2 -b S16_LE -i in.raw -o out.raw -t <test.tplg>\n\n", executable);
+}
+
+static void print_platform_presets(void)
+{
+	size_t count = 0, i;
+	const struct host_platform_preset *presets = host_platform_get_presets(&count);
+
+	printf("Available Hardware Platform Presets (-A <platform>):\n");
+	printf("  %-8s %-6s %-13s %-10s %-10s %-10s %s\n",
+	       "Name", "Cores", "Clock (MHz)", "HPSRAM", "LPSRAM", "DRAM/IMR", "Description");
+	printf("  ---------------------------------------------------------------------------------------------\n");
+	for (i = 0; i < count; i++) {
+		printf("  %-8s %-6u %7u.%03u   %6zu KB  %6zu KB  %6zu KB  %s (aliases: %s)\n",
+		       presets[i].name,
+		       presets[i].num_cores,
+		       presets[i].freq_hz / 1000000U,
+		       (presets[i].freq_hz % 1000000U) / 1000U,
+		       presets[i].hpsram_size_bytes / 1024UL,
+		       presets[i].lpsram_size_bytes / 1024UL,
+		       presets[i].dram_size_bytes / 1024UL,
+		       presets[i].desc,
+		       presets[i].aliases);
+	}
+}
+
+static uint32_t parse_freq_token_hz(const char *str)
+{
+	char *endp = NULL;
+	double val;
+
+	if (!str || !*str)
+		return (uint32_t)TB_DSP_NOMINAL_HZ;
+	val = strtod(str, &endp);
+	if (val <= 0.0)
+		return (uint32_t)TB_DSP_NOMINAL_HZ;
+
+	if (endp && (*endp == 'k' || *endp == 'K'))
+		return (uint32_t)(val * 1000.0 + 0.5);
+	if (endp && (*endp == 'm' || *endp == 'M'))
+		return (uint32_t)(val * 1000000.0 + 0.5);
+	if (val < 100000.0)
+		return (uint32_t)(val * 1000000.0 + 0.5);
+	return (uint32_t)(val + 0.5);
 }
 
 static void parse_core_freq_arg(const char *arg)
@@ -172,19 +218,102 @@ static void parse_core_freq_arg(const char *arg)
 
 		if (colon) {
 			int core = atoi(tok);
-			uint32_t val = (uint32_t)strtoul(colon + 1, NULL, 10);
-			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+			uint32_t hz = parse_freq_token_hz(colon + 1);
 
 			host_workload_sim_set_core_freq(core, hz);
 		} else {
-			uint32_t val = (uint32_t)strtoul(tok, NULL, 10);
-			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+			uint32_t hz = parse_freq_token_hz(tok);
 
 			host_workload_sim_set_core_freq(-1, hz);
 		}
 		tok = strtok_r(NULL, ",", &saveptr);
 	}
 	free(copy);
+}
+
+static size_t parse_mem_size_token(const char *str)
+{
+	char *endp = NULL;
+	double val;
+
+	if (!str || !*str)
+		return 0;
+	val = strtod(str, &endp);
+	if (val <= 0.0)
+		return 0;
+
+	if (endp && (*endp == 'm' || *endp == 'M'))
+		return (size_t)(val * 1024.0 * 1024.0 + 0.5);
+	if (endp && (*endp == 'k' || *endp == 'K'))
+		return (size_t)(val * 1024.0 + 0.5);
+	if (endp && (*endp == 'b' || *endp == 'B'))
+		return (size_t)(val + 0.5);
+	if (val <= 65536.0)
+		return (size_t)(val * 1024.0 + 0.5); /* Default unit: KB */
+	return (size_t)(val + 0.5);
+}
+
+static int parse_mem_cfg_arg(const char *arg)
+{
+	size_t hpsram = 0, lpsram = 0, dram = 0;
+	bool enforce = true;
+	char *copy, *saveptr = NULL, *tok;
+	int pos = 0;
+
+	if (!arg || !*arg)
+		return -EINVAL;
+
+	copy = strdup(arg);
+	if (!copy)
+		return -ENOMEM;
+
+	tok = strtok_r(copy, ",", &saveptr);
+	while (tok) {
+		char *eq = strchr(tok, '=');
+
+		if (eq) {
+			*eq = '\0';
+			const char *val = eq + 1;
+
+			if (strcasecmp(tok, "hpsram") == 0 || strcasecmp(tok, "sram") == 0 ||
+			    strcasecmp(tok, "hp") == 0) {
+				hpsram = parse_mem_size_token(val);
+			} else if (strcasecmp(tok, "lpsram") == 0 || strcasecmp(tok, "lp") == 0) {
+				lpsram = parse_mem_size_token(val);
+			} else if (strcasecmp(tok, "dram") == 0 || strcasecmp(tok, "imr") == 0 ||
+				   strcasecmp(tok, "l3") == 0) {
+				dram = parse_mem_size_token(val);
+			} else if (strcasecmp(tok, "strict") == 0 ||
+				   strcasecmp(tok, "enforce") == 0) {
+				enforce = (atoi(val) != 0 && strcasecmp(val, "off") != 0 &&
+					   strcasecmp(val, "false") != 0);
+			}
+		} else if (strcasecmp(tok, "nostrict") == 0) {
+			enforce = false;
+		} else if (strcasecmp(tok, "strict") == 0) {
+			enforce = true;
+		} else {
+			size_t sz = parse_mem_size_token(tok);
+
+			if (pos == 0)
+				hpsram = sz;
+			else if (pos == 1)
+				lpsram = sz;
+			else if (pos == 2)
+				dram = sz;
+			pos++;
+		}
+		tok = strtok_r(NULL, ",", &saveptr);
+	}
+	free(copy);
+
+	if (hpsram == 0 && lpsram == 0 && dram == 0) {
+		fprintf(stderr, "Error: invalid memory configuration '%s'\n", arg);
+		return -EINVAL;
+	}
+
+	host_platform_set_memory(hpsram, lpsram, dram, enforce);
+	return 0;
 }
 
 static void parse_mem_domain_arg(const char *arg)
@@ -214,8 +343,12 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 	int option = 0;
 	int ret = 0;
 	bool w_explicit_off = false;
+	const char *opt_preset = NULL;
+	const char *opt_cores = NULL;
+	const char *opt_mem = NULL;
+	const char *opt_freq = NULL;
 
-	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:S:WIw:F:M:")) != -1) {
+	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:S:WIA:N:m:w:F:M:")) != -1) {
 		switch (option) {
 		/* input sample file */
 		case 'i':
@@ -305,6 +438,25 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 				tp->server_port = 9998;
 			break;
 
+		/* hardware platform preset */
+		case 'A':
+			if (strcasecmp(optarg, "list") == 0 || strcasecmp(optarg, "help") == 0) {
+				print_platform_presets();
+				exit(EXIT_SUCCESS);
+			}
+			opt_preset = optarg;
+			break;
+
+		/* DSP core count */
+		case 'N':
+			opt_cores = optarg;
+			break;
+
+		/* DSP memory capacities (HPSRAM, LPSRAM, DRAM) */
+		case 'm':
+			opt_mem = optarg;
+			break;
+
 		/* workload execution time simulation mode */
 		case 'w':
 			if (strcmp(optarg, "0") == 0 || strcasecmp(optarg, "off") == 0 ||
@@ -324,10 +476,7 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 
 		/* target DSP core clock frequency in MHz */
 		case 'F':
-			parse_core_freq_arg(optarg);
-			if (!w_explicit_off &&
-			    host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
-				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+			opt_freq = optarg;
 			break;
 
 		/* workload execution memory domain (sram vs dram) */
@@ -351,6 +500,40 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 
 		if (ret < 0)
 			return ret;
+	}
+
+	/* Apply platform preset first, then explicit -N / -m / -F overrides regardless of order */
+	if (opt_preset) {
+		if (host_platform_apply_preset(opt_preset) < 0) {
+			fprintf(stderr, "Error: unknown platform preset '%s' (use -A list)\n",
+				opt_preset);
+			return -EINVAL;
+		}
+		if (!w_explicit_off && host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+			host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+	}
+
+	if (opt_cores) {
+		int nc = atoi(opt_cores);
+
+		if (nc < 1 || nc > TB_TELEM_MAX_CORES ||
+		    host_platform_set_core_count((uint32_t)nc) < 0) {
+			fprintf(stderr, "Error: core count (-N) must be between 1 and %d\n",
+				TB_TELEM_MAX_CORES);
+			return -EINVAL;
+		}
+	}
+
+	if (opt_mem) {
+		ret = parse_mem_cfg_arg(opt_mem);
+		if (ret < 0)
+			return ret;
+	}
+
+	if (opt_freq) {
+		parse_core_freq_arg(opt_freq);
+		if (!w_explicit_off && host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+			host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
 	}
 
 	return ret;
@@ -439,17 +622,24 @@ static void test_pipeline_stats(struct testbench_prm *tp, long long delta_t,
 				(st->sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) ? "DRAM" :
 											   "SRAM";
 
-			printf("--- Per-Core LL & DP Scheduler Telemetry [Mode=%s Mem=%s DRAM_Factor=%u.%02ux] ---\n",
+			printf("--- Per-Core LL & DP Scheduler Telemetry [Platform=%s Cores=%u HPSRAM=%zu/%zuKB LPSRAM=%zu/%zuKB Mode=%s Mem=%s DRAM_Factor=%u.%02ux] ---\n",
+			       st->hw_cfg.platform_name,
+			       st->hw_cfg.num_cores,
+			       st->hw_cfg.hpsram_peak_bytes / 1024UL,
+			       st->hw_cfg.hpsram_size_bytes / 1024UL,
+			       st->hw_cfg.lpsram_peak_bytes / 1024UL,
+			       st->hw_cfg.lpsram_size_bytes / 1024UL,
 			       mode_str, mem_str,
 			       st->sim_cfg.dram_factor_x100 / 100,
 			       st->sim_cfg.dram_factor_x100 % 100);
-			for (u = 0; u < TB_TELEM_MAX_CORES; u++) {
+			for (u = 0; u < st->hw_cfg.num_cores && u < TB_TELEM_MAX_CORES; u++) {
 				struct host_core_telem *ct = &st->cores[u];
 
 				if (!ct->active)
 					continue;
-				printf("  Core %u (%u MHz): util=%u.%02u%% overruns=%u | LL: ticks=%u tasks=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus | DP: runs=%u thr=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus\n",
+				printf("  Core %u (%u.%03u MHz): util=%u.%02u%% overruns=%u | LL: ticks=%u tasks=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus | DP: runs=%u thr=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus\n",
 				       u, ct->freq_hz / 1000000U,
+				       (ct->freq_hz % 1000000U) / 1000U,
 				       ct->total_util_x100 / 100, ct->total_util_x100 % 100,
 				       ct->ll_deadline_violations,
 				       ct->ll_tick_count, ct->ll_active_tasks,
@@ -598,7 +788,7 @@ static int pipline_test(struct testbench_prm *tp)
 	int64_t next_control_ns;
 	int64_t time_ns;
 	float samples_to_ns;
-	int err;
+	int err = 0;
 	int heap_usage_records_count = 0;
 	int dp_count = 0;
 
@@ -728,7 +918,7 @@ out:
 		dp_count++;
 	}
 
-	return 0;
+	return err < 0 ? err : 0;
 }
 
 int main(int argc, char **argv)
@@ -866,11 +1056,10 @@ int main(int argc, char **argv)
 	}
 
 	/* build, run and teardown pipelines */
-	pipline_test(tp);
+	ret = pipline_test(tp) < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
 	/* free other core FW services */
 	tb_free(sof_get());
-	ret = EXIT_SUCCESS;
 
 out:
 	/* free all other data */

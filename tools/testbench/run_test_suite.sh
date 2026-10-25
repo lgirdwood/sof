@@ -452,7 +452,15 @@ EOF
 		"Mode=VIRTUAL-SIM Mem=DRAM DRAM_Factor=1.60x" \
 		-r 48000 -R 48000 -c 2 -n 2 -b S32_LE -w 1 -F 0:400,1:200,2:120 -M dram:160
 
-	# 5.4 Interactive sof-tb-ctl Batch Script (-f), REPL & Dynamic IPC4 Pipeline/Module Ops
+	# 5.4 Hardware Platform Preset & Core/Memory Config (-A ptl)
+	run_tb_case 5 "platform_preset_ptl_multicore" \
+		"Hardware Platform Preset PTL (5c @ 442.368MHz, 4608KB HPSRAM)" \
+		"${DEV_TPLG}/sof-mtl-nocodec-dp-core-test.tplg" "5,6,7,8,11,12" \
+		3 "${WORK_DIR}/in_48k_2ch_s32.raw" 3 \
+		"Platform=ptl Cores=5" \
+		-r 48000 -R 48000 -c 2 -n 2 -b S32_LE -A ptl
+
+	# 5.5 Interactive sof-tb-ctl Batch Script (-f), REPL & Dynamic IPC4 Pipeline/Module Ops
 	if should_run 5 "interactive_tb_ctl_batch_repl"; then
 		if [[ "${LIST_ONLY}" -eq 1 ]]; then
 			printf "  [Tier 5] %-36s : %s\n" "interactive_tb_ctl_batch_repl" "Interactive sof-tb-ctl batch (-f), REPL & dynamic IPC4 ops"
@@ -478,6 +486,10 @@ EOF
 			cat >"${batch_file}" <<EOF
 ping
 info
+platform-cfg presets
+platform-cfg preset arl
+platform-cfg status
+platform-cfg preset default
 core enable 1
 core enable 2
 ppl-create 99 0 1

@@ -130,14 +130,31 @@ static struct block_map lp_buf_heap_map[] = {
 
 static struct mm memmap;
 
+size_t __attribute__((weak)) host_platform_get_hpsram_size(void);
+size_t __attribute__((weak)) host_platform_get_lpsram_size(void);
+
 void platform_init_memmap(struct sof *sof)
 {
-	uint32_t heap_buffer_size = SOF_FW_END - HEAP_BUFFER_BASE;
+	uint32_t hp_sram_total = HP_SRAM_SIZE;
+	uint32_t lp_buffer_size = HEAP_LP_BUFFER_SIZE;
+	uint32_t heap_buffer_size;
 	uint32_t buffer_count;
 	int i;
 
+	if (host_platform_get_hpsram_size && host_platform_get_hpsram_size() >= 0x40000U)
+		hp_sram_total = (uint32_t)host_platform_get_hpsram_size();
+	if (host_platform_get_lpsram_size && host_platform_get_lpsram_size() >= 0x1000U)
+		lp_buffer_size = (uint32_t)host_platform_get_lpsram_size();
+
+	if (hp_sram_total > (HEAP_BUFFER_BASE - HP_SRAM_BASE))
+		heap_buffer_size = hp_sram_total - (HEAP_BUFFER_BASE - HP_SRAM_BASE);
+	else
+		heap_buffer_size = hp_sram_total / 2;
+
 	/* calculate the buffer heap size */
 	buffer_count = heap_buffer_size / HEAP_BUFFER_BLOCK_SIZE;
+	if (buffer_count > HEAP_BUFFER_COUNT_MAX)
+		buffer_count = HEAP_BUFFER_COUNT_MAX;
 	heap_buffer_size = buffer_count * HEAP_BUFFER_BLOCK_SIZE;
 
 	for (i = 0; i < ARRAY_SIZE(buf_heap_map); i++) {
@@ -249,15 +266,15 @@ void platform_init_memmap(struct sof *sof)
 	/* heap lp buffer init */
 	sof->memory_map->buffer[1].blocks = ARRAY_SIZE(lp_buf_heap_map);
 	sof->memory_map->buffer[1].map = uncached_block_map(lp_buf_heap_map);
-	sof->memory_map->buffer[1].heap = (unsigned long)malloc(HEAP_LP_BUFFER_SIZE);
-	sof->memory_map->buffer[1].size = HEAP_LP_BUFFER_SIZE;
-	sof->memory_map->buffer[1].info.free = HEAP_LP_BUFFER_SIZE;
+	sof->memory_map->buffer[1].heap = (unsigned long)malloc(lp_buffer_size);
+	sof->memory_map->buffer[1].size = lp_buffer_size;
+	sof->memory_map->buffer[1].info.free = lp_buffer_size;
 	sof->memory_map->buffer[1].caps = SOF_MEM_CAPS_RAM | SOF_MEM_CAPS_LP |
 		SOF_MEM_CAPS_CACHE | SOF_MEM_CAPS_DMA;
 
 	/* .total init */
 	sof->memory_map->total.free = HEAP_SYSTEM_T_SIZE +
 		HEAP_SYS_RUNTIME_T_SIZE + HEAP_RUNTIME_SIZE + heap_buffer_size +
-		HEAP_LP_BUFFER_SIZE;
+		lp_buffer_size;
 
 }
