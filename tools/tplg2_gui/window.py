@@ -10,11 +10,11 @@ import os
 import shutil
 import subprocess
 import threading
-from typing import Optional
+from typing import Dict, List, Optional
 
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gio, GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk
 
 from .compiler import CompileResult, TopologyCompiler
 from .graph_canvas import TopologyGraphCanvas
@@ -24,7 +24,18 @@ from .model import ConfigNode, GraphViewModel
 from .parser import Topology2Workspace
 from .right_inspector import RightAttributeInspector
 from .serializer import generate_compilable_conf
-from .testbench import TestbenchRunResult, TestbenchRunner, WaveformSnapshotWidget
+from .testbench import (
+    KcontrolTelemetryItem,
+    SOF_PCM_OP_CAPTURE_BUFFER,
+    SOF_PCM_OP_START_TONE,
+    SOF_PCM_OP_STOP_TONE,
+    SOF_PM_OP_RELEASE_HOLD,
+    SOF_PM_OP_WAKE_HOLD,
+    TestbenchRunResult,
+    TestbenchRunner,
+    TestbenchTelemetry,
+    WaveformSnapshotWidget,
+)
 
 
 class Topology2MainWindow(Gtk.ApplicationWindow):
@@ -32,13 +43,22 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def __init__(self, app: Gtk.Application, initial_dir: Optional[str] = None):
         super().__init__(application=app, title="SOF Topology2 Visual Graph Editor & Testbench")
+        self.set_decorated(True)
         self.set_default_size(1560, 940)
+        self.maximize()
+
+        win_key = Gtk.EventControllerKey.new()
+        win_key.connect("key-pressed", self._on_window_key_pressed)
+        self.add_controller(win_key)
 
         self.workspace: Optional[Topology2Workspace] = None
         self.compiler: Optional[TopologyCompiler] = None
         self.tb_runner: Optional[TestbenchRunner] = None
         self.last_compiled_tplg: Optional[str] = None
         self.last_output_wav: Optional[str] = None
+        self.last_telemetry: Optional[TestbenchTelemetry] = None
+        self._discovered_kcontrols: List[KcontrolTelemetryItem] = []
+        self._pending_kctl_overrides: Dict[str, List[int]] = {}
         self._last_allocated_width: int = 0
         self._last_allocated_height: int = 0
 
@@ -50,8 +70,24 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if os.path.isdir(default_dir):
             self.load_topology2_directory(default_dir)
 
+    def _on_window_key_pressed(
+        self,
+        _ctrl: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        _state: Gdk.ModifierType,
+    ) -> bool:
+        if keyval == Gdk.KEY_F11:
+            if self.is_fullscreen():
+                self.unfullscreen()
+            else:
+                self.fullscreen()
+            return True
+        return False
+
     def _build_header_bar(self) -> None:
         header = Gtk.HeaderBar()
+        header.set_show_title_buttons(True)
         self.set_titlebar(header)
 
         # Left header controls: Open Topology2 Dir + Graph Layout actions
@@ -87,9 +123,17 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.play_out_btn.connect("clicked", self._on_play_output_clicked)
         header.pack_end(self.play_out_btn)
 
+        self.keep_alive_btn = Gtk.ToggleButton(label="Keep Server (-W)")
+        self.keep_alive_btn.set_tooltip_text(
+            "Keep sof-testbench4 SOFR TCP server running after run for interactive control & telemetry"
+        )
+        header.pack_end(self.keep_alive_btn)
+
         self.run_tb_btn = Gtk.Button(label="▶ Run in Testbench")
         self.run_tb_btn.add_css_class("suggested-action")
-        self.run_tb_btn.set_tooltip_text("Compile topology and run test audio through sof-testbench4")
+        self.run_tb_btn.set_tooltip_text(
+            "Compile topology and run sof-testbench4 configured & monitored via SOFR network protocol"
+        )
         self.run_tb_btn.connect("clicked", self._on_run_testbench_clicked)
         header.pack_end(self.run_tb_btn)
 
@@ -116,7 +160,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         # Signal selector
         self.sig_combo = Gtk.DropDown.new_from_strings(
-            ["Sine 997 Hz", "Chirp 100-12kHz", "Multitone", "White Noise", "ALSA Front_Center.wav"]
+            [
+                "Sine 997 Hz",
+                "Chirp 100-12kHz",
+                "Multitone",
+                "White Noise",
+                "ALSA Front_Center.wav",
+                "SOFR Remote 1kHz Tone",
+            ]
         )
         self.sig_combo.set_selected(0)
         self.sig_combo.set_tooltip_text("Test audio signal to run through the pipeline")
@@ -169,7 +220,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         canvas_frame.set_child(self.canvas)
         self.center_vpaned.set_start_child(canvas_frame)
 
-        # Bottom drawer: Waveform comparison + Compiler/Testbench console log
+        # Bottom drawer: Waveform comparison + SOFR Telemetry / Remote Control / Console Log
         bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         bottom_box.set_margin_start(4)
         bottom_box.set_margin_end(4)
@@ -180,11 +231,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.status_lbl.set_xalign(0.0)
         bottom_box.append(self.status_lbl)
 
-        # Split bottom drawer horizontally: [WaveformSnapshotWidget] | [Console Log]
+        # Split bottom drawer horizontally: [WaveformSnapshotWidget] | [Notebook: SOFR Telemetry / Control / Log]
         bottom_hpaned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         bottom_hpaned.set_wide_handle(True)
         bottom_hpaned.set_vexpand(True)
-        bottom_hpaned.set_position(430)
+        bottom_hpaned.set_position(360)
 
         wf_frame = Gtk.Frame()
         wf_frame.add_css_class("sub-panel-frame")
@@ -192,6 +243,120 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         wf_frame.set_child(self.waveform_widget)
         bottom_hpaned.set_start_child(wf_frame)
 
+        self.bottom_notebook = Gtk.Notebook()
+        self.bottom_notebook.set_vexpand(True)
+        self.bottom_notebook.set_hexpand(True)
+
+        # Tab 1: SOFR Telemetry View
+        telem_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        telem_box.set_margin_start(4)
+        telem_box.set_margin_end(4)
+        telem_box.set_margin_top(4)
+        telem_box.set_margin_bottom(4)
+
+        self.telem_summary_lbl = Gtk.Label(
+            label="SOFR Telemetry: Run Testbench to query DSP cores, KCPS, SRAM banks, heap, DAPM & kcontrols."
+        )
+        self.telem_summary_lbl.set_xalign(0.0)
+        self.telem_summary_lbl.add_css_class("heading")
+        telem_box.append(self.telem_summary_lbl)
+
+        telem_scroll = Gtk.ScrolledWindow()
+        telem_scroll.set_vexpand(True)
+        telem_scroll.set_hexpand(True)
+        self.telem_view = Gtk.TextView()
+        self.telem_view.set_editable(False)
+        self.telem_view.set_monospace(True)
+        self.telem_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        telem_scroll.set_child(self.telem_view)
+        telem_box.append(telem_scroll)
+        self.bottom_notebook.append_page(telem_box, Gtk.Label(label="SOFR Telemetry"))
+
+        # Tab 2: Remote Control & Kcontrols (SOFR Protocol)
+        ctl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        ctl_box.set_margin_start(6)
+        ctl_box.set_margin_end(6)
+        ctl_box.set_margin_top(6)
+        ctl_box.set_margin_bottom(6)
+
+        # Row 1: DSP Power, Execution, Tone & Telemetry Poll Controls
+        exec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        exec_row.append(Gtk.Label(label="DSP Control:"))
+
+        btn_wake = Gtk.Button(label="▶ Resume (D0)")
+        btn_wake.set_tooltip_text("SOF_NET_OP_PM_CTL: SOF_PM_OP_WAKE_HOLD")
+        btn_wake.connect("clicked", lambda _b: self._on_remote_pm_ctl(SOF_PM_OP_WAKE_HOLD))
+        exec_row.append(btn_wake)
+
+        btn_pause = Gtk.Button(label="⏸ Pause (D3)")
+        btn_pause.set_tooltip_text("SOF_NET_OP_PM_CTL: SOF_PM_OP_RELEASE_HOLD")
+        btn_pause.connect("clicked", lambda _b: self._on_remote_pm_ctl(SOF_PM_OP_RELEASE_HOLD))
+        exec_row.append(btn_pause)
+
+        btn_step = Gtk.Button(label="⏭ Step 10 Ticks")
+        btn_step.set_tooltip_text("SOF_NET_OP_SHELL_EXEC: step 10")
+        btn_step.connect("clicked", lambda _b: self._on_remote_shell_preset("step 10"))
+        exec_row.append(btn_step)
+
+        self.remote_tone_btn = Gtk.ToggleButton(label="🎵 1kHz Tone")
+        self.remote_tone_btn.set_tooltip_text("SOF_NET_OP_PCM_CTL: START_TONE / STOP_TONE")
+        self.remote_tone_btn.connect("toggled", self._on_remote_tone_toggled)
+        exec_row.append(self.remote_tone_btn)
+
+        btn_poll = Gtk.Button(label="🔄 Refresh Telemetry")
+        btn_poll.set_tooltip_text("Poll SOF_NET_OP_TELEM_SNAPSHOT & SOF_PCM_OP_CAPTURE_BUFFER")
+        btn_poll.connect("clicked", self._on_refresh_telemetry_clicked)
+        exec_row.append(btn_poll)
+
+        btn_stop_srv = Gtk.Button(label="⏹ Stop Server")
+        btn_stop_srv.set_tooltip_text("Send SOF_NET_OP_SHELL_EXEC 'quit' to stop live testbench server")
+        btn_stop_srv.connect("clicked", self._on_stop_live_server_clicked)
+        exec_row.append(btn_stop_srv)
+        ctl_box.append(exec_row)
+
+        # Row 2: Kcontrol Configuration (SOF_NET_OP_KCTL_LIST / SOF_NET_OP_KCTL_SET)
+        kctl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        kctl_row.append(Gtk.Label(label="Kcontrol:"))
+        self.kctl_combo = Gtk.DropDown.new_from_strings(["(Run testbench to list kcontrols)"])
+        self.kctl_combo.set_hexpand(True)
+        self.kctl_combo.connect("notify::selected", self._on_kctl_combo_selected)
+        kctl_row.append(self.kctl_combo)
+
+        kctl_row.append(Gtk.Label(label="Values:"))
+        self.kctl_val_entry = Gtk.Entry()
+        self.kctl_val_entry.set_placeholder_text("e.g. 28,28")
+        self.kctl_val_entry.set_width_chars(12)
+        kctl_row.append(self.kctl_val_entry)
+
+        btn_kctl_set = Gtk.Button(label="Apply Kcontrol (OP_KCTL_SET)")
+        btn_kctl_set.connect("clicked", self._on_apply_kcontrol_clicked)
+        kctl_row.append(btn_kctl_set)
+        ctl_box.append(kctl_row)
+
+        # Row 3: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
+        sh_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        sh_row.append(Gtk.Label(label="Shell:"))
+        self.remote_shell_entry = Gtk.Entry()
+        self.remote_shell_entry.set_placeholder_text(
+            "Enter testbench shell command (info, pipelines, controls, stats, kernel cycles, kernel threads…)"
+        )
+        self.remote_shell_entry.set_hexpand(True)
+        self.remote_shell_entry.connect("activate", lambda _e: self._on_run_remote_shell_clicked(None))
+        sh_row.append(self.remote_shell_entry)
+
+        btn_sh_run = Gtk.Button(label="Send (OP_SHELL_EXEC)")
+        btn_sh_run.connect("clicked", self._on_run_remote_shell_clicked)
+        sh_row.append(btn_sh_run)
+
+        for sh_cmd in ("info", "pipelines", "stats", "kernel cycles", "kernel threads"):
+            b_pre = Gtk.Button(label=sh_cmd)
+            b_pre.connect("clicked", lambda _b, c=sh_cmd: self._on_remote_shell_preset(c))
+            sh_row.append(b_pre)
+        ctl_box.append(sh_row)
+
+        self.bottom_notebook.append_page(ctl_box, Gtk.Label(label="Remote Control & Kcontrols"))
+
+        # Tab 3: Console & Protocol Log
         log_scroll = Gtk.ScrolledWindow()
         log_scroll.set_vexpand(True)
         log_scroll.set_hexpand(True)
@@ -200,10 +365,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.log_view.set_monospace(True)
         self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         log_scroll.set_child(self.log_view)
-        log_frame = Gtk.Frame()
-        log_frame.add_css_class("sub-panel-frame")
-        log_frame.set_child(log_scroll)
-        bottom_hpaned.set_end_child(log_frame)
+        self.bottom_notebook.append_page(log_scroll, Gtk.Label(label="Console & Protocol Log"))
+
+        nb_frame = Gtk.Frame()
+        nb_frame.add_css_class("sub-panel-frame")
+        nb_frame.set_child(self.bottom_notebook)
+        bottom_hpaned.set_end_child(nb_frame)
 
         bottom_box.append(bottom_hpaned)
         bottom_drawer_frame = Gtk.Frame()
@@ -431,6 +598,22 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _collect_kcontrol_overrides(self) -> Dict[str, List[int]]:
+        """Collect any kcontrol overrides from Control nodes on the graph and pending UI edits."""
+        overrides: Dict[str, List[int]] = dict(self._pending_kctl_overrides)
+        if not self.canvas.vm:
+            return overrides
+        for node in self.canvas.vm.nodes.values():
+            if node.class_category != "Control":
+                continue
+            cname = node.config.get_scalar("name", "")
+            val_str = node.config.get_scalar("value", "") or node.config.get_scalar("volume", "")
+            if cname and val_str:
+                vals = [int(x.strip()) for x in str(val_str).split(",") if x.strip().lstrip("-").isdigit()]
+                if vals:
+                    overrides[str(cname).strip('"')] = vals
+        return overrides
+
     def _on_compile_finished(self, res: CompileResult, run_tb_after: bool) -> bool:
         self.compile_btn.set_sensitive(True)
         self.append_log(f"$ {res.command}")
@@ -462,6 +645,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             2: ("multitone", ""),
             3: ("noise", ""),
             4: ("wav_file", "/usr/share/sounds/alsa/Front_Center.wav"),
+            5: ("remote_tone", ""),
         }
         sig_kind, wav_src = sig_map.get(sig_idx, ("sine_997", ""))
 
@@ -470,8 +654,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         pipe_txt = self.pipes_entry.get_text().strip()
         pipes = [int(x.strip()) for x in pipe_txt.split(",") if x.strip().isdigit()] or res.pipeline_ids
+        kctl_overrides = self._collect_kcontrol_overrides()
+        keep_alive = self.keep_alive_btn.get_active()
 
         def tb_worker() -> None:
+            assert self.tb_runner is not None
             tb_res = self.tb_runner.run_testbench(
                 tplg_path=res.tplg_path,
                 pipeline_ids=pipes,
@@ -481,6 +668,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 bits=bits,
                 duration_sec=0.15,
                 wav_source=wav_src,
+                kcontrol_overrides=kctl_overrides,
+                keep_alive=keep_alive,
             )
             GLib.idle_add(self._on_testbench_finished, tb_res)
 
@@ -490,10 +679,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_testbench_finished(self, tb_res: TestbenchRunResult) -> bool:
         self.run_tb_btn.set_sensitive(True)
         self.append_log(f"$ {tb_res.command}")
+        if tb_res.telemetry and tb_res.telemetry.protocol_log:
+            for pline in tb_res.telemetry.protocol_log:
+                self.append_log(pline)
         if tb_res.stdout.strip():
             self.append_log(tb_res.stdout.strip())
         if tb_res.stderr.strip():
-            # Show last 20 lines of testbench trace summary
             lines = tb_res.stderr.strip().splitlines()
             tail = "\n".join(lines[-20:])
             self.append_log(tail)
@@ -502,10 +693,126 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.status_lbl.set_text(tb_res.summary_text)
         self.waveform_widget.set_waveforms(tb_res.in_samples, tb_res.out_samples, tb_res.summary_text)
 
+        if tb_res.telemetry:
+            self._apply_telemetry_to_ui(tb_res.telemetry)
+
         if tb_res.success and tb_res.out_wav_path and os.path.isfile(tb_res.out_wav_path):
             self.last_output_wav = tb_res.out_wav_path
             self.play_out_btn.set_sensitive(True)
         return False
+
+    def _apply_telemetry_to_ui(self, telem: TestbenchTelemetry) -> None:
+        self.last_telemetry = telem
+        pwr = "D0 (ACTIVE)" if telem.dsp_power_state == 1 else "D3 (PAUSED)"
+        active_kcps = sum(c.avg_kcps for c in telem.cores if c.enabled)
+        self.telem_summary_lbl.set_text(
+            f"SOFR :{telem.server_port}  |  FW v{telem.fw_version} ({pwr})  |  "
+            f"Cores=0x{telem.enabled_cores_mask:02x}  |  Ticks={telem.total_ll_ticks}  |  "
+            f"KCPS={active_kcps}  |  HPSRAM={telem.hpsram.powered_banks}/{telem.hpsram.total_banks} banks  |  "
+            f"Heap={telem.total_heap_bytes}B  |  DAPM={telem.dapm_powered_nodes}/{telem.dapm_total_nodes} widgets"
+        )
+        tbuf = self.telem_view.get_buffer()
+        tbuf.set_text(telem.format_report())
+
+        self._discovered_kcontrols = list(telem.kcontrols)
+        if self._discovered_kcontrols:
+            labels = [
+                f"[{k.numid}] {k.name} = {','.join(str(v) for v in k.values)}"
+                for k in self._discovered_kcontrols
+            ]
+            self.kctl_combo.set_model(Gtk.StringList.new(labels))
+            self.kctl_combo.set_selected(0)
+            self._on_kctl_combo_selected(self.kctl_combo, None)
+        else:
+            self.kctl_combo.set_model(Gtk.StringList.new(["(No kcontrols in active topology)"]))
+
+    # -------------------------------------------------------------------------
+    # Interactive SOFR Network Protocol Controls
+    # -------------------------------------------------------------------------
+
+    def _on_kctl_combo_selected(self, combo: Gtk.DropDown, _pspec: object) -> None:
+        idx = combo.get_selected()
+        if 0 <= idx < len(self._discovered_kcontrols):
+            kc = self._discovered_kcontrols[idx]
+            self.kctl_val_entry.set_text(",".join(str(v) for v in kc.values))
+
+    def _on_apply_kcontrol_clicked(self, _btn: Gtk.Button) -> None:
+        idx = self.kctl_combo.get_selected()
+        if not (0 <= idx < len(self._discovered_kcontrols)):
+            return
+        kc = self._discovered_kcontrols[idx]
+        raw = self.kctl_val_entry.get_text().strip()
+        vals = [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
+        if not vals:
+            return
+        self._pending_kctl_overrides[kc.name] = vals
+        if self.tb_runner and self.tb_runner.live_client:
+            st, _ = self.tb_runner.live_client.set_kcontrol(
+                numid=kc.numid,
+                name=kc.name,
+                values=vals,
+            )
+            self.append_log(
+                f"[SOFR] Live OP_KCTL_SET numid={kc.numid} '{kc.name}' = {vals} -> status={st}"
+            )
+            self._on_refresh_telemetry_clicked(None)
+        else:
+            self.status_lbl.set_text(
+                f"Queued kcontrol override '{kc.name}' = {vals} for next Testbench run (or enable Keep Server -W)."
+            )
+
+    def _on_remote_pm_ctl(self, op: int) -> None:
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench for live PM control.")
+            return
+        st, info = self.tb_runner.live_client.pm_control(op)
+        self.append_log(f"[SOFR] Live OP_PM_CTL op={op} -> status={st} {info}")
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_remote_tone_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if not self.tb_runner or not self.tb_runner.live_client:
+            return
+        op = SOF_PCM_OP_START_TONE if btn.get_active() else SOF_PCM_OP_STOP_TONE
+        st, info, _ = self.tb_runner.live_client.pcm_control(op, freq_hz=1000)
+        self.append_log(f"[SOFR] Live OP_PCM_CTL tone={'ON' if btn.get_active() else 'OFF'} -> status={st} {info}")
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_remote_shell_preset(self, cmd: str) -> None:
+        self.remote_shell_entry.set_text(cmd)
+        self._on_run_remote_shell_clicked(None)
+
+    def _on_run_remote_shell_clicked(self, _btn: Optional[Gtk.Button]) -> None:
+        cmd = self.remote_shell_entry.get_text().strip()
+        if not cmd:
+            return
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to run live shell commands.")
+            return
+        st, out = self.tb_runner.live_client.exec_shell(cmd)
+        self.append_log(f"[SOFR] $ {cmd}\n{out.strip()}")
+        self._on_refresh_telemetry_clicked(None)
+
+    def _on_refresh_telemetry_clicked(self, _btn: Optional[Gtk.Button]) -> None:
+        if not self.tb_runner or not self.tb_runner.live_client:
+            return
+        telem = self.tb_runner.live_client.collect_full_telemetry()
+        if telem:
+            self._apply_telemetry_to_ui(telem)
+            _, _, pcm_bytes = self.tb_runner.live_client.pcm_control(
+                SOF_PCM_OP_CAPTURE_BUFFER,
+                duration_ms=150,
+            )
+            if pcm_bytes:
+                out_norm = self.tb_runner._decode_s16_bytes_normalized(pcm_bytes, telem.pcm_channels)
+                if out_norm:
+                    self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, out_norm)
+
+    def _on_stop_live_server_clicked(self, _btn: Gtk.Button) -> None:
+        if self.tb_runner:
+            self.tb_runner.stop_live_session()
+            self.keep_alive_btn.set_active(False)
+            self.status_lbl.set_text("Stopped live SOFR testbench server.")
+            self.append_log("[SOFR] Live testbench server stopped.")
 
     def _on_play_output_clicked(self, _btn: Gtk.Button) -> None:
         if not self.last_output_wav or not os.path.isfile(self.last_output_wav):

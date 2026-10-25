@@ -2230,12 +2230,22 @@ class Topology2Workspace:
         # 1. Left-hand Testbench I/O nodes for every host-copier
         for hc_node in hc_nodes:
             tb_id = f"tb_io.{hc_node.id}"
-            if tb_id in vm.nodes:
-                continue
-
             is_cap = _is_copier_capture(hc_node)
             chain_pids = _trace_pipeline_chain(hc_node, walk_upstream=is_cap)
             pipes_str = " → ".join(str(p) for p in chain_pids) if chain_pids else str(hc_node.pipeline_id or 1)
+            if tb_id in vm.nodes:
+                existing_tb = vm.nodes[tb_id]
+                existing_tb.config.set_scalar(
+                    "target_pipelines",
+                    pipes_str,
+                    category_info="Downstream/upstream pipelines enabled for testbench",
+                    origin="default",
+                    is_immutable=True,
+                )
+                existing_tb.badges = [f"Pipes: {pipes_str}"]
+                if str(existing_tb.config.get_scalar("enabled", "false")).lower() == "true":
+                    enabled_chain_pids.update(chain_pids)
+                continue
 
             pcm_id = str(hc_node.config.get_scalar("pcm_id", hc_node.instance_id) or "0")
             is_enabled = not has_left_enabled
@@ -2354,15 +2364,23 @@ class Topology2Workspace:
 
         for dc_node in dc_nodes:
             tb_id = f"tb_io.{dc_node.id}"
-            if tb_id in vm.nodes:
-                continue
-
             is_cap = _is_copier_capture(dc_node)
             # For DAI/ALH copiers on the right:
             # - Playback DAI/ALH is a Sink at the end of an upstream playback chain (walk_upstream=True)
             # - Capture DAI/ALH is a Source at the start of a downstream capture chain (walk_upstream=False)
             chain_pids = _trace_pipeline_chain(dc_node, walk_upstream=not is_cap)
             pipes_str = " → ".join(str(p) for p in chain_pids) if chain_pids else str(dc_node.pipeline_id or 1)
+            if tb_id in vm.nodes:
+                existing_tb = vm.nodes[tb_id]
+                existing_tb.config.set_scalar(
+                    "target_pipelines",
+                    pipes_str,
+                    category_info="Downstream/upstream pipelines enabled for testbench",
+                    origin="default",
+                    is_immutable=True,
+                )
+                existing_tb.badges = [f"Pipes: {pipes_str}"]
+                continue
 
             parts = dc_node.id.split(".")
             if len(parts) >= 3 and parts[0] == "dai-copier":

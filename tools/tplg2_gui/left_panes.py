@@ -13,7 +13,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, GObject, Gtk, Pango
 
-from .graph_canvas import MiniGraphPreview
+from .graph_canvas import MiniGraphPreview, TopologyGraphCanvas
 from .model import CMakeTargetVariant, GraphViewModel, MachineTopologyEntry, TplgClassDef
 from .parser import Topology2Workspace
 
@@ -49,6 +49,7 @@ class LeftNavigationPanel(Gtk.Box):
         self._filter_text: str = ""
         self._mini_vm_cache: Dict[str, GraphViewModel] = {}
         self._hovered_row: Optional[Gtk.ListBoxRow] = None
+        self._is_dragging: bool = False
 
         # Reusable non-modal Hover Zoom Info Box Popover for Object View items
         self._hover_popover = Gtk.Popover()
@@ -97,6 +98,10 @@ class LeftNavigationPanel(Gtk.Box):
         self.obj_mod_list = Gtk.ListBox()
         self.obj_mod_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.obj_mod_list.connect("row-selected", self._on_obj_module_row_selected)
+        mod_click = Gtk.GestureClick.new()
+        mod_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        mod_click.connect("pressed", lambda *_a: self._hide_hover_zoom_box())
+        self.obj_mod_list.add_controller(mod_click)
         mod_motion = Gtk.EventControllerMotion.new()
         mod_motion.connect("motion", self._on_obj_list_motion, self.obj_mod_list)
         mod_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
@@ -131,6 +136,10 @@ class LeftNavigationPanel(Gtk.Box):
         self.obj_pipe_list = Gtk.ListBox()
         self.obj_pipe_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.obj_pipe_list.connect("row-selected", self._on_obj_pipeline_row_selected)
+        pipe_click = Gtk.GestureClick.new()
+        pipe_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        pipe_click.connect("pressed", lambda *_a: self._hide_hover_zoom_box())
+        self.obj_pipe_list.add_controller(pipe_click)
         pipe_motion = Gtk.EventControllerMotion.new()
         pipe_motion.connect("motion", self._on_obj_list_motion, self.obj_pipe_list)
         pipe_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
@@ -377,13 +386,11 @@ class LeftNavigationPanel(Gtk.Box):
             drag_src.set_actions(Gdk.DragAction.COPY)
             drag_src.connect(
                 "prepare",
-                lambda _src, _x, _y, mn=mname: (
-                    self._hide_hover_zoom_box(),
-                    Gdk.ContentProvider.new_for_value(
-                        GObject.Value(GObject.TYPE_STRING, f"module:{mn}")
-                    ),
-                )[1],
+                lambda _src, _x, _y, mn=mname: self._prepare_drag_item(f"module:{mn}"),
             )
+            drag_src.connect("drag-begin", lambda *_a: self._on_drag_started())
+            drag_src.connect("drag-end", lambda *_a: self._on_drag_stopped())
+            drag_src.connect("drag-cancel", lambda *_a: (self._on_drag_stopped(), False)[1])
             row.add_controller(drag_src)
 
             self.obj_mod_list.append(row)
@@ -446,13 +453,11 @@ class LeftNavigationPanel(Gtk.Box):
             drag_src.set_actions(Gdk.DragAction.COPY)
             drag_src.connect(
                 "prepare",
-                lambda _src, _x, _y, pn=pname: (
-                    self._hide_hover_zoom_box(),
-                    Gdk.ContentProvider.new_for_value(
-                        GObject.Value(GObject.TYPE_STRING, f"pipeline:{pn}")
-                    ),
-                )[1],
+                lambda _src, _x, _y, pn=pname: self._prepare_drag_item(f"pipeline:{pn}"),
             )
+            drag_src.connect("drag-begin", lambda *_a: self._on_drag_started())
+            drag_src.connect("drag-end", lambda *_a: self._on_drag_stopped())
+            drag_src.connect("drag-cancel", lambda *_a: (self._on_drag_stopped(), False)[1])
             row.add_controller(drag_src)
 
             self.obj_pipe_list.append(row)
@@ -646,14 +651,28 @@ class LeftNavigationPanel(Gtk.Box):
             if pipe_name:
                 self.on_add_pipeline_requested(pipe_name)
 
+    def _prepare_drag_item(self, payload: str) -> Gdk.ContentProvider:
+        self._is_dragging = True
+        TopologyGraphCanvas._active_drag_payload = payload
+        self._hide_hover_zoom_box()
+        val = GObject.Value(GObject.TYPE_STRING, payload)
+        return Gdk.ContentProvider.new_for_value(val)
+
+    def _on_drag_started(self) -> None:
+        self._is_dragging = True
+        self._hide_hover_zoom_box()
+
+    def _on_drag_stopped(self) -> None:
+        self._is_dragging = False
+        TopologyGraphCanvas._active_drag_payload = None
+
     def _on_module_drag_prepare(self, source: Gtk.DragSource, x: float, y: float, tree: Gtk.TreeView) -> Optional[Gdk.ContentProvider]:
         sel = tree.get_selection()
         model, tree_iter = sel.get_selected()
         if tree_iter:
             mod_name = model.get_value(tree_iter, 3)
             if mod_name:
-                val = GObject.Value(GObject.TYPE_STRING, f"module:{mod_name}")
-                return Gdk.ContentProvider.new_for_value(val)
+                return self._prepare_drag_item(f"module:{mod_name}")
         return None
 
     # ------------------------------------------------------------------
@@ -666,6 +685,18 @@ class LeftNavigationPanel(Gtk.Box):
         y: float,
         listbox: Gtk.ListBox,
     ) -> None:
+        state = _ctrl.get_current_event_state()
+        btn_pressed = bool(
+            state
+            & (
+                Gdk.ModifierType.BUTTON1_MASK
+                | Gdk.ModifierType.BUTTON2_MASK
+                | Gdk.ModifierType.BUTTON3_MASK
+            )
+        )
+        if self._is_dragging or btn_pressed or TopologyGraphCanvas._active_drag_payload is not None:
+            self._hide_hover_zoom_box()
+            return
         row = listbox.get_row_at_y(int(y))
         if row is None:
             self._hide_hover_zoom_box()
@@ -811,3 +842,4 @@ class LeftNavigationPanel(Gtk.Box):
         self._hovered_row = None
         if self._hover_popover.get_parent() is not None:
             self._hover_popover.popdown()
+            self._hover_popover.set_visible(False)

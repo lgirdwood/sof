@@ -126,6 +126,7 @@ class Topology2GuiApp(Gtk.Application):
 
         if not self.win:
             self.win = Topology2MainWindow(self, initial_dir=self.initial_dir)
+            self.win.maximize()
         self.win.present()
 
 
