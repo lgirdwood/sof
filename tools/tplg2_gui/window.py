@@ -75,7 +75,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         _ctrl: Gtk.EventControllerKey,
         keyval: int,
         _keycode: int,
-        _state: Gdk.ModifierType,
+        state: Gdk.ModifierType,
     ) -> bool:
         if keyval == Gdk.KEY_F11:
             if self.is_fullscreen():
@@ -83,6 +83,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             else:
                 self.fullscreen()
             return True
+
+        focus = self.get_focus()
+        if not isinstance(focus, Gtk.Editable):
+            ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+            if ctrl_held and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+                if shift_held:
+                    self._on_redo_clicked(None)
+                else:
+                    self._on_undo_clicked(None)
+                return True
+            if ctrl_held and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+                self._on_redo_clicked(None)
+                return True
         return False
 
     def _build_header_bar(self) -> None:
@@ -90,11 +104,23 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         header.set_show_title_buttons(True)
         self.set_titlebar(header)
 
-        # Left header controls: Open Topology2 Dir + Graph Layout actions
+        # Left header controls: Open Topology2 Dir + Undo/Redo + Graph Layout actions
         open_btn = Gtk.Button(label="Open Topology2 Dir…")
         open_btn.set_tooltip_text("Open a tools/topology/topology2 directory")
         open_btn.connect("clicked", self._on_open_dir_clicked)
         header.pack_start(open_btn)
+
+        self.undo_btn = Gtk.Button(label="↶ Undo")
+        self.undo_btn.set_sensitive(False)
+        self.undo_btn.set_tooltip_text("Undo last change (Shortcut: Ctrl+Z)")
+        self.undo_btn.connect("clicked", self._on_undo_clicked)
+        header.pack_start(self.undo_btn)
+
+        self.redo_btn = Gtk.Button(label="↷ Redo")
+        self.redo_btn.set_sensitive(False)
+        self.redo_btn.set_tooltip_text("Redo last undone change (Shortcut: Ctrl+Y / Ctrl+Shift+Z)")
+        self.redo_btn.connect("clicked", self._on_redo_clicked)
+        header.pack_start(self.redo_btn)
 
         fit_btn = Gtk.Button(label="Fit Graph")
         fit_btn.set_tooltip_text("Fit graph to canvas (Shortcut: F)")
@@ -214,6 +240,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.canvas = TopologyGraphCanvas(
             on_selection_changed=self._on_canvas_selection_changed,
             on_graph_modified=self._on_graph_modified,
+            on_history_changed=self._update_undo_redo_buttons,
         )
         canvas_frame = Gtk.Frame()
         canvas_frame.add_css_class("sub-panel-frame")
@@ -389,6 +416,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         # 3. Right Hand Panel (Tree View of Attributes of Selected Graph Node)
         self.right_inspector = RightAttributeInspector(
             on_attribute_edited=self._on_node_attribute_edited,
+            on_before_attribute_edit=self._on_before_attribute_edit,
         )
         right_panel_frame = Gtk.Frame()
         right_panel_frame.add_css_class("high-level-panel")
@@ -517,6 +545,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     ) -> None:
         self.right_inspector.set_node_config(title, config, subtitle)
 
+    def _on_before_attribute_edit(self, desc: str) -> None:
+        self.canvas.record_undo_snapshot(desc)
+
     def _on_node_attribute_edited(self, config: ConfigNode, key: str, new_val: str) -> None:
         if not self.canvas.vm:
             return
@@ -526,13 +557,40 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             node = self.canvas.vm.nodes[self.canvas.selected_node_id]
             if node.class_category == "TestbenchIO":
                 if key == "enabled" and new_val.strip().lower() in ("true", "1", "yes"):
-                    self.canvas.select_testbench_io_radio(node.id)
+                    self.canvas._suppress_auto_history = True
+                    try:
+                        self.canvas.select_testbench_io_radio(node.id)
+                    finally:
+                        self.canvas._suppress_auto_history = False
             else:
                 node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
                 node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
             _compute_node_geometry(node)
         self.canvas.queue_draw()
         self.status_lbl.set_text(f"Updated attribute '{key}' = '{new_val}'")
+
+    def _on_undo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
+        desc = self.canvas.history.undo_description
+        if self.canvas.undo():
+            self.status_lbl.set_text(f"Undid: {desc}")
+
+    def _on_redo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
+        desc = self.canvas.history.redo_description
+        if self.canvas.redo():
+            self.status_lbl.set_text(f"Redid: {desc}")
+
+    def _update_undo_redo_buttons(self) -> None:
+        h = self.canvas.history
+        self.undo_btn.set_sensitive(h.can_undo)
+        self.redo_btn.set_sensitive(h.can_redo)
+        if h.can_undo:
+            self.undo_btn.set_tooltip_text(f"Undo: {h.undo_description} (Ctrl+Z)")
+        else:
+            self.undo_btn.set_tooltip_text("Undo last change (Shortcut: Ctrl+Z)")
+        if h.can_redo:
+            self.redo_btn.set_tooltip_text(f"Redo: {h.redo_description} (Ctrl+Y / Ctrl+Shift+Z)")
+        else:
+            self.redo_btn.set_tooltip_text("Redo last undone change (Shortcut: Ctrl+Y / Ctrl+Shift+Z)")
 
     def _on_graph_modified(self) -> None:
         if self.canvas.vm:
@@ -541,9 +599,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             )
 
     def _on_relayout_clicked(self, _btn: Gtk.Button) -> None:
-        if self.canvas.vm:
-            layout_graph(self.canvas.vm)
-            self.canvas.fit_to_view()
+        self.canvas.relayout_graph()
 
     def _on_export_conf_clicked(self, _btn: Gtk.Button) -> None:
         if not self.canvas.vm or not self.compiler:

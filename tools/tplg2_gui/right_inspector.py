@@ -17,6 +17,7 @@ class RightAttributeInspector(Gtk.Box):
     def __init__(
         self,
         on_attribute_edited: Optional[Callable[[ConfigNode, str, str], None]] = None,
+        on_before_attribute_edit: Optional[Callable[[str], None]] = None,
     ):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.set_size_request(330, -1)
@@ -26,6 +27,7 @@ class RightAttributeInspector(Gtk.Box):
         self.set_margin_bottom(6)
 
         self.on_attribute_edited = on_attribute_edited
+        self.on_before_attribute_edit = on_before_attribute_edit
         self.current_config: Optional[ConfigNode] = None
         # Map TreePath string -> ConfigNode reference for instant in-place AST updates
         self._path_to_node: Dict[str, ConfigNode] = {}
@@ -209,6 +211,10 @@ class RightAttributeInspector(Gtk.Box):
         cnode = self._path_to_node.get(path_str)
         if cnode is None or cnode.is_immutable:
             return
+        if str(cnode.value if cnode.value is not None else "") == new_text:
+            return
+        if self.on_before_attribute_edit:
+            self.on_before_attribute_edit(f"Edit attribute '{cnode.key}'")
 
         cnode.value = new_text
         cnode.origin = "instance"
@@ -232,6 +238,8 @@ class RightAttributeInspector(Gtk.Box):
         v = self.new_val_entry.get_text().strip()
         if not k:
             return
+        if self.on_before_attribute_edit:
+            self.on_before_attribute_edit(f"Add attribute '{k}'")
         self.current_config.set_scalar(k, v, category_info="user", origin="instance")
         self.new_key_entry.set_text("")
         self.new_val_entry.set_text("")

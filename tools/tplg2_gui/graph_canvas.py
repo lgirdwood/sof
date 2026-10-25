@@ -25,7 +25,16 @@ from .layout import (
     layout_graph,
     update_container_bounds_from_nodes,
 )
-from .model import ConfigNode, GraphEdge, GraphNode, GraphPort, GraphViewModel, PipelineContainer
+from .model import (
+    ConfigNode,
+    GraphEdge,
+    GraphHistoryEntry,
+    GraphNode,
+    GraphPort,
+    GraphViewModel,
+    PipelineContainer,
+    UndoRedoManager,
+)
 from .parser import Topology2Workspace
 
 
@@ -120,6 +129,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self,
         on_selection_changed: Optional[Callable[[Optional[str], Optional[ConfigNode], str], None]] = None,
         on_graph_modified: Optional[Callable[[], None]] = None,
+        on_history_changed: Optional[Callable[[], None]] = None,
     ):
         super().__init__()
         self.set_hexpand(True)
@@ -129,6 +139,9 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         self.on_selection_changed = on_selection_changed
         self.on_graph_modified = on_graph_modified
+        self.history = UndoRedoManager(on_history_changed=on_history_changed)
+        self._suppress_auto_history: bool = False
+        self._pending_drag_history_entry: Optional[GraphHistoryEntry] = None
 
         self.workspace: Optional[Topology2Workspace] = None
         self.vm: Optional[GraphViewModel] = None
@@ -262,11 +275,122 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.selected_container_id = None
         self.selected_container_ids.clear()
         self.hovered_warning_pid = None
+        self._pending_drag_history_entry = None
+        self.history.clear()
         self._layout_cache.clear()
         layout_graph(vm)
         self.fit_to_view()
         if self.on_selection_changed:
             self.on_selection_changed(vm.title, vm.root_config, vm.subtitle)
+        self.queue_draw()
+
+    def _capture_history_entry(self, description: str) -> Optional[GraphHistoryEntry]:
+        if not self.vm:
+            return None
+        return GraphHistoryEntry(
+            description=description,
+            vm_snapshot=self.vm.clone(),
+            selected_node_id=self.selected_node_id,
+            selected_node_ids=set(self.selected_node_ids),
+            selected_edge_id=self.selected_edge_id,
+            selected_container_id=self.selected_container_id,
+            selected_container_ids=set(self.selected_container_ids),
+        )
+
+    def record_undo_snapshot(self, description: str) -> None:
+        """Record a snapshot of the current graph state onto the Undo stack before a mutation."""
+        if self._suppress_auto_history or not self.vm:
+            return
+        entry = self._capture_history_entry(description)
+        if entry is not None:
+            self.history.push_undo_entry(entry)
+
+    def _notify_current_selection(self) -> None:
+        if not self.vm or not self.on_selection_changed:
+            return
+        if self.selected_node_id and self.selected_node_id in self.vm.nodes:
+            node = self.vm.nodes[self.selected_node_id]
+            self.on_selection_changed(node.title, node.config, node.subtitle)
+        elif self.selected_edge_id:
+            edge = next((e for e in self.vm.edges if e.id == self.selected_edge_id), None)
+            if edge:
+                self.on_selection_changed(
+                    f"Route: {edge.source_node} ({edge.source_port}) → {edge.sink_node} ({edge.sink_port})",
+                    edge.config,
+                    "Object.Base.route",
+                )
+            else:
+                self.on_selection_changed(self.vm.title, self.vm.root_config, self.vm.subtitle)
+        elif self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+            cont = self.vm.containers[self.selected_container_id]
+            self.on_selection_changed(
+                f"Pipeline {self.selected_container_id}: {cont.class_name}",
+                cont.config,
+                f"Direction: {cont.direction}",
+            )
+        else:
+            self.on_selection_changed(self.vm.title, self.vm.root_config, self.vm.subtitle)
+
+    def _restore_history_entry(self, entry: GraphHistoryEntry) -> None:
+        self._clear_drop_preview()
+        self.vm = entry.vm_snapshot.clone()
+        self.selected_node_id = entry.selected_node_id if entry.selected_node_id in self.vm.nodes else None
+        self.selected_node_ids = {nid for nid in entry.selected_node_ids if nid in self.vm.nodes}
+        self.selected_edge_id = (
+            entry.selected_edge_id
+            if any(e.id == entry.selected_edge_id for e in self.vm.edges)
+            else None
+        )
+        self.selected_container_id = (
+            entry.selected_container_id
+            if entry.selected_container_id in self.vm.containers
+            else None
+        )
+        self.selected_container_ids = {pid for pid in entry.selected_container_ids if pid in self.vm.containers}
+        self._layout_cache.clear()
+        self._notify_current_selection()
+        if self.on_graph_modified:
+            self.on_graph_modified()
+        self.queue_draw()
+
+    def undo(self) -> Optional[str]:
+        """Undo the last graph or attribute modification and return its description."""
+        if not self.vm or not self.history.can_undo:
+            return None
+        curr = self._capture_history_entry("")
+        if curr is None:
+            return None
+        res = self.history.undo(curr)
+        if res is None:
+            return None
+        prev_entry, desc = res
+        self._restore_history_entry(prev_entry)
+        return desc
+
+    def redo(self) -> Optional[str]:
+        """Redo the last undone graph or attribute modification and return its description."""
+        if not self.vm or not self.history.can_redo:
+            return None
+        curr = self._capture_history_entry("")
+        if curr is None:
+            return None
+        res = self.history.redo(curr)
+        if res is None:
+            return None
+        next_entry, desc = res
+        self._restore_history_entry(next_entry)
+        return desc
+
+    def relayout_graph(self) -> None:
+        """Record an undo snapshot and re-run Sugiyama DAG auto-layout on the active graph."""
+        if not self.vm:
+            return
+        self.record_undo_snapshot("Auto-layout graph")
+        layout_graph(self.vm)
+        self.vm.dirty = True
+        self.fit_to_view()
+        if self.on_graph_modified:
+            self.on_graph_modified()
         self.queue_draw()
 
     def select_node(self, node_id: Optional[str], additive: bool = False) -> None:
@@ -1370,20 +1494,24 @@ class TopologyGraphCanvas(Gtk.Widget):
                     avail_w = node.width - 26.0
                     file_pw = round(avail_w * 0.46, 1)
                     if 10.0 <= lx <= 10.0 + file_pw:
-                        node.config.set_scalar("io_type", "file", origin="instance")
-                        self.vm.dirty = True
-                        self.select_node(nid)
-                        if self.on_graph_modified:
-                            self.on_graph_modified()
-                        self.queue_draw()
+                        if (node.config.get_scalar("io_type") or "").strip().lower() != "file":
+                            self.record_undo_snapshot(f"Set {node.title} mode to File")
+                            node.config.set_scalar("io_type", "file", origin="instance")
+                            self.vm.dirty = True
+                            self.select_node(nid)
+                            if self.on_graph_modified:
+                                self.on_graph_modified()
+                            self.queue_draw()
                         return
                     if 16.0 + file_pw <= lx <= node.width - 10.0:
-                        node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
-                        self.vm.dirty = True
-                        self.select_node(nid)
-                        if self.on_graph_modified:
-                            self.on_graph_modified()
-                        self.queue_draw()
+                        if (node.config.get_scalar("io_type") or "").strip().lower() != "alsa_pcm":
+                            self.record_undo_snapshot(f"Set {node.title} mode to ALSA PCM")
+                            node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
+                            self.vm.dirty = True
+                            self.select_node(nid)
+                            if self.on_graph_modified:
+                                self.on_graph_modified()
+                            self.queue_draw()
                         return
                 # Row 2: Selector box click -> open FileChooser or ALSA PCM popover
                 if 53.0 <= ly <= 75.0 and 10.0 <= lx <= node.width - 10.0:
@@ -1465,6 +1593,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.select_node(nid)
             else:
                 self.selected_node_id = nid
+            self._pending_drag_history_entry = self._capture_history_entry(f"Move {nid}")
             node = self.vm.nodes[nid]
             self._drag_node_initial = (node.x, node.y)
             self._drag_children_initial = {
@@ -1479,6 +1608,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         if pid is not None and pid in self.vm.containers:
             self._drag_mode = "container"
             self._drag_container_id = pid
+            self._pending_drag_history_entry = self._capture_history_entry(f"Move Pipeline {pid}")
             cont = self.vm.containers[pid]
             self._drag_container_initial = (cont.x, cont.y)
             pipe_nids = {n.id for n in self.vm.nodes.values() if n.pipeline_id == pid}
@@ -1538,6 +1668,7 @@ class TopologyGraphCanvas(Gtk.Widget):
 
     def _on_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         self._clear_drop_preview()
+        moved = abs(offset_x) > 1.0 or abs(offset_y) > 1.0
         if self.vm and self._drag_mode == "wire" and self._wire_source is not None:
             src_nid, src_pid, _, _ = self._wire_source
             wx = self._drag_start_world[0] + offset_x / self.zoom
@@ -1547,8 +1678,19 @@ class TopologyGraphCanvas(Gtk.Widget):
             target_pid = port_hit[1] if (port_hit and port_hit[2] == "in") else None
             if target_nid and target_nid != src_nid:
                 self._create_route_edge(src_nid, target_nid, src_port=src_pid, snk_port=target_pid)
-        elif self.vm and self._drag_mode == "node" and self.selected_node_id in self.vm.nodes:
-            self._maybe_reparent_dragged_node(self.selected_node_id)
+        elif self.vm and self._drag_mode in ("node", "container"):
+            if moved and self._pending_drag_history_entry is not None:
+                self.history.push_undo_entry(self._pending_drag_history_entry)
+                self.vm.dirty = True
+            if self._drag_mode == "node" and self.selected_node_id in self.vm.nodes:
+                self._suppress_auto_history = True
+                try:
+                    self._maybe_reparent_dragged_node(self.selected_node_id)
+                finally:
+                    self._suppress_auto_history = False
+            if moved and self.on_graph_modified:
+                self.on_graph_modified()
+        self._pending_drag_history_entry = None
         self._drag_mode = "none"
         self._wire_source = None
         self.set_cursor(None)
@@ -1624,6 +1766,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         if self._has_selected_objects():
             self._right_drag_mode = "objects"
             self.set_cursor_from_name("move")
+            self._pending_drag_history_entry = self._capture_history_entry("Move selected object(s)")
             self._capture_selected_objects_initial()
         else:
             self._right_drag_mode = "pan"
@@ -1660,8 +1803,20 @@ class TopologyGraphCanvas(Gtk.Widget):
 
     def _on_right_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         self._clear_drop_preview()
-        if self.vm and self._right_drag_mode == "objects" and not self._right_drag_containers_initial and self.selected_node_id in self.vm.nodes:
-            self._maybe_reparent_dragged_node(self.selected_node_id)
+        moved = abs(offset_x) > 1.0 or abs(offset_y) > 1.0
+        if self.vm and self._right_drag_mode == "objects":
+            if moved and self._pending_drag_history_entry is not None:
+                self.history.push_undo_entry(self._pending_drag_history_entry)
+                self.vm.dirty = True
+            if not self._right_drag_containers_initial and self.selected_node_id in self.vm.nodes:
+                self._suppress_auto_history = True
+                try:
+                    self._maybe_reparent_dragged_node(self.selected_node_id)
+                finally:
+                    self._suppress_auto_history = False
+            if moved and self.on_graph_modified:
+                self.on_graph_modified()
+        self._pending_drag_history_entry = None
         self._right_drag_mode = "none"
         self._right_drag_nodes_initial.clear()
         self._right_drag_containers_initial.clear()
@@ -1720,6 +1875,14 @@ class TopologyGraphCanvas(Gtk.Widget):
         return True
 
     def _on_key_pressed(self, controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: Gdk.ModifierType) -> bool:
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if ctrl_held and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            if shift_held:
+                return self.redo()
+            return self.undo()
+        if ctrl_held and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+            return self.redo()
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
             self.delete_selected()
             return True
@@ -1727,8 +1890,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.fit_to_view()
             return True
         if keyval in (Gdk.KEY_l, Gdk.KEY_L) and self.vm:
-            layout_graph(self.vm)
-            self.fit_to_view()
+            self.relayout_graph()
             return True
         return False
 
@@ -1747,6 +1909,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             return
         if any(e.source_node == src_nid and e.sink_node == snk_nid for e in self.vm.edges):
             return
+        self.record_undo_snapshot(f"Wire route {src_nid} → {snk_nid}")
         u = self.vm.nodes[src_nid]
         v = self.vm.nodes[snk_nid]
         if not src_port:
@@ -1783,13 +1946,16 @@ class TopologyGraphCanvas(Gtk.Widget):
         if not self.vm:
             return
         if self.selected_edge_id:
+            self.record_undo_snapshot("Delete route")
             self.vm.edges = [e for e in self.vm.edges if e.id != self.selected_edge_id]
             self.selected_edge_id = None
             self.vm.dirty = True
+            self._notify_current_selection()
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
         elif self.selected_node_ids or (self.selected_node_id and self.selected_node_id in self.vm.nodes) or self.selected_container_ids or (self.selected_container_id is not None and self.selected_container_id in self.vm.containers):
+            self.record_undo_snapshot("Delete selected object(s)")
             nids = set(self.selected_node_ids)
             if self.selected_node_id:
                 nids.add(self.selected_node_id)
@@ -1827,6 +1993,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.selected_container_ids.clear()
             self.vm.dirty = True
             update_container_bounds_from_nodes(self.vm)
+            self._notify_current_selection()
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
@@ -2025,109 +2192,114 @@ class TopologyGraphCanvas(Gtk.Widget):
         """
         if not self.vm or not self.workspace or module_name not in self.workspace.processing_modules:
             return None
-        cdef = self.workspace.processing_modules[module_name]
+        self.record_undo_snapshot(f"Add module {module_name}")
+        self._suppress_auto_history = True
+        try:
+            cdef = self.workspace.processing_modules[module_name]
 
-        target_pid: Optional[int] = None
-        if wx is not None and wy is not None:
-            target_pid = self._find_target_pipeline_at(wx, wy)
-        else:
-            if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
-                target_pid = self.selected_container_id
-            elif (
-                self.selected_node_id
-                and self.selected_node_id in self.vm.nodes
-                and self.vm.nodes[self.selected_node_id].pipeline_id in self.vm.containers
-            ):
-                target_pid = self.vm.nodes[self.selected_node_id].pipeline_id
-
-        if target_pid is not None and target_pid in self.vm.containers:
-            pid = target_pid
-        else:
-            used_pids = set(self.vm.containers.keys()) | {
-                n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
-            }
-            pid = 1
-            while pid in used_pids:
-                pid += 1
-            wdir = str(cdef.defaults.get("direction", "")).lower()
-            wtype = str(cdef.defaults.get("type", "")).lower()
-            pipe_dir = (
-                "capture"
-                if ("capture" in module_name.lower() or wdir == "capture" or wtype == "dai_out")
-                else "playback"
-            )
-            p_cfg = ConfigNode("Object.Widget.pipeline.1", node_type="object")
-            p_cfg.set_scalar("index", str(pid), origin="instance", is_constructor=True)
-            self.vm.containers[pid] = PipelineContainer(
-                pipeline_id=pid,
-                class_name="custom",
-                direction=pipe_dir,
-                enabled_by="Added from Object View",
-                config=p_cfg,
-            )
-
-        # Find unused instance number
-        inst_num = 1
-        while f"{module_name}.{pid}.{inst_num}" in self.vm.nodes:
-            inst_num += 1
-
-        node = self.workspace._instantiate_widget_node(
-            wclass=module_name,
-            winst=str(inst_num),
-            pipeline_id=pid,
-            pipeline_class=self.vm.containers[pid].class_name if pid in self.vm.containers else "custom",
-            pipeline_direction=self.vm.containers[pid].direction if pid in self.vm.containers else "playback",
-            override_stmts=[],
-            defines=self.vm.defines or self.workspace.global_defines,
-            source_file=cdef.source_file,
-        )
-        _compute_node_geometry(node, is_capture=_is_node_capture(self.vm, node))
-        if wx is None or wy is None:
-            if target_pid is not None and target_pid in self.vm.containers:
-                t_cont = self.vm.containers[target_pid]
-                wx = t_cont.x + t_cont.width - 10.0
-                wy = t_cont.y + t_cont.height / 2.0
+            target_pid: Optional[int] = None
+            if wx is not None and wy is not None:
+                target_pid = self._find_target_pipeline_at(wx, wy)
             else:
-                wx, wy = self.screen_to_world(
-                    float(self.get_width() or 600) / 2.0,
-                    float(self.get_height() or 400) / 2.0,
+                if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+                    target_pid = self.selected_container_id
+                elif (
+                    self.selected_node_id
+                    and self.selected_node_id in self.vm.nodes
+                    and self.vm.nodes[self.selected_node_id].pipeline_id in self.vm.containers
+                ):
+                    target_pid = self.vm.nodes[self.selected_node_id].pipeline_id
+
+            if target_pid is not None and target_pid in self.vm.containers:
+                pid = target_pid
+            else:
+                used_pids = set(self.vm.containers.keys()) | {
+                    n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
+                }
+                pid = 1
+                while pid in used_pids:
+                    pid += 1
+                wdir = str(cdef.defaults.get("direction", "")).lower()
+                wtype = str(cdef.defaults.get("type", "")).lower()
+                pipe_dir = (
+                    "capture"
+                    if ("capture" in module_name.lower() or wdir == "capture" or wtype == "dai_out")
+                    else "playback"
                 )
-        node.x = wx - node.width / 2.0
-        node.y = wy - node.height / 2.0
-        self.vm.nodes[node.id] = node
+                p_cfg = ConfigNode("Object.Widget.pipeline.1", node_type="object")
+                p_cfg.set_scalar("index", str(pid), origin="instance", is_constructor=True)
+                self.vm.containers[pid] = PipelineContainer(
+                    pipeline_id=pid,
+                    class_name="custom",
+                    direction=pipe_dir,
+                    enabled_by="Added from Object View",
+                    config=p_cfg,
+                )
 
-        if target_pid is not None:
-            self._join_module_to_pipeline(node, pid, wx, wy)
+            # Find unused instance number
+            inst_num = 1
+            while f"{module_name}.{pid}.{inst_num}" in self.vm.nodes:
+                inst_num += 1
 
-        self.workspace.attach_widget_kcontrol_nodes(self.vm, node)
-        ctrls = [
-            cnode for cnode in self.vm.nodes.values()
-            if cnode.parent_node_id == node.id and cnode.class_category != "TestbenchIO"
-        ]
-        if ctrls:
-            for cnode in ctrls:
-                _compute_node_geometry(cnode)
-            row_w = sum(cnode.width for cnode in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
-            ctrl_x = node.x + (node.width - row_w) / 2.0
-            ctrl_y = node.y + node.height + CTRL_TOP_GAP
-            for cnode in ctrls:
-                cnode.x = ctrl_x
-                cnode.y = ctrl_y
-                ctrl_x += cnode.width + CTRL_H_GAP
+            node = self.workspace._instantiate_widget_node(
+                wclass=module_name,
+                winst=str(inst_num),
+                pipeline_id=pid,
+                pipeline_class=self.vm.containers[pid].class_name if pid in self.vm.containers else "custom",
+                pipeline_direction=self.vm.containers[pid].direction if pid in self.vm.containers else "playback",
+                override_stmts=[],
+                defines=self.vm.defines or self.workspace.global_defines,
+                source_file=cdef.source_file,
+            )
+            _compute_node_geometry(node, is_capture=_is_node_capture(self.vm, node))
+            if wx is None or wy is None:
+                if target_pid is not None and target_pid in self.vm.containers:
+                    t_cont = self.vm.containers[target_pid]
+                    wx = t_cont.x + t_cont.width - 10.0
+                    wy = t_cont.y + t_cont.height / 2.0
+                else:
+                    wx, wy = self.screen_to_world(
+                        float(self.get_width() or 600) / 2.0,
+                        float(self.get_height() or 400) / 2.0,
+                    )
+            node.x = wx - node.width / 2.0
+            node.y = wy - node.height / 2.0
+            self.vm.nodes[node.id] = node
 
-        self.vm.dirty = True
-        update_container_bounds_from_nodes(self.vm)
-        self.workspace.attach_host_copier_io_nodes(self.vm)
-        for tb_node in self.vm.nodes.values():
-            if tb_node.class_category == "TestbenchIO":
-                _compute_node_geometry(tb_node)
-        _position_testbench_io_nodes(self.vm)
-        _assign_edge_ports(self.vm)
-        self.select_node(node.id)
-        if self.on_graph_modified:
-            self.on_graph_modified()
-        self.queue_draw()
-        return node.id
+            if target_pid is not None:
+                self._join_module_to_pipeline(node, pid, wx, wy)
+
+            self.workspace.attach_widget_kcontrol_nodes(self.vm, node)
+            ctrls = [
+                cnode for cnode in self.vm.nodes.values()
+                if cnode.parent_node_id == node.id and cnode.class_category != "TestbenchIO"
+            ]
+            if ctrls:
+                for cnode in ctrls:
+                    _compute_node_geometry(cnode)
+                row_w = sum(cnode.width for cnode in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
+                ctrl_x = node.x + (node.width - row_w) / 2.0
+                ctrl_y = node.y + node.height + CTRL_TOP_GAP
+                for cnode in ctrls:
+                    cnode.x = ctrl_x
+                    cnode.y = ctrl_y
+                    ctrl_x += cnode.width + CTRL_H_GAP
+
+            self.vm.dirty = True
+            update_container_bounds_from_nodes(self.vm)
+            self.workspace.attach_host_copier_io_nodes(self.vm)
+            for tb_node in self.vm.nodes.values():
+                if tb_node.class_category == "TestbenchIO":
+                    _compute_node_geometry(tb_node)
+            _position_testbench_io_nodes(self.vm)
+            _assign_edge_ports(self.vm)
+            self.select_node(node.id)
+            if self.on_graph_modified:
+                self.on_graph_modified()
+            self.queue_draw()
+            return node.id
+        finally:
+            self._suppress_auto_history = False
 
     def add_pipeline_instance(self, pipeline_name: str, wx: Optional[float] = None, wy: Optional[float] = None) -> Optional[int]:
         """Instantiate a full Pipeline (Class.Pipeline.<pipeline_name>) onto the active graph.
@@ -2136,135 +2308,139 @@ class TopologyGraphCanvas(Gtk.Widget):
         """
         if not self.vm or not self.workspace or pipeline_name not in self.workspace.pipeline_classes:
             return None
+        self.record_undo_snapshot(f"Add pipeline {pipeline_name}")
+        self._suppress_auto_history = True
+        try:
+            target_pid = self._find_target_pipeline_at(wx, wy)
 
-        target_pid = self._find_target_pipeline_at(wx, wy)
+            used_pids = set(self.vm.containers.keys()) | {
+                n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
+            }
+            new_pid = 1
+            while new_pid in used_pids:
+                new_pid += 1
 
-        used_pids = set(self.vm.containers.keys()) | {
-            n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
-        }
-        new_pid = 1
-        while new_pid in used_pids:
-            new_pid += 1
-
-        sub_vm = self.workspace.build_graph_for_pipeline(
-            pipeline_name,
-            index=new_pid,
-            include_testbench_io=True,
-        )
-        layout_graph(sub_vm)
-
-        sub_cont = sub_vm.containers.get(new_pid)
-        if sub_cont is not None:
-            sub_min_x = sub_cont.x
-            sub_min_y = sub_cont.y
-            sub_max_x = sub_cont.x + sub_cont.width
-            sub_max_y = sub_cont.y + sub_cont.height
-        else:
-            sub_xs = [n.x for n in sub_vm.nodes.values()]
-            sub_ys = [n.y for n in sub_vm.nodes.values()]
-            sub_x2s = [n.x + n.width for n in sub_vm.nodes.values()]
-            sub_y2s = [n.y + n.height for n in sub_vm.nodes.values()]
-            sub_min_x = min(sub_xs) if sub_xs else 0.0
-            sub_min_y = min(sub_ys) if sub_ys else 0.0
-            sub_max_x = max(sub_x2s) if sub_x2s else 300.0
-            sub_max_y = max(sub_y2s) if sub_y2s else 180.0
-
-        sub_cx = (sub_min_x + sub_max_x) / 2.0
-        sub_cy = (sub_min_y + sub_max_y) / 2.0
-        sub_w = sub_max_x - sub_min_x
-
-        place_on_right = True
-        if target_pid is not None and target_pid in self.vm.containers:
-            t_cont = self.vm.containers[target_pid]
-            t_nodes = [
-                n for n in self.vm.nodes.values()
-                if n.pipeline_id == target_pid and n.parent_node_id is None
-            ]
-            n_nodes = [
-                n for n in sub_vm.nodes.values()
-                if n.pipeline_id == new_pid and n.parent_node_id is None
-            ]
-            t_has_host = any(n.class_name == "host-copier" for n in t_nodes)
-            t_has_dai = any(n.class_name in ("dai-copier", "alh-copier") for n in t_nodes)
-            n_has_host = any(n.class_name == "host-copier" for n in n_nodes)
-            n_has_dai = any(n.class_name in ("dai-copier", "alh-copier") for n in n_nodes)
-
-            if t_has_host and n_has_dai:
-                place_on_right = True
-            elif n_has_host and t_has_dai:
-                place_on_right = False
-            elif wx is not None:
-                place_on_right = wx >= (t_cont.x + t_cont.width / 2.0)
-
-            if place_on_right:
-                wx = t_cont.x + t_cont.width + CONTAINER_GAP_X + sub_w / 2.0
-            else:
-                wx = t_cont.x - CONTAINER_GAP_X - sub_w / 2.0
-            wy = t_cont.y + t_cont.height / 2.0
-        elif wx is None or wy is None:
-            if self.vm.nodes or self.vm.containers:
-                g_min_x, g_min_y, g_w, g_h = self._get_graph_bounds()
-                wx = g_min_x + g_w / 2.0
-                wy = g_min_y + g_h + 64.0 + (sub_max_y - sub_min_y) / 2.0
-            else:
-                wx, wy = self.screen_to_world(
-                    float(self.get_width() or 600) / 2.0,
-                    float(self.get_height() or 400) / 2.0,
-                )
-
-        dx = wx - sub_cx
-        dy = wy - sub_cy
-
-        existing_enabled_sides = {
-            str(n.config.get_scalar("side", "left")).lower()
-            for n in self.vm.nodes.values()
-            if n.class_category == "TestbenchIO"
-            and str(n.config.get_scalar("enabled", "false")).lower() in ("true", "1", "yes")
-        }
-
-        for cid, cont in sub_vm.containers.items():
-            cont.x += dx
-            cont.y += dy
-            cont.enabled_by = "Added from Object View"
-            cont.config.set_scalar("index", str(new_pid), origin="instance", is_constructor=True)
-            self.vm.containers[cid] = cont
-
-        for nid, node in sub_vm.nodes.items():
-            node.x += dx
-            node.y += dy
-            if node.class_category == "TestbenchIO":
-                side = str(node.config.get_scalar("side", "left")).lower()
-                if side in existing_enabled_sides:
-                    node.config.set_scalar("enabled", "false", origin="instance")
-            self.vm.nodes[nid] = node
-
-        for edge in sub_vm.edges:
-            edge.id = f"pipe_{new_pid}_{edge.id}"
-            self.vm.edges.append(edge)
-
-        if target_pid is not None and target_pid in self.vm.containers:
-            self._join_pipelines(target_pid, new_pid, place_on_right=place_on_right)
-            self.workspace.attach_host_copier_io_nodes(self.vm)
-            _position_testbench_io_nodes(self.vm)
-            _assign_edge_ports(self.vm)
-
-        self.vm.dirty = True
-        self.selected_node_id = None
-        self.selected_node_ids.clear()
-        self.selected_edge_id = None
-        self.selected_container_id = new_pid
-        self.selected_container_ids = {new_pid}
-        if new_pid in self.vm.containers and self.on_selection_changed:
-            cont = self.vm.containers[new_pid]
-            self.on_selection_changed(
-                f"Pipeline {new_pid}: {cont.class_name}",
-                cont.config,
-                f"Direction: {cont.direction}",
+            sub_vm = self.workspace.build_graph_for_pipeline(
+                pipeline_name,
+                index=new_pid,
+                include_testbench_io=True,
             )
-        if self.on_graph_modified:
-            self.on_graph_modified()
-        self.queue_draw()
-        return new_pid
+            layout_graph(sub_vm)
+
+            sub_cont = sub_vm.containers.get(new_pid)
+            if sub_cont is not None:
+                sub_min_x = sub_cont.x
+                sub_min_y = sub_cont.y
+                sub_max_x = sub_cont.x + sub_cont.width
+                sub_max_y = sub_cont.y + sub_cont.height
+            else:
+                sub_xs = [n.x for n in sub_vm.nodes.values()]
+                sub_ys = [n.y for n in sub_vm.nodes.values()]
+                sub_x2s = [n.x + n.width for n in sub_vm.nodes.values()]
+                sub_y2s = [n.y + n.height for n in sub_vm.nodes.values()]
+                sub_min_x = min(sub_xs) if sub_xs else 0.0
+                sub_min_y = min(sub_ys) if sub_ys else 0.0
+                sub_max_x = max(sub_x2s) if sub_x2s else 300.0
+                sub_max_y = max(sub_y2s) if sub_y2s else 180.0
+
+            sub_cx = (sub_min_x + sub_max_x) / 2.0
+            sub_cy = (sub_min_y + sub_max_y) / 2.0
+            sub_w = sub_max_x - sub_min_x
+
+            place_on_right = True
+            if target_pid is not None and target_pid in self.vm.containers:
+                t_cont = self.vm.containers[target_pid]
+                t_nodes = [
+                    n for n in self.vm.nodes.values()
+                    if n.pipeline_id == target_pid and n.parent_node_id is None
+                ]
+                n_nodes = [
+                    n for n in sub_vm.nodes.values()
+                    if n.pipeline_id == new_pid and n.parent_node_id is None
+                ]
+                t_has_host = any(n.class_name == "host-copier" for n in t_nodes)
+                t_has_dai = any(n.class_name in ("dai-copier", "alh-copier") for n in t_nodes)
+                n_has_host = any(n.class_name == "host-copier" for n in n_nodes)
+                n_has_dai = any(n.class_name in ("dai-copier", "alh-copier") for n in n_nodes)
+
+                if t_has_host and n_has_dai:
+                    place_on_right = True
+                elif n_has_host and t_has_dai:
+                    place_on_right = False
+                elif wx is not None:
+                    place_on_right = wx >= (t_cont.x + t_cont.width / 2.0)
+
+                if place_on_right:
+                    wx = t_cont.x + t_cont.width + CONTAINER_GAP_X + sub_w / 2.0
+                else:
+                    wx = t_cont.x - CONTAINER_GAP_X - sub_w / 2.0
+                wy = t_cont.y + t_cont.height / 2.0
+            elif wx is None or wy is None:
+                if self.vm.nodes or self.vm.containers:
+                    g_min_x, g_min_y, g_w, g_h = self._get_graph_bounds()
+                    wx = g_min_x + g_w / 2.0
+                    wy = g_min_y + g_h + 64.0 + (sub_max_y - sub_min_y) / 2.0
+                else:
+                    wx, wy = self.screen_to_world(
+                        float(self.get_width() or 600) / 2.0,
+                        float(self.get_height() or 400) / 2.0,
+                    )
+
+            dx = wx - sub_cx
+            dy = wy - sub_cy
+
+            existing_enabled_sides = {
+                str(n.config.get_scalar("side", "left")).lower()
+                for n in self.vm.nodes.values()
+                if n.class_category == "TestbenchIO"
+                and str(n.config.get_scalar("enabled", "false")).lower() in ("true", "1", "yes")
+            }
+
+            for cid, cont in sub_vm.containers.items():
+                cont.x += dx
+                cont.y += dy
+                cont.enabled_by = "Added from Object View"
+                cont.config.set_scalar("index", str(new_pid), origin="instance", is_constructor=True)
+                self.vm.containers[cid] = cont
+
+            for nid, node in sub_vm.nodes.items():
+                node.x += dx
+                node.y += dy
+                if node.class_category == "TestbenchIO":
+                    side = str(node.config.get_scalar("side", "left")).lower()
+                    if side in existing_enabled_sides:
+                        node.config.set_scalar("enabled", "false", origin="instance")
+                self.vm.nodes[nid] = node
+
+            for edge in sub_vm.edges:
+                edge.id = f"pipe_{new_pid}_{edge.id}"
+                self.vm.edges.append(edge)
+
+            if target_pid is not None and target_pid in self.vm.containers:
+                self._join_pipelines(target_pid, new_pid, place_on_right=place_on_right)
+                self.workspace.attach_host_copier_io_nodes(self.vm)
+                _position_testbench_io_nodes(self.vm)
+                _assign_edge_ports(self.vm)
+
+            self.vm.dirty = True
+            self.selected_node_id = None
+            self.selected_node_ids.clear()
+            self.selected_edge_id = None
+            self.selected_container_id = new_pid
+            self.selected_container_ids = {new_pid}
+            if new_pid in self.vm.containers and self.on_selection_changed:
+                cont = self.vm.containers[new_pid]
+                self.on_selection_changed(
+                    f"Pipeline {new_pid}: {cont.class_name}",
+                    cont.config,
+                    f"Direction: {cont.direction}",
+                )
+            if self.on_graph_modified:
+                self.on_graph_modified()
+            self.queue_draw()
+            return new_pid
+        finally:
+            self._suppress_auto_history = False
 
     # -------------------------------------------------------------------------
     # Testbench IO Node Radio Selection & File / ALSA PCM Pickers
@@ -2275,6 +2451,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         if not self.vm or active_nid not in self.vm.nodes:
             return
         active_node = self.vm.nodes[active_nid]
+        self.record_undo_snapshot(f"Enable {active_node.title}")
         active_side = str(active_node.config.get_scalar("side", "left")).lower()
         active_pids = self._parse_pipe_ids(str(active_node.config.get_scalar("target_pipelines", "")))
 
@@ -2347,6 +2524,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             try:
                 gfile = dlg.save_finish(res) if is_sink else dlg.open_finish(res)
                 if gfile and gfile.get_path():
+                    self.record_undo_snapshot(f"Set {node.title} file")
                     node.config.set_scalar("file_path", gfile.get_path(), origin="instance")
                     node.config.set_scalar("io_type", "file", origin="instance")
                     if self.vm:
@@ -2415,6 +2593,7 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         def _apply(_w: Gtk.Widget) -> None:
             val = entry.get_text().strip() or "default"
+            self.record_undo_snapshot(f"Set {node.title} ALSA PCM")
             node.config.set_scalar("alsa_pcm", val, origin="instance")
             node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
             if self.vm:

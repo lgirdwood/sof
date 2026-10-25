@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -158,6 +158,16 @@ class GraphPort:
     rel_x: float = 0.0
     rel_y: float = 0.0
 
+    def clone(self) -> "GraphPort":
+        return GraphPort(
+            id=self.id,
+            name=self.name,
+            direction=self.direction,
+            port_type=self.port_type,
+            rel_x=self.rel_x,
+            rel_y=self.rel_y,
+        )
+
 
 @dataclass
 class GraphNode:
@@ -185,6 +195,32 @@ class GraphNode:
     class_def: Optional[TplgClassDef] = None
     source_file: str = ""
 
+    def clone(self) -> "GraphNode":
+        return GraphNode(
+            id=self.id,
+            title=self.title,
+            subtitle=self.subtitle,
+            category=self.category,
+            class_category=self.class_category,
+            class_name=self.class_name,
+            instance_id=self.instance_id,
+            pipeline_id=self.pipeline_id,
+            pipeline_class=self.pipeline_class,
+            parent_node_id=self.parent_node_id,
+            x=self.x,
+            y=self.y,
+            width=self.width,
+            height=self.height,
+            in_ports=[p.clone() for p in self.in_ports],
+            out_ports=[p.clone() for p in self.out_ports],
+            in_fmt_badge=self.in_fmt_badge,
+            out_fmt_badge=self.out_fmt_badge,
+            badges=list(self.badges),
+            config=self.config.clone(),
+            class_def=self.class_def,
+            source_file=self.source_file,
+        )
+
 
 @dataclass
 class GraphEdge:
@@ -198,6 +234,19 @@ class GraphEdge:
     pipeline_id: Optional[int] = None
     is_inter_pipeline: bool = False
     config: ConfigNode = field(default_factory=lambda: ConfigNode("route", node_type="object"))
+
+    def clone(self) -> "GraphEdge":
+        return GraphEdge(
+            id=self.id,
+            source_node=self.source_node,
+            sink_node=self.sink_node,
+            source_port=self.source_port,
+            sink_port=self.sink_port,
+            control=self.control,
+            pipeline_id=self.pipeline_id,
+            is_inter_pipeline=self.is_inter_pipeline,
+            config=self.config.clone(),
+        )
 
 
 @dataclass
@@ -213,6 +262,20 @@ class PipelineContainer:
     enabled_by: str = ""
     warning_text: str = ""
     config: ConfigNode = field(default_factory=lambda: ConfigNode("pipeline", node_type="object"))
+
+    def clone(self) -> "PipelineContainer":
+        return PipelineContainer(
+            pipeline_id=self.pipeline_id,
+            class_name=self.class_name,
+            direction=self.direction,
+            x=self.x,
+            y=self.y,
+            width=self.width,
+            height=self.height,
+            enabled_by=self.enabled_by,
+            warning_text=self.warning_text,
+            config=self.config.clone(),
+        )
 
 
 @dataclass
@@ -249,3 +312,96 @@ class GraphViewModel:
     root_config: ConfigNode = field(default_factory=lambda: ConfigNode("root", node_type="object"))
     dirty: bool = False
     target_variant: Optional[CMakeTargetVariant] = None
+
+    def clone(self) -> "GraphViewModel":
+        return GraphViewModel(
+            title=self.title,
+            subtitle=self.subtitle,
+            view_kind=self.view_kind,
+            source_file=self.source_file,
+            defines=dict(self.defines),
+            nodes={nid: n.clone() for nid, n in self.nodes.items()},
+            edges=[e.clone() for e in self.edges],
+            containers={pid: c.clone() for pid, c in self.containers.items()},
+            root_config=self.root_config.clone(),
+            dirty=self.dirty,
+            target_variant=self.target_variant,
+        )
+
+
+@dataclass
+class GraphHistoryEntry:
+    """Snapshot of a GraphViewModel and selection state for Undo/Redo."""
+    description: str
+    vm_snapshot: GraphViewModel
+    selected_node_id: Optional[str] = None
+    selected_node_ids: Set[str] = field(default_factory=set)
+    selected_edge_id: Optional[str] = None
+    selected_container_id: Optional[int] = None
+    selected_container_ids: Set[int] = field(default_factory=set)
+
+
+class UndoRedoManager:
+    """Bounded Undo/Redo stack managing GraphHistoryEntry snapshots."""
+
+    def __init__(
+        self,
+        max_depth: int = 100,
+        on_history_changed: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.max_depth = max_depth
+        self.on_history_changed = on_history_changed
+        self.undo_stack: List[GraphHistoryEntry] = []
+        self.redo_stack: List[GraphHistoryEntry] = []
+
+    def clear(self) -> None:
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        if self.on_history_changed:
+            self.on_history_changed()
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self.undo_stack)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self.redo_stack)
+
+    @property
+    def undo_description(self) -> Optional[str]:
+        return self.undo_stack[-1].description if self.undo_stack else None
+
+    @property
+    def redo_description(self) -> Optional[str]:
+        return self.redo_stack[-1].description if self.redo_stack else None
+
+    def push_undo_entry(self, entry: GraphHistoryEntry) -> None:
+        self.undo_stack.append(entry)
+        if len(self.undo_stack) > self.max_depth:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        if self.on_history_changed:
+            self.on_history_changed()
+
+    def undo(self, current_entry: GraphHistoryEntry) -> Optional[Tuple[GraphHistoryEntry, str]]:
+        if not self.undo_stack:
+            return None
+        prev_entry = self.undo_stack.pop()
+        action_desc = prev_entry.description
+        current_entry.description = action_desc
+        self.redo_stack.append(current_entry)
+        if self.on_history_changed:
+            self.on_history_changed()
+        return (prev_entry, action_desc)
+
+    def redo(self, current_entry: GraphHistoryEntry) -> Optional[Tuple[GraphHistoryEntry, str]]:
+        if not self.redo_stack:
+            return None
+        next_entry = self.redo_stack.pop()
+        action_desc = next_entry.description
+        current_entry.description = action_desc
+        self.undo_stack.append(current_entry)
+        if self.on_history_changed:
+            self.on_history_changed()
+        return (next_entry, action_desc)
