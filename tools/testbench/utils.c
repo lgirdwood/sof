@@ -184,7 +184,8 @@ bool tb_schedule_pipeline_check_state(struct testbench_prm *tp)
 	tb_gettime(&td0);
 	tb_getcycles(&cycles0);
 
-	schedule_ll_run_tasks();
+	if (!sof_get() || !sof_get()->ipc || !list_is_empty(&sof_get()->ipc->comp_list))
+		schedule_ll_run_tasks();
 
 	tb_getcycles(&cycles1);
 	tb_gettime(&td1);

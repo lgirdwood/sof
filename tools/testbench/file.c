@@ -974,7 +974,7 @@ static int file_prepare(struct processing_module *mod,
 
 static int file_reset(struct processing_module *mod)
 {
-	struct file_comp_data *cd = module_get_private_data(mod);
+	struct file_comp_data *cd = get_file_comp_data(module_get_private_data(mod));
 
 	tb_debug_print("file_reset()\n");
 	cd->copies_timeout_count = 0;

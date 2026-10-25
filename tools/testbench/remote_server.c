@@ -32,6 +32,7 @@
 #include <sof/lib/cpu.h>
 #include <sof/list.h>
 #include <platform/lib/ll_schedule.h>
+#include <platform/lib/telemetry_sched.h>
 #include <ipc4/header.h>
 #include <ipc4/module.h>
 #include <ipc4/pipeline.h>
@@ -316,7 +317,13 @@ static struct tplg_comp_info *find_comp_info_by_ipc_id(struct testbench_prm *tp,
 			struct tplg_comp_info *ci = container_of(item, struct tplg_comp_info, item);
 			uint32_t cid = (uint32_t)IPC4_COMP_ID(ci->module_id, ci->instance_id);
 
-			if (cid == ipc_id || (uint32_t)ci->id == ipc_id)
+			if (cid == ipc_id)
+				return ci;
+		}
+		list_for_item(item, &tp->widget_list) {
+			struct tplg_comp_info *ci = container_of(item, struct tplg_comp_info, item);
+
+			if ((uint32_t)ci->id == ipc_id)
 				return ci;
 		}
 	}
@@ -328,7 +335,11 @@ static struct tplg_comp_info *find_comp_info_by_ipc_id(struct testbench_prm *tp,
 		uint32_t cid = (uint32_t)IPC4_COMP_ID(tp->info[i].module_id,
 						      tp->info[i].instance_id);
 
-		if (cid == ipc_id || (uint32_t)tp->info[i].id == ipc_id)
+		if (cid == ipc_id)
+			return &tp->info[i];
+	}
+	for (i = 0; i < tp->info_elems; i++) {
+		if ((uint32_t)tp->info[i].id == ipc_id)
 			return &tp->info[i];
 	}
 	return NULL;
@@ -673,22 +684,33 @@ static uint32_t build_ext_perf_tlv(struct testbench_prm *tp, uint8_t *out, uint3
 	memset(g_win3_perf, 0, sizeof(g_win3_perf));
 
 	/* 1. Per-core summary items (module_id == 0, instance_id == core_id) */
+	struct host_sched_telemetry *st = host_telem_get();
+
 	for (c = 0; c < CONFIG_CORE_COUNT && count < max_items; c++) {
-		if (!(enabled_mask & BIT(c)))
+		if (!(enabled_mask & BIT(c)) && !(st && st->cores[c].active))
 			continue;
 		struct perf_data_item_comp_wire *it = &items[count++];
 
 		it->resource_id = IPC4_COMP_ID(0, c);
 		it->power_mode = 0;
 		it->is_removed = 0;
-		it->avg_kcps = g_core_ticks[c].avg_utilization;
-		it->peak_kcps = g_core_ticks[c].peak_utilization;
-		it->total_iteration_count = g_core_ticks[c].count;
-		it->total_cycles_consumed = (uint64_t)g_core_ticks[c].count *
-					    g_core_ticks[c].last_time_elapsed;
+		if (st && st->cores[c].active) {
+			it->avg_kcps = st->cores[c].ll_avg_kcps + st->cores[c].dp_avg_kcps;
+			it->peak_kcps = st->cores[c].ll_peak_kcps + st->cores[c].dp_peak_kcps;
+			it->total_iteration_count = st->cores[c].ll_tick_count +
+						    st->cores[c].dp_run_count;
+			it->total_cycles_consumed = st->cores[c].ll_total_cycles +
+						    st->cores[c].dp_total_cycles;
+		} else {
+			it->avg_kcps = g_core_ticks[c].avg_utilization;
+			it->peak_kcps = g_core_ticks[c].peak_utilization;
+			it->total_iteration_count = g_core_ticks[c].count;
+			it->total_cycles_consumed = (uint64_t)g_core_ticks[c].count *
+						    g_core_ticks[c].last_time_elapsed;
+		}
 	}
 
-	/* 2. Per-component items from active SOF components */
+	/* 2. Per-component items from active SOF components & real telemetry */
 	if (ipc) {
 		list_for_item(clist, &ipc->comp_list) {
 			struct ipc_comp_dev *icd = container_of(clist, struct ipc_comp_dev, list);
@@ -699,17 +721,37 @@ static uint32_t build_ext_perf_tlv(struct testbench_prm *tp, uint8_t *out, uint3
 				break;
 
 			struct perf_data_item_comp_wire *it = &items[count++];
-			uint32_t core = icd->core < CONFIG_CORE_COUNT ? icd->core : 0;
-			uint32_t iters = g_core_ticks[core].count;
+			struct host_mod_telem *mt = NULL;
+			uint32_t i;
+
+			if (st) {
+				for (i = 0; i < st->num_mods; i++) {
+					if (st->mods[i].active &&
+					    st->mods[i].comp_id == icd->id) {
+						mt = &st->mods[i];
+						break;
+					}
+				}
+			}
 
 			it->resource_id = icd->id;
 			it->power_mode = (icd->cd->ipc_config.proc_domain ==
 					  COMP_PROCESSING_DOMAIN_DP) ? 1 : 0;
 			it->is_removed = 0;
-			it->avg_kcps = 1200 + (icd->id & 0xff) * 50;
-			it->peak_kcps = it->avg_kcps + 400;
-			it->total_iteration_count = iters;
-			it->total_cycles_consumed = (uint64_t)iters * it->avg_kcps;
+			if (mt && mt->iterations > 0) {
+				it->avg_kcps = mt->avg_kcps;
+				it->peak_kcps = mt->peak_kcps;
+				it->total_iteration_count = mt->iterations;
+				it->total_cycles_consumed = mt->total_cycles;
+			} else {
+				uint32_t core = icd->core < CONFIG_CORE_COUNT ? icd->core : 0;
+				uint32_t iters = g_core_ticks[core].count;
+
+				it->avg_kcps = 100;
+				it->peak_kcps = 200;
+				it->total_iteration_count = iters;
+				it->total_cycles_consumed = (uint64_t)iters * it->avg_kcps;
+			}
 
 			if ((win3_count + 1) * sizeof(*win3_items) <= sizeof(g_win3_perf))
 				win3_items[win3_count++] = *it;
@@ -758,7 +800,9 @@ void tb_remote_tick_begin(struct testbench_prm *tp)
 	pthread_mutex_lock(&g_tb_lock);
 	g_tp = tp;
 
-	while (g_dsp_paused && g_step_ticks_remaining <= 0 && !g_quit_requested && g_srv_running)
+	while ((g_dsp_paused || (!tp->tplg_file && sof_get() && sof_get()->ipc &&
+				 list_is_empty(&sof_get()->ipc->comp_list))) &&
+	       g_step_ticks_remaining <= 0 && !g_quit_requested && g_srv_running)
 		pthread_cond_wait(&g_tb_cond, &g_tb_lock);
 
 	if (g_step_ticks_remaining > 0)
@@ -772,7 +816,7 @@ void tb_remote_tick_end(struct testbench_prm *tp, uint64_t delta_cycles, uint64_
 	uint32_t kcps;
 	int c;
 
-	if (!g_srv_running || g_in_remote_rpc)
+	if (!g_srv_running)
 		return;
 
 	g_total_ticks++;
@@ -794,25 +838,54 @@ void tb_remote_tick_end(struct testbench_prm *tp, uint64_t delta_cycles, uint64_
 	kcps = sim_cycles; /* 1 ms tick -> cycles per tick == kcps */
 
 	for (c = 0; c < CONFIG_CORE_COUNT; c++) {
-		if (!(enabled_mask & BIT(c)))
-			continue;
+		struct host_sched_telemetry *st = host_telem_get();
+
 		if (g_perf_meas_state == 2 /* STARTED */) {
-			g_core_ticks[c].count++;
-			g_core_ticks[c].last_time_elapsed = sim_cycles;
-			if (sim_cycles > g_core_ticks[c].max_time_elapsed)
-				g_core_ticks[c].max_time_elapsed = sim_cycles;
-			g_core_ticks[c].last_ccount += sim_cycles;
-			g_core_ticks[c].avg_utilization =
-				g_core_ticks[c].avg_utilization ?
-				((g_core_ticks[c].avg_utilization * 7 + kcps) / 8) : kcps;
-			if (kcps > g_core_ticks[c].peak_utilization)
-				g_core_ticks[c].peak_utilization = kcps;
-			g_core_ticks[c].peak_utilization_4k = g_core_ticks[c].peak_utilization;
-			g_core_ticks[c].peak_utilization_8k = g_core_ticks[c].peak_utilization;
+			if (st && (st->num_pipes > 0 || st->num_mods > 0)) {
+				if (st->cores[c].active) {
+					struct host_core_telem *ct = &st->cores[c];
+					uint32_t last_cyc = (uint32_t)(ct->ll_last_cycles +
+								       ct->dp_last_cycles);
+					uint32_t peak_cyc = (uint32_t)(ct->ll_peak_cycles +
+								       ct->dp_peak_cycles);
+					uint32_t avg_k = ct->ll_avg_kcps + ct->dp_avg_kcps;
+					uint32_t peak_k = ct->ll_peak_kcps + ct->dp_peak_kcps;
+
+					g_core_ticks[c].count = ct->ll_tick_count +
+								ct->dp_run_count;
+					g_core_ticks[c].last_time_elapsed = last_cyc;
+					g_core_ticks[c].max_time_elapsed = peak_cyc;
+					g_core_ticks[c].last_ccount =
+						(uint32_t)(ct->ll_total_cycles +
+							   ct->dp_total_cycles);
+					g_core_ticks[c].avg_utilization = avg_k;
+					g_core_ticks[c].peak_utilization = peak_k;
+					g_core_ticks[c].peak_utilization_4k = peak_k;
+					g_core_ticks[c].peak_utilization_8k = peak_k;
+				}
+			} else if (enabled_mask & BIT(c)) {
+				g_core_ticks[c].count++;
+				g_core_ticks[c].last_time_elapsed = sim_cycles;
+				if (sim_cycles > g_core_ticks[c].max_time_elapsed)
+					g_core_ticks[c].max_time_elapsed = sim_cycles;
+				g_core_ticks[c].last_ccount += sim_cycles;
+				g_core_ticks[c].avg_utilization =
+					g_core_ticks[c].avg_utilization ?
+					((g_core_ticks[c].avg_utilization * 7 + kcps) / 8) : kcps;
+				if (kcps > g_core_ticks[c].peak_utilization)
+					g_core_ticks[c].peak_utilization = kcps;
+				g_core_ticks[c].peak_utilization_4k =
+					g_core_ticks[c].peak_utilization;
+				g_core_ticks[c].peak_utilization_8k =
+					g_core_ticks[c].peak_utilization;
+			}
 		}
 	}
 
 	refresh_emulated_windows(tp);
+	if (g_in_remote_rpc)
+		return;
+
 	pthread_mutex_unlock(&g_tb_lock);
 
 	/* When running in interactive server mode (-W or -S), pace slightly so network clients
@@ -866,6 +939,666 @@ bool tb_remote_should_continue(struct testbench_prm *tp, bool file_eof)
  * -------------------------------------------------------------------------
  */
 
+static void remote_set_csv_files(char **arr, int *num_out, int max_num, const char *csv)
+{
+	char *copy, *save = NULL, *tok;
+	int i;
+
+	for (i = 0; i < *num_out && i < max_num; i++) {
+		free(arr[i]);
+		arr[i] = NULL;
+	}
+	*num_out = 0;
+	if (!csv || !*csv)
+		return;
+
+	copy = strdup(csv);
+	if (!copy)
+		return;
+	tok = strtok_r(copy, ",", &save);
+	while (tok && *num_out < max_num) {
+		arr[(*num_out)++] = strdup(tok);
+		tok = strtok_r(NULL, ",", &save);
+	}
+	free(copy);
+}
+
+static void remote_set_csv_pipelines(struct testbench_prm *tp, const char *csv)
+{
+	char *copy, *save = NULL, *tok;
+	int idx = 0;
+
+	if (!tp || !csv || !*csv)
+		return;
+
+	copy = strdup(csv);
+	if (!copy)
+		return;
+	tok = strtok_r(copy, ",", &save);
+	while (tok && idx < TB_MAX_PIPELINES_NUM) {
+		tp->pipelines[idx++] = atoi(tok);
+		tok = strtok_r(NULL, ",", &save);
+	}
+	if (idx > 0)
+		tp->pipeline_num = idx;
+	free(copy);
+}
+
+static void remote_unload_active_topology(struct testbench_prm *tp)
+{
+	if (!tp)
+		return;
+
+	if (tp->tplg_file ||
+	    (sof_get() && sof_get()->ipc && !list_is_empty(&sof_get()->ipc->comp_list))) {
+		tb_set_reset_state(tp);
+		tb_free_all_pipelines(tp);
+		tb_free_topology(tp);
+	}
+	if (tp->tplg_file) {
+		free(tp->tplg_file);
+		tp->tplg_file = NULL;
+	}
+	if (tp->control_fh) {
+		fclose(tp->control_fh);
+		tp->control_fh = NULL;
+	}
+	if (tp->control_file) {
+		free(tp->control_file);
+		tp->control_file = NULL;
+	}
+	memset(g_kctl_shadow, 0, sizeof(g_kctl_shadow));
+}
+
+static int tokenize_shell_args(char *buf, char **argv, int max_args)
+{
+	int argc = 0;
+	char *p = buf;
+
+	while (*p && argc < max_args) {
+		while (*p == ' ' || *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		if (*p == '"' || *p == '\'') {
+			char q = *p++;
+
+			argv[argc++] = p;
+			while (*p && *p != q)
+				p++;
+			if (*p == q)
+				*p++ = '\0';
+		} else {
+			argv[argc++] = p;
+			while (*p && *p != ' ' && *p != '\t')
+				p++;
+			if (*p)
+				*p++ = '\0';
+		}
+	}
+	return argc;
+}
+
+static void remote_apply_freq_arg(const char *arg)
+{
+	char *copy, *saveptr = NULL, *tok;
+
+	if (!arg)
+		return;
+	copy = strdup(arg);
+	if (!copy)
+		return;
+	tok = strtok_r(copy, ",", &saveptr);
+	while (tok) {
+		char *colon = strchr(tok, ':');
+
+		if (colon) {
+			int core = atoi(tok);
+			uint32_t val = (uint32_t)strtoul(colon + 1, NULL, 10);
+			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+
+			host_workload_sim_set_core_freq(core, hz);
+		} else {
+			uint32_t val = (uint32_t)strtoul(tok, NULL, 10);
+			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+
+			host_workload_sim_set_core_freq(-1, hz);
+		}
+		tok = strtok_r(NULL, ",", &saveptr);
+	}
+	free(copy);
+}
+
+static void remote_apply_mem_arg(const char *arg)
+{
+	uint32_t domain = HOST_MEM_DOMAIN_SRAM;
+	uint32_t factor_x100 = 0;
+	uint32_t cyc_per_word = 0;
+	const char *colon;
+
+	if (!arg)
+		return;
+	if (strncasecmp(arg, "dram", 4) == 0 || strcmp(arg, "1") == 0)
+		domain = HOST_MEM_DOMAIN_DRAM;
+
+	colon = strchr(arg, ':');
+	if (colon) {
+		factor_x100 = (uint32_t)strtoul(colon + 1, NULL, 10);
+		colon = strchr(colon + 1, ':');
+		if (colon)
+			cyc_per_word = (uint32_t)strtoul(colon + 1, NULL, 10);
+	}
+	host_workload_sim_set_mem_domain(domain, factor_x100, cyc_per_word);
+}
+
+static size_t format_remote_test_summary(struct testbench_prm *tp, long long delta_t,
+					 struct tb_heap_usage_record *heap_records,
+					 int heap_records_count, char *out_buf,
+					 size_t off, size_t out_cap)
+{
+	long long file_cycles = 0;
+	int n_in = 0, n_out = 0, frames_out;
+	int i;
+	uint32_t u;
+	struct host_sched_telemetry *st = host_telem_get();
+
+	for (i = 0; i < tp->input_file_num; i++) {
+		if (tp->fr[i].id < 0 || !tp->fr[i].state)
+			continue;
+		n_in += tp->fr[i].state->n;
+		file_cycles += tp->fr[i].state->cycles_count;
+	}
+	for (i = 0; i < tp->output_file_num; i++) {
+		if (tp->fw[i].id < 0 || !tp->fw[i].state)
+			continue;
+		n_out += tp->fw[i].state->n;
+		file_cycles += tp->fw[i].state->cycles_count;
+	}
+
+	off += snprintf(out_buf + off, out_cap - off,
+			"==========================================================\n"
+			"		           Test Summary 1\n"
+			"==========================================================\n");
+
+	for (i = 0; i < tp->pipeline_num && off + 256 < out_cap; i++) {
+		int pid = tp->pipelines[i];
+		int j;
+
+		off += snprintf(out_buf + off, out_cap - off, "pipeline %d\n", pid);
+		for (j = 0; j < tp->input_file_num && off + 160 < out_cap; j++) {
+			if (tp->fr[j].pipeline_id == pid && tp->fr[j].state) {
+				off += snprintf(out_buf + off, out_cap - off,
+						"file read %d:pipeline %d: used file %s: %d samples %d copies\n",
+						tp->fr[j].id, pid, tp->fr[j].state->fn,
+						tp->fr[j].state->n, tp->fr[j].state->copy_count);
+			}
+		}
+		for (j = 0; j < tp->output_file_num && off + 160 < out_cap; j++) {
+			if (tp->fw[j].pipeline_id == pid && tp->fw[j].state) {
+				off += snprintf(out_buf + off, out_cap - off,
+						"file write %d:pipeline %d: used file %s: %d samples %d copies\n",
+						tp->fw[j].id, pid, tp->fw[j].state->fn,
+						tp->fw[j].state->n, tp->fw[j].state->copy_count);
+			}
+		}
+	}
+
+	frames_out = tp->channels_out > 0 ? (n_out / tp->channels_out) : 0;
+	off += snprintf(out_buf + off, out_cap - off,
+			"Input bit format: %s\n"
+			"Input sample rate: %d\n"
+			"Output sample rate: %d\n"
+			"Input sample (frame) count: %d (%d)\n"
+			"Output sample (frame) count: %d (%d)\n",
+			tp->bits_in ? tp->bits_in : "S32_LE",
+			tp->fs_in, tp->fs_out,
+			n_in, tp->channels_in > 0 ? (n_in / tp->channels_in) : 0,
+			n_out, frames_out);
+
+	for (i = 0; i < heap_records_count && off + 128 < out_cap; i++) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"Heap usage for module %s: %u bytes\n",
+				heap_records[i].module_name,
+				(uint32_t)heap_records[i].heap_max);
+	}
+
+	if (delta_t <= 0)
+		delta_t = 1;
+	off += snprintf(out_buf + off, out_cap - off,
+			"\nTotal execution time: %lld us, %.2f x realtime\n\n",
+			delta_t,
+			tp->fs_out > 0 ? ((float)frames_out / tp->fs_out * 1000000.0f / delta_t) : 0.0f);
+
+	if (st && (st->num_pipes > 0 || st->num_mods > 0) && off + 512 < out_cap) {
+		const char *mode_str =
+			(st->sim_cfg.mode == HOST_WORKLOAD_SIM_REALTIME) ? "REALTIME-PACED" :
+			(st->sim_cfg.mode == HOST_WORKLOAD_SIM_VIRTUAL)  ? "VIRTUAL-SIM" :
+									   "HOST-MEASURED";
+		const char *mem_str =
+			(st->sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) ? "DRAM" : "SRAM";
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"--- Per-Core LL & DP Scheduler Telemetry [Mode=%s Mem=%s DRAM_Factor=%u.%02ux] ---\n",
+				mode_str, mem_str,
+				st->sim_cfg.dram_factor_x100 / 100,
+				st->sim_cfg.dram_factor_x100 % 100);
+		for (u = 0; u < TB_TELEM_MAX_CORES && off + 256 < out_cap; u++) {
+			struct host_core_telem *ct = &st->cores[u];
+
+			if (!ct->active)
+				continue;
+			off += snprintf(out_buf + off, out_cap - off,
+					"  Core %u (%u MHz): util=%u.%02u%% overruns=%u | LL: ticks=%u tasks=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus | DP: runs=%u thr=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus\n",
+					u, ct->freq_hz / 1000000U,
+					ct->total_util_x100 / 100, ct->total_util_x100 % 100,
+					ct->ll_deadline_violations,
+					ct->ll_tick_count, ct->ll_active_tasks,
+					(unsigned long long)ct->ll_avg_cycles,
+					(unsigned long long)ct->ll_peak_cycles,
+					(unsigned long long)ct->ll_total_cycles,
+					ct->ll_avg_kcps, ct->ll_peak_kcps,
+					(unsigned long long)(ct->ll_avg_exec_ns / 1000ULL),
+					(unsigned long long)(ct->ll_avg_exec_ns % 1000ULL),
+					(unsigned long long)(ct->ll_peak_exec_ns / 1000ULL),
+					(unsigned long long)(ct->ll_peak_exec_ns % 1000ULL),
+					ct->dp_run_count, ct->dp_active_threads,
+					(unsigned long long)ct->dp_avg_cycles,
+					(unsigned long long)ct->dp_peak_cycles,
+					(unsigned long long)ct->dp_total_cycles,
+					ct->dp_avg_kcps, ct->dp_peak_kcps,
+					(unsigned long long)(ct->dp_avg_exec_ns / 1000ULL),
+					(unsigned long long)(ct->dp_avg_exec_ns % 1000ULL),
+					(unsigned long long)(ct->dp_peak_exec_ns / 1000ULL),
+					(unsigned long long)(ct->dp_peak_exec_ns % 1000ULL));
+		}
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"\n--- Per-Pipeline Scheduling Telemetry (%u active) ---\n",
+				st->num_pipes);
+		for (u = 0; u < st->num_pipes && off + 224 < out_cap; u++) {
+			struct host_pipe_telem *pt = &st->pipes[u];
+
+			if (!pt->active)
+				continue;
+			off += snprintf(out_buf + off, out_cap - off,
+					"  Pipe %2u: core=%u prio=%u per=%uus mem=%s mods=%uLL/%uDP copies=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus xruns=%u\n",
+					pt->pipeline_id, pt->core_id, pt->priority, pt->period_us,
+					pt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+					pt->num_ll_modules, pt->num_dp_modules,
+					(unsigned long long)pt->copy_iterations,
+					(unsigned long long)pt->avg_cycles,
+					(unsigned long long)pt->peak_cycles,
+					(unsigned long long)pt->total_cycles,
+					pt->avg_kcps, pt->peak_kcps,
+					(unsigned long long)(pt->avg_exec_ns / 1000ULL),
+					(unsigned long long)(pt->avg_exec_ns % 1000ULL),
+					(unsigned long long)(pt->peak_exec_ns / 1000ULL),
+					(unsigned long long)(pt->peak_exec_ns % 1000ULL),
+					pt->xrun_count);
+		}
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"\n--- Per-Module LL & DP Scheduling + Entry/Exit Buffer Telemetry (%u active) ---\n",
+				st->num_mods);
+		for (u = 0; u < st->num_mods && off + 256 < out_cap; u++) {
+			struct host_mod_telem *mt = &st->mods[u];
+			struct tplg_comp_info *ci;
+			const char *wname;
+
+			if (!mt->active)
+				continue;
+			ci = find_comp_info_by_ipc_id(tp, mt->comp_id);
+			wname = (ci && ci->name) ? ci->name : "comp";
+
+			off += snprintf(out_buf + off, out_cap - off,
+					"  [0x%06x %-24s] pipe=%u core=%u %s mem=%s iters=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus ibs=%u obs=%u cpc=%u(viol=%u)\n",
+					mt->comp_id, wname, mt->pipeline_id, mt->core_id,
+					mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
+					mt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+					(unsigned long long)mt->iterations,
+					(unsigned long long)mt->avg_cycles,
+					(unsigned long long)mt->peak_cycles,
+					(unsigned long long)mt->total_cycles,
+					mt->avg_kcps, mt->peak_kcps,
+					(unsigned long long)(mt->avg_exec_ns / 1000ULL),
+					(unsigned long long)(mt->avg_exec_ns % 1000ULL),
+					(unsigned long long)(mt->peak_exec_ns / 1000ULL),
+					(unsigned long long)(mt->peak_exec_ns % 1000ULL),
+					mt->ibs, mt->obs, mt->effective_cpc, mt->cpc_violations);
+		}
+	}
+	return off;
+}
+
+static size_t handle_remote_io_cfg(struct testbench_prm *tp, const char *args_str,
+				   char *out_buf, size_t off, size_t out_cap)
+{
+	char *copy = strdup(args_str ? args_str : "");
+	char *argv[64];
+	int argc, i;
+
+	if (!copy || !tp) {
+		free(copy);
+		return off + snprintf(out_buf + off, out_cap - off, "error: out of memory\n");
+	}
+
+	argc = tokenize_shell_args(copy, argv, 64);
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+			remote_set_csv_files(tp->input_file, &tp->input_file_num,
+					     TB_MAX_INPUT_FILE_NUM, argv[++i]);
+		} else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+			remote_set_csv_files(tp->output_file, &tp->output_file_num,
+					     TB_MAX_OUTPUT_FILE_NUM, argv[++i]);
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			remote_set_csv_pipelines(tp, argv[++i]);
+		} else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+			tp->fs_in = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-R") == 0 && i + 1 < argc) {
+			tp->fs_out = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+			tp->channels_in = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+			tp->channels_out = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+			free(tp->bits_in);
+			tp->bits_in = strdup(argv[++i]);
+			tp->frame_fmt = tplg_find_format(tp->bits_in);
+		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+			free(tp->control_file);
+			tp->control_file = strdup(argv[++i]);
+		} else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc) {
+			tp->copy_iterations = atoi(argv[++i]);
+			tp->copy_check = true;
+		}
+	}
+	free(copy);
+
+	if (!tp->fs_in)
+		tp->fs_in = 48000;
+	if (!tp->fs_out)
+		tp->fs_out = tp->fs_in;
+	if (!tp->channels_in)
+		tp->channels_in = 2;
+	if (!tp->channels_out)
+		tp->channels_out = tp->channels_in;
+	tb_configure_audio_params(tp);
+
+	off += snprintf(out_buf + off, out_cap - off,
+			"io-cfg: in=%d out=%d pipes=%d rate=%d->%d ch=%d->%d fmt=%s\n",
+			tp->input_file_num, tp->output_file_num, tp->pipeline_num,
+			tp->fs_in, tp->fs_out, tp->channels_in, tp->channels_out,
+			tp->bits_in ? tp->bits_in : "S32_LE");
+	return off;
+}
+
+static size_t handle_remote_run_test(struct testbench_prm *tp, const char *args_str,
+				     char *out_buf, size_t off, size_t out_cap)
+{
+	struct tb_heap_usage_record heap_records[TB_NUM_WIDGETS_SUPPORTED];
+	struct host_sched_telemetry *st = host_telem_get();
+	struct host_workload_sim_cfg saved_sim_cfg;
+	struct file_state *out_stat;
+	struct timespec td0 = {0}, td1 = {0};
+	long long delta_t = 0;
+	int64_t next_control_ns = 0;
+	int64_t time_ns;
+	float samples_to_ns;
+	int heap_records_count = 0;
+	bool saved_server_wait;
+	bool w_explicit_off = false;
+	char *copy;
+	char *argv[64];
+	int argc, i, err = 0;
+
+	if (!tp)
+		return off + snprintf(out_buf + off, out_cap - off, "error: testbench not initialized\n");
+
+	copy = strdup(args_str ? args_str : "");
+	if (!copy)
+		return off + snprintf(out_buf + off, out_cap - off, "error: out of memory\n");
+
+	/* Ensure any prior topology or dynamic pipeline is cleanly torn down */
+	remote_unload_active_topology(tp);
+
+	saved_sim_cfg = st->sim_cfg;
+	saved_server_wait = tp->server_wait;
+	tp->server_wait = false;
+
+	/* Reset per-run defaults before parsing run-test flags */
+	tp->fs_in = 48000;
+	tp->fs_out = 0;
+	tp->channels_in = 2;
+	tp->channels_out = 0;
+	free(tp->bits_in);
+	tp->bits_in = strdup("S32_LE");
+	tp->frame_fmt = tplg_find_format(tp->bits_in);
+	tp->copy_check = false;
+	tp->copy_iterations = 1;
+	tp->pipelines[0] = 1;
+	tp->pipeline_num = 1;
+
+	argc = tokenize_shell_args(copy, argv, 64);
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+			free(tp->tplg_file);
+			tp->tplg_file = strdup(argv[++i]);
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			remote_set_csv_pipelines(tp, argv[++i]);
+		} else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
+			remote_set_csv_files(tp->input_file, &tp->input_file_num,
+					     TB_MAX_INPUT_FILE_NUM, argv[++i]);
+		} else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+			remote_set_csv_files(tp->output_file, &tp->output_file_num,
+					     TB_MAX_OUTPUT_FILE_NUM, argv[++i]);
+		} else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+			tp->fs_in = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-R") == 0 && i + 1 < argc) {
+			tp->fs_out = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+			tp->channels_in = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
+			tp->channels_out = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+			free(tp->bits_in);
+			tp->bits_in = strdup(argv[++i]);
+			tp->frame_fmt = tplg_find_format(tp->bits_in);
+		} else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+			free(tp->control_file);
+			tp->control_file = strdup(argv[++i]);
+		} else if (strcmp(argv[i], "-C") == 0 && i + 1 < argc) {
+			tp->copy_iterations = atoi(argv[++i]);
+			tp->copy_check = true;
+		} else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+			tp->trace_level = atoi(argv[++i]);
+			tb_enable_trace(tp->trace_level);
+		} else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+			const char *warg = argv[++i];
+
+			if (strcmp(warg, "0") == 0 || strcasecmp(warg, "off") == 0 ||
+			    strcasecmp(warg, "disable") == 0) {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_OFF);
+				w_explicit_off = true;
+			} else if (strcmp(warg, "2") == 0 || strcasecmp(warg, "realtime") == 0 ||
+				   strcasecmp(warg, "pace") == 0) {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_REALTIME);
+				w_explicit_off = false;
+			} else {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+				w_explicit_off = false;
+			}
+		} else if (strcmp(argv[i], "-F") == 0 && i + 1 < argc) {
+			remote_apply_freq_arg(argv[++i]);
+			if (!w_explicit_off &&
+			    host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+		} else if (strcmp(argv[i], "-M") == 0 && i + 1 < argc) {
+			remote_apply_mem_arg(argv[++i]);
+			if (!w_explicit_off &&
+			    host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+		}
+	}
+	free(copy);
+
+	if (!tp->fs_out)
+		tp->fs_out = tp->fs_in;
+	if (!tp->channels_out)
+		tp->channels_out = tp->channels_in;
+
+	if (!tp->tplg_file) {
+		st->sim_cfg = saved_sim_cfg;
+		tp->server_wait = saved_server_wait;
+		return off + snprintf(out_buf + off, out_cap - off,
+				      "error: run-test requires -t <file.tplg>\n");
+	}
+
+	off += snprintf(out_buf + off, out_cap - off,
+			"==========================================================\n"
+			"		           Test Start 0\n"
+			"==========================================================\n");
+
+	host_telem_reset();
+
+	err = tb_load_topology(tp);
+	if (err < 0) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: topology load 0 failed %d\n", err);
+		goto cleanup;
+	}
+
+	err = tb_set_up_all_pipelines(tp);
+	if (err < 0) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: pipelines set up 0 failed %d\n", err);
+		goto cleanup;
+	}
+
+	err = tb_set_running_state(tp);
+	if (err < 0) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: pipelines state set 0 failed %d\n", err);
+		goto cleanup;
+	}
+
+	err = tb_find_file_components(tp);
+	if (err < 0) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: file component find failed %d\n", err);
+		goto cleanup;
+	}
+
+	/* Record active secondary core LL worker and DP module thread creation lines */
+	for (i = 1; i < CONFIG_CORE_COUNT && off + 128 < out_cap; i++) {
+		if (arch_cpu_enabled_cores() & BIT(i))
+			off += snprintf(out_buf + off, out_cap - off,
+					"LL worker thread created for DSP core %d (host CPU %d)\n",
+					i, i);
+	}
+	if (tp->widget_list.next) {
+		struct list_item *item;
+
+		list_for_item(item, &tp->widget_list) {
+			struct tplg_comp_info *ci = container_of(item, struct tplg_comp_info, item);
+
+			if (off + 160 >= out_cap)
+				break;
+			if (ci->proc_domain == 1 && tb_is_pipeline_enabled(tp, ci->pipeline_id))
+				off += snprintf(out_buf + off, out_cap - off,
+						"DP thread initialized for module %s (0x%x) on DSP core %d (host CPU %d)\n",
+						ci->name ? ci->name : "dp_mod",
+						(uint32_t)IPC4_COMP_ID(ci->module_id, ci->instance_id),
+						ci->core_id, ci->core_id);
+		}
+	}
+
+	out_stat = tp->fw[0].state;
+	if (!out_stat) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: no active output file component found\n");
+		goto cleanup;
+	}
+	samples_to_ns = (1.0e9f / ((float)out_stat->channels * out_stat->rate));
+
+	if (tp->control_file) {
+		FILE *cfh = fopen(tp->control_file, "r");
+
+		if (!cfh) {
+			off += snprintf(out_buf + off, out_cap - off,
+					"error: opening script %s (%s).\n",
+					tp->control_file, strerror(errno));
+			goto cleanup;
+		}
+		char cline[512];
+
+		while (fgets(cline, sizeof(cline), cfh) && off + 192 < out_cap) {
+			char *nl = strpbrk(cline, "\r\n");
+
+			if (nl)
+				*nl = '\0';
+			if (cline[0] != '#' && cline[0] != '\0')
+				off += snprintf(out_buf + off, out_cap - off,
+						"Info: Setting control name from '%s'\n", cline);
+		}
+		rewind(cfh);
+		tp->control_fh = cfh;
+	}
+
+	err = tb_read_controls(tp, &next_control_ns);
+	if (err) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: failed to read control commands.\n");
+		goto cleanup;
+	}
+
+	tb_gettime(&td0);
+	while (true) {
+		if (tp->copy_check) {
+			if (tp->copy_iterations-- <= 0)
+				break;
+		}
+		if (tb_schedule_pipeline_check_state(tp))
+			break;
+		if (next_control_ns && out_stat) {
+			time_ns = (int64_t)(samples_to_ns * out_stat->n);
+			if (time_ns >= next_control_ns) {
+				err = tb_read_controls(tp, &next_control_ns);
+				if (err) {
+					off += snprintf(out_buf + off, out_cap - off,
+							"error: failed to read control commands.\n");
+					goto cleanup;
+				}
+				if (next_control_ns)
+					next_control_ns += time_ns;
+			}
+		}
+	}
+	tb_schedule_pipeline_check_state(tp);
+	tb_gettime(&td1);
+
+	delta_t = (td1.tv_sec - td0.tv_sec) * 1000000LL;
+	delta_t += (td1.tv_nsec - td0.tv_nsec) / 1000LL;
+
+	memset(heap_records, 0, sizeof(heap_records));
+	tb_collect_heap_usage(tp, heap_records, &heap_records_count);
+
+	err = tb_set_reset_state(tp);
+	if (err < 0) {
+		off += snprintf(out_buf + off, out_cap - off,
+				"error: pipeline reset 0 failed %d\n", err);
+		goto cleanup;
+	}
+
+	off = format_remote_test_summary(tp, delta_t, heap_records, heap_records_count,
+					 out_buf, off, out_cap);
+
+cleanup:
+	remote_unload_active_topology(tp);
+	st->sim_cfg = saved_sim_cfg;
+	tp->server_wait = saved_server_wait;
+	return off;
+}
+
 static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 {
 	size_t off = 0;
@@ -899,10 +1632,14 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 				"  version | info               Show testbench version, topology & core state\n"
 				"  pipelines | widgets          List active IPC pipelines, components & widgets\n"
 				"  modules                      List loaded built-in & dynamic LLEXT modules\n"
+				"  io-cfg [-i .. -o .. -r ..]   Configure input/output files, rates, channels & format\n"
 				"  tplg-load <file> [p1,p2,...] Dynamically load topology and start pipelines\n"
+				"  tplg-unload                  Stop, reset and free active topology & pipelines\n"
+				"  run-test -t <file> [...]     Run full topology test to EOF and return summary\n"
 				"  ppl-create <id> [prio] [core] Dynamically create an IPC4 pipeline\n"
 				"  ppl-state <id> <run|pause|reset> Set IPC4 pipeline state\n"
 				"  ppl-delete <id>              Delete an IPC4 pipeline\n"
+				"  mod-init <m> <i> <ppl> [c] [d] Initialize an IPC4 module instance\n"
 				"  mod-bind <sm> <si> <sq> <dm> <di> <dq>   Bind two module instances\n"
 				"  mod-unbind <sm> <si> <sq> <dm> <di> <dq> Unbind two module instances\n"
 				"  mod-delete <mod_id> <inst_id> Delete a module instance\n"
@@ -910,6 +1647,10 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 				"  amixer cset name=\"...\" <val> Set mixer or enum control live\n"
 				"  sof-ctl -c name=\"...\" -s <f> Apply bytes control blob live\n"
 				"  stats | heap                 Show file I/O stats and module heap usage\n"
+				"  sched-telem                  Show per-core, per-pipeline & per-module LL/DP telemetry\n"
+				"  sched-telem-reset            Reset scheduling telemetry counters\n"
+				"  workload-sim [status|...]    Configure/query CPC, core freq & SRAM/DRAM workload sim\n"
+				"  mod-buffers [id|name]        Show module entry/exit buffer levels, dBFS & sample taps\n"
 				"  kernel cycles                Show simulated DSP core tick & cycle counters\n"
 				"  kernel threads               Show active LL core & DP module worker threads\n"
 				"  pause | resume | step [N]    Pause, resume, or step N pipeline ticks\n"
@@ -1021,6 +1762,14 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 		}
 		if (lcount == 0)
 			off += snprintf(out_buf + off, out_cap - off, "  (none loaded via llext-load)\n");
+	} else if (strncmp(cmd, "io-cfg", 6) == 0) {
+		off = handle_remote_io_cfg(g_tp, cmd + 6, out_buf, off, out_cap);
+	} else if (strcmp(cmd, "tplg-unload") == 0) {
+		remote_unload_active_topology(g_tp);
+		off += snprintf(out_buf + off, out_cap - off,
+				"tplg-unload -> OK (all pipelines and topology freed)\n");
+	} else if (strncmp(cmd, "run-test", 8) == 0) {
+		off = handle_remote_run_test(g_tp, cmd + 8, out_buf, off, out_cap);
 	} else if (strncmp(cmd, "tplg-load ", 10) == 0) {
 		char tpath[256] = {0};
 		char plist[128] = {0};
@@ -1030,26 +1779,10 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 			off += snprintf(out_buf + off, out_cap - off,
 					"Usage: tplg-load <file.tplg> [p1,p2,...]\n");
 		} else {
-			if (g_tp->tplg_file) {
-				tb_set_reset_state(g_tp);
-				tb_free_all_pipelines(g_tp);
-				tb_free_topology(g_tp);
-				free(g_tp->tplg_file);
-			}
-			memset(g_kctl_shadow, 0, sizeof(g_kctl_shadow));
+			remote_unload_active_topology(g_tp);
 			g_tp->tplg_file = strdup(tpath);
-			if (n >= 2) {
-				char *save = NULL;
-				char *tok = strtok_r(plist, ",", &save);
-				int idx = 0;
-
-				while (tok && idx < TB_MAX_PIPELINES_NUM) {
-					g_tp->pipelines[idx++] = atoi(tok);
-					tok = strtok_r(NULL, ",", &save);
-				}
-				if (idx > 0)
-					g_tp->pipeline_num = idx;
-			}
+			if (n >= 2)
+				remote_set_csv_pipelines(g_tp, plist);
 			int err = tb_load_topology(g_tp);
 
 			if (!err)
@@ -1058,6 +1791,8 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 				err = tb_set_running_state(g_tp);
 			if (!err)
 				err = tb_find_file_components(g_tp);
+			if (!err)
+				pthread_cond_broadcast(&g_tb_cond);
 			off += snprintf(out_buf + off, out_cap - off,
 					"tplg-load '%s' -> %s (err=%d)\n",
 					tpath, err == 0 ? "OK" : "FAILED", err);
@@ -1088,9 +1823,87 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 			ipc_cmd((struct ipc_cmd_hdr *)mbox);
 			uint32_t st = mbox[0] & 0x00FFFFFFU;
 
+			pthread_cond_broadcast(&g_tb_cond);
 			off += snprintf(out_buf + off, out_cap - off,
 					"CREATE_PIPELINE(inst=%u, prio=%u, core=%u) -> status=%u (%s)\n",
 					inst_id, prio, core, st, st == 0 ? "IPC4_SUCCESS" : "FAILED");
+		}
+	} else if (strncmp(cmd, "mod-init ", 9) == 0) {
+		uint32_t mid = 0, iid = 0, ppl_id = 0, core = 0, dom = 0;
+		int n = sscanf(cmd + 9, "%i %i %i %i %i", &mid, &iid, &ppl_id, &core, &dom);
+
+		if (n < 3 || !sof_get() || !sof_get()->ipc || !sof_get()->ipc->comp_data) {
+			off += snprintf(out_buf + off, out_cap - off,
+					"Usage: mod-init <mod_id> <inst_id> <ppl_id> [core_id] [domain(0=LL,1=DP)]\n");
+		} else {
+			struct {
+				struct ipc4_base_module_cfg base_cfg;
+				struct sof_uuid uuid;
+			} init_payload;
+			struct ipc4_module_init_instance msg = {{0}};
+			uint32_t *mbox = (uint32_t *)sof_get()->ipc->comp_data;
+			/* Default to mixin UUID (39656eb2-3b71-4049-8d3f-f92cd5c43c09) or mixout (0x3) */
+			static const struct sof_uuid mixin_uuid = {
+				.a = 0x39656eb2, .b = 0x3b71, .c = 0x4049,
+				.d = { 0x8d, 0x3f, 0xf9, 0x2c, 0xd5, 0xc4, 0x3c, 0x09 }
+			};
+			static const struct sof_uuid mixout_uuid = {
+				.a = 0x3c56505a, .b = 0x24d7, .c = 0x418f,
+				.d = { 0xbd, 0xdc, 0xc1, 0xf5, 0xa3, 0xac, 0x2a, 0xe0 }
+			};
+
+			if (core < CONFIG_CORE_COUNT)
+				cpu_enable_core(core);
+
+			memset(&init_payload, 0, sizeof(init_payload));
+			init_payload.base_cfg.cpc = 1000;
+			init_payload.base_cfg.ibs = 384;
+			init_payload.base_cfg.obs = 384;
+			init_payload.base_cfg.is_pages = 1;
+			init_payload.base_cfg.audio_fmt.sampling_frequency = 48000;
+			init_payload.base_cfg.audio_fmt.depth = 32;
+			init_payload.base_cfg.audio_fmt.ch_map = 0xFFFFFF10U;
+			init_payload.base_cfg.audio_fmt.ch_cfg = 1; /* STEREO */
+			init_payload.base_cfg.audio_fmt.interleaving_style = 0;
+			init_payload.base_cfg.audio_fmt.channels_count = 2;
+			init_payload.base_cfg.audio_fmt.valid_bit_depth = 32;
+			init_payload.base_cfg.audio_fmt.s_type = 0;
+			init_payload.uuid = (mid == 3) ? mixout_uuid : mixin_uuid;
+
+			if (g_tp && g_tp->widget_list.next) {
+				struct list_item *it;
+
+				list_for_item(it, &g_tp->widget_list) {
+					struct tplg_comp_info *ci =
+						container_of(it, struct tplg_comp_info, item);
+					if ((uint32_t)ci->module_id == mid) {
+						init_payload.uuid = ci->uuid;
+						break;
+					}
+				}
+			}
+
+			msg.primary.r.type = SOF_IPC4_MOD_INIT_INSTANCE;
+			msg.primary.r.msg_tgt = SOF_IPC4_MESSAGE_TARGET_MODULE_MSG;
+			msg.primary.r.rsp = SOF_IPC4_MESSAGE_DIR_MSG_REQUEST;
+			msg.primary.r.module_id = mid;
+			msg.primary.r.instance_id = iid;
+			msg.extension.r.param_block_size = sizeof(init_payload) / sizeof(uint32_t);
+			msg.extension.r.ppl_instance_id = ppl_id;
+			msg.extension.r.core_id = core;
+			msg.extension.r.proc_domain = dom ? 1 : 0;
+
+			memset(mbox, 0, SOF_IPC_MSG_MAX_SIZE);
+			mbox[0] = msg.primary.dat;
+			mbox[1] = msg.extension.dat;
+			memcpy(&mbox[2], &init_payload, sizeof(init_payload));
+			ipc_cmd((struct ipc_cmd_hdr *)mbox);
+			uint32_t st = mbox[0] & 0x00FFFFFFU;
+
+			off += snprintf(out_buf + off, out_cap - off,
+					"MOD_INIT_INSTANCE(mod=0x%x, inst=%u, ppl=%u, core=%u, dom=%s) -> status=%u (%s)\n",
+					mid, iid, ppl_id, core, dom ? "DP" : "LL", st,
+					st == 0 ? "IPC4_SUCCESS" : "FAILED");
 		}
 	} else if (strncmp(cmd, "ppl-state ", 10) == 0) {
 		uint32_t inst_id = 0;
@@ -1269,6 +2082,482 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 						recs[i].module_name, recs[i].heap_max);
 			}
 		}
+	} else if (strcmp(cmd, "sched-telem-reset") == 0) {
+		host_telem_reset();
+		off += snprintf(out_buf + off, out_cap - off,
+				"Scheduling & buffer telemetry counters reset.\n");
+	} else if (strncmp(cmd, "workload-sim", 12) == 0) {
+		struct host_sched_telemetry *st = host_telem_get();
+		const char *sub = cmd + 12;
+
+		while (*sub == ' ' || *sub == '\t')
+			sub++;
+
+		if (*sub == '\0' || strcmp(sub, "status") == 0) {
+			const char *mstr =
+				(st->sim_cfg.mode == HOST_WORKLOAD_SIM_REALTIME) ? "REALTIME-PACED" :
+				(st->sim_cfg.mode == HOST_WORKLOAD_SIM_VIRTUAL)  ? "VIRTUAL-SIM" :
+										   "OFF (HOST-MEASURED)";
+			const char *dstr =
+				(st->sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) ? "DRAM" : "SRAM";
+			uint32_t i;
+
+			off += snprintf(out_buf + off, out_cap - off,
+					"=== Workload Execution Time Simulation ===\n"
+					"  Mode:              %s (%u)\n"
+					"  Default Memory:    %s (SRAM=%u.%02ux, DRAM=%u.%02ux + %u cyc/word)\n"
+					"  Module Overrides:  %u active\n",
+					mstr, st->sim_cfg.mode, dstr,
+					st->sim_cfg.sram_factor_x100 / 100,
+					st->sim_cfg.sram_factor_x100 % 100,
+					st->sim_cfg.dram_factor_x100 / 100,
+					st->sim_cfg.dram_factor_x100 % 100,
+					st->sim_cfg.dram_cycles_per_word,
+					st->sim_cfg.num_overrides);
+			for (i = 0; i < TB_TELEM_MAX_CORES && off + 192 < out_cap; i++) {
+				struct host_core_telem *ct = &st->cores[i];
+
+				off += snprintf(out_buf + off, out_cap - off,
+						"  [Core %u] target_freq=%u MHz (budget=%u cyc/ms) active=%u util=%u.%02u%% overruns=%u LL_exec=%llu.%03llu/%llu.%03lluus DP_exec=%llu.%03llu/%llu.%03lluus\n",
+						i, st->sim_cfg.core_freq_hz[i] / 1000000U,
+						st->sim_cfg.core_freq_hz[i] / 1000U,
+						ct->active ? 1 : 0,
+						ct->total_util_x100 / 100, ct->total_util_x100 % 100,
+						ct->ll_deadline_violations,
+						(unsigned long long)(ct->ll_avg_exec_ns / 1000ULL),
+						(unsigned long long)(ct->ll_avg_exec_ns % 1000ULL),
+						(unsigned long long)(ct->ll_peak_exec_ns / 1000ULL),
+						(unsigned long long)(ct->ll_peak_exec_ns % 1000ULL),
+						(unsigned long long)(ct->dp_avg_exec_ns / 1000ULL),
+						(unsigned long long)(ct->dp_avg_exec_ns % 1000ULL),
+						(unsigned long long)(ct->dp_peak_exec_ns / 1000ULL),
+						(unsigned long long)(ct->dp_peak_exec_ns % 1000ULL));
+			}
+			for (i = 0; i < st->num_mods && off + 192 < out_cap; i++) {
+				struct host_mod_telem *mt = &st->mods[i];
+				struct tplg_comp_info *ci;
+				const char *wname;
+
+				if (!mt->active)
+					continue;
+				ci = find_comp_info_by_ipc_id(g_tp, mt->comp_id);
+				wname = (ci && ci->name) ? ci->name : "comp";
+				off += snprintf(out_buf + off, out_cap - off,
+						"  [Mod 0x%06x %-22s] core=%u %s mem=%s cpc=%u avg_cyc=%llu (%u kcps) exec=%llu.%03llu/%llu.%03lluus viol=%u\n",
+						mt->comp_id, wname, mt->core_id,
+						mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
+						mt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+						mt->effective_cpc,
+						(unsigned long long)mt->avg_cycles, mt->avg_kcps,
+						(unsigned long long)(mt->avg_exec_ns / 1000ULL),
+						(unsigned long long)(mt->avg_exec_ns % 1000ULL),
+						(unsigned long long)(mt->peak_exec_ns / 1000ULL),
+						(unsigned long long)(mt->peak_exec_ns % 1000ULL),
+						mt->cpc_violations);
+			}
+		} else if (strncmp(sub, "enable", 6) == 0 || strncmp(sub, "on", 2) == 0) {
+			const char *arg = sub + (strncmp(sub, "enable", 6) == 0 ? 6 : 2);
+			uint32_t m = HOST_WORKLOAD_SIM_VIRTUAL;
+
+			while (*arg == ' ' || *arg == '\t')
+				arg++;
+			if (strcasecmp(arg, "realtime") == 0 || strcasecmp(arg, "pace") == 0 ||
+			    strcmp(arg, "2") == 0)
+				m = HOST_WORKLOAD_SIM_REALTIME;
+			host_workload_sim_set_mode(m);
+			host_telem_reset();
+			off += snprintf(out_buf + off, out_cap - off,
+					"Workload simulation enabled (mode=%s)\n",
+					m == HOST_WORKLOAD_SIM_REALTIME ? "REALTIME-PACED" : "VIRTUAL-SIM");
+		} else if (strncmp(sub, "disable", 7) == 0 || strncmp(sub, "off", 3) == 0) {
+			host_workload_sim_set_mode(HOST_WORKLOAD_SIM_OFF);
+			host_telem_reset();
+			off += snprintf(out_buf + off, out_cap - off,
+					"Workload simulation disabled (using measured host CPU cycles)\n");
+		} else if (strncmp(sub, "freq ", 5) == 0) {
+			const char *farg = sub + 5;
+			char *copy, *saveptr = NULL, *tok;
+
+			while (*farg == ' ' || *farg == '\t')
+				farg++;
+			copy = strdup(farg);
+			if (copy) {
+				tok = strtok_r(copy, ",", &saveptr);
+				while (tok) {
+					char *colon = strchr(tok, ':');
+
+					if (colon) {
+						int c = atoi(tok);
+						uint32_t v = (uint32_t)strtoul(colon + 1, NULL, 10);
+						uint32_t hz = (v < 100000U) ? (v * 1000000U) : v;
+
+						host_workload_sim_set_core_freq(c, hz);
+					} else {
+						uint32_t v = (uint32_t)strtoul(tok, NULL, 10);
+						uint32_t hz = (v < 100000U) ? (v * 1000000U) : v;
+
+						host_workload_sim_set_core_freq(-1, hz);
+					}
+					tok = strtok_r(NULL, ",", &saveptr);
+				}
+				free(copy);
+			}
+			if (host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+			host_telem_reset();
+			off += snprintf(out_buf + off, out_cap - off,
+					"Target core frequencies updated: C0=%uMHz C1=%uMHz C2=%uMHz C3=%uMHz\n",
+					st->sim_cfg.core_freq_hz[0] / 1000000U,
+					st->sim_cfg.core_freq_hz[1] / 1000000U,
+					st->sim_cfg.core_freq_hz[2] / 1000000U,
+					st->sim_cfg.core_freq_hz[3] / 1000000U);
+		} else if (strncmp(sub, "mem ", 4) == 0) {
+			const char *marg = sub + 4;
+			char dom_str[16] = {0};
+			uint32_t factor = 0, c_word = 0;
+			uint32_t dom = HOST_MEM_DOMAIN_SRAM;
+
+			while (*marg == ' ' || *marg == '\t')
+				marg++;
+			sscanf(marg, "%15s %u %u", dom_str, &factor, &c_word);
+			if (strncasecmp(dom_str, "dram", 4) == 0 || strcmp(dom_str, "1") == 0)
+				dom = HOST_MEM_DOMAIN_DRAM;
+			host_workload_sim_set_mem_domain(dom, factor, c_word);
+			if (host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+			host_telem_reset();
+			off += snprintf(out_buf + off, out_cap - off,
+					"Memory execution domain set to %s (DRAM factor=%u.%02ux, %u cyc/word)\n",
+					dom == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+					st->sim_cfg.dram_factor_x100 / 100,
+					st->sim_cfg.dram_factor_x100 % 100,
+					st->sim_cfg.dram_cycles_per_word);
+		} else if (strncmp(sub, "mod ", 4) == 0) {
+			const char *marg = sub + 4;
+			char target_tok[64] = {0};
+			uint32_t comp_id = 0xFFFFFFFFU;
+			uint32_t cpc_ov = 0;
+			uint32_t mem_ov = HOST_MEM_DOMAIN_AUTO;
+			const char *p_cpc, *p_mem;
+
+			while (*marg == ' ' || *marg == '\t')
+				marg++;
+			sscanf(marg, "%63s", target_tok);
+			if (target_tok[0] >= '0' && target_tok[0] <= '9') {
+				comp_id = (uint32_t)strtoul(target_tok, NULL, 0);
+			} else if (g_tp) {
+				for (uint32_t i = 0; i < st->num_mods; i++) {
+					struct tplg_comp_info *ci =
+						find_comp_info_by_ipc_id(g_tp, st->mods[i].comp_id);
+					if (ci && ci->name && strstr(ci->name, target_tok)) {
+						comp_id = st->mods[i].comp_id;
+						break;
+					}
+				}
+			}
+			p_cpc = strstr(marg, "cpc=");
+			if (p_cpc)
+				cpc_ov = (uint32_t)strtoul(p_cpc + 4, NULL, 0);
+			p_mem = strstr(marg, "mem=");
+			if (p_mem) {
+				if (strncasecmp(p_mem + 4, "dram", 4) == 0)
+					mem_ov = HOST_MEM_DOMAIN_DRAM;
+				else if (strncasecmp(p_mem + 4, "sram", 4) == 0)
+					mem_ov = HOST_MEM_DOMAIN_SRAM;
+			}
+			if (comp_id == 0xFFFFFFFFU) {
+				off += snprintf(out_buf + off, out_cap - off,
+						"Usage: workload-sim mod <comp_id|name> [cpc=<cycles>] [mem=<sram|dram>]\n");
+			} else {
+				host_workload_sim_set_mod_override(comp_id, cpc_ov, mem_ov);
+				if (host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+					host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+				host_telem_reset();
+				off += snprintf(out_buf + off, out_cap - off,
+						"Override set for module 0x%06x: cpc=%u mem=%s\n",
+						comp_id, cpc_ov,
+						mem_ov == HOST_MEM_DOMAIN_DRAM ? "DRAM" :
+						(mem_ov == HOST_MEM_DOMAIN_SRAM ? "SRAM" : "AUTO"));
+			}
+		} else if (strcmp(sub, "reset") == 0) {
+			host_workload_sim_clear_overrides();
+			host_telem_reset();
+			off += snprintf(out_buf + off, out_cap - off,
+					"Cleared module workload overrides and reset telemetry.\n");
+		} else {
+			off += snprintf(out_buf + off, out_cap - off,
+					"Usage:\n"
+					"  workload-sim status\n"
+					"  workload-sim enable [virtual|realtime]\n"
+					"  workload-sim disable\n"
+					"  workload-sim freq <mhz | core:mhz,...>\n"
+					"  workload-sim mem <sram|dram> [dram_factor_x100] [cycles_per_word]\n"
+					"  workload-sim mod <comp_id|name> [cpc=<cycles>] [mem=<sram|dram>]\n"
+					"  workload-sim reset\n");
+		}
+	} else if (strcmp(cmd, "sched-telem") == 0) {
+		struct host_sched_telemetry *st = host_telem_get();
+		const char *mode_str =
+			(st->sim_cfg.mode == HOST_WORKLOAD_SIM_REALTIME) ? "REALTIME-PACED" :
+			(st->sim_cfg.mode == HOST_WORKLOAD_SIM_VIRTUAL)  ? "VIRTUAL-SIM" :
+									   "HOST-MEASURED";
+		const char *mem_str =
+			(st->sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) ? "DRAM" : "SRAM";
+		uint32_t i;
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"=== Per-Core LL & DP Scheduler Telemetry [Mode=%s Mem=%s DRAM_Factor=%u.%02ux] ===\n",
+				mode_str, mem_str,
+				st->sim_cfg.dram_factor_x100 / 100,
+				st->sim_cfg.dram_factor_x100 % 100);
+		for (i = 0; i < TB_TELEM_MAX_CORES && off + 256 < out_cap; i++) {
+			struct host_core_telem *ct = &st->cores[i];
+
+			if (!ct->active && !(arch_cpu_enabled_cores() & BIT(i)))
+				continue;
+			off += snprintf(out_buf + off, out_cap - off,
+					"  [Core %u %uMHz] util=%u.%02u%% overruns=%u | LL: ticks=%u tasks=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus | DP: runs=%u thr=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus\n",
+					i, ct->freq_hz / 1000000U,
+					ct->total_util_x100 / 100, ct->total_util_x100 % 100,
+					ct->ll_deadline_violations,
+					ct->ll_tick_count, ct->ll_active_tasks,
+					(unsigned long long)ct->ll_avg_cycles,
+					(unsigned long long)ct->ll_peak_cycles,
+					(unsigned long long)ct->ll_total_cycles,
+					ct->ll_avg_kcps, ct->ll_peak_kcps,
+					(unsigned long long)(ct->ll_avg_exec_ns / 1000ULL),
+					(unsigned long long)(ct->ll_avg_exec_ns % 1000ULL),
+					(unsigned long long)(ct->ll_peak_exec_ns / 1000ULL),
+					(unsigned long long)(ct->ll_peak_exec_ns % 1000ULL),
+					ct->dp_run_count, ct->dp_active_threads,
+					(unsigned long long)ct->dp_avg_cycles,
+					(unsigned long long)ct->dp_peak_cycles,
+					(unsigned long long)ct->dp_total_cycles,
+					ct->dp_avg_kcps, ct->dp_peak_kcps,
+					(unsigned long long)(ct->dp_avg_exec_ns / 1000ULL),
+					(unsigned long long)(ct->dp_avg_exec_ns % 1000ULL),
+					(unsigned long long)(ct->dp_peak_exec_ns / 1000ULL),
+					(unsigned long long)(ct->dp_peak_exec_ns % 1000ULL));
+		}
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"\n=== Per-Pipeline Scheduling Telemetry (%u active) ===\n",
+				st->num_pipes);
+		for (i = 0; i < st->num_pipes && off + 224 < out_cap; i++) {
+			struct host_pipe_telem *pt = &st->pipes[i];
+
+			if (!pt->active)
+				continue;
+			off += snprintf(out_buf + off, out_cap - off,
+					"  [Pipe %2u] core=%u prio=%u per=%uus mem=%s mods=%uLL/%uDP copies=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus xruns=%u\n",
+					pt->pipeline_id, pt->core_id, pt->priority, pt->period_us,
+					pt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+					pt->num_ll_modules, pt->num_dp_modules,
+					(unsigned long long)pt->copy_iterations,
+					(unsigned long long)pt->avg_cycles,
+					(unsigned long long)pt->peak_cycles,
+					(unsigned long long)pt->total_cycles,
+					pt->avg_kcps, pt->peak_kcps,
+					(unsigned long long)(pt->avg_exec_ns / 1000ULL),
+					(unsigned long long)(pt->avg_exec_ns % 1000ULL),
+					(unsigned long long)(pt->peak_exec_ns / 1000ULL),
+					(unsigned long long)(pt->peak_exec_ns % 1000ULL),
+					pt->xrun_count);
+		}
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"\n=== Per-Module LL & DP Scheduling + Entry/Exit Buffer Telemetry (%u active) ===\n",
+				st->num_mods);
+		for (i = 0; i < st->num_mods && off + 288 < out_cap; i++) {
+			struct host_mod_telem *mt = &st->mods[i];
+			struct tplg_comp_info *ci;
+			const char *wname;
+
+			if (!mt->active)
+				continue;
+			ci = find_comp_info_by_ipc_id(g_tp, mt->comp_id);
+			wname = (ci && ci->name) ? ci->name : "comp";
+
+			off += snprintf(out_buf + off, out_cap - off,
+					"  [0x%06x %-24s] pipe=%u core=%u %s mem=%s iters=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus ibs=%u obs=%u cpc=%u(viol=%u)",
+					mt->comp_id, wname, mt->pipeline_id, mt->core_id,
+					mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
+					mt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+					(unsigned long long)mt->iterations,
+					(unsigned long long)mt->avg_cycles,
+					(unsigned long long)mt->peak_cycles,
+					(unsigned long long)mt->total_cycles,
+					mt->avg_kcps, mt->peak_kcps,
+					(unsigned long long)(mt->avg_exec_ns / 1000ULL),
+					(unsigned long long)(mt->avg_exec_ns % 1000ULL),
+					(unsigned long long)(mt->peak_exec_ns / 1000ULL),
+					(unsigned long long)(mt->peak_exec_ns % 1000ULL),
+					mt->ibs, mt->obs, mt->effective_cpc, mt->cpc_violations);
+			if (mt->proc_domain == COMP_PROCESSING_DOMAIN_DP) {
+				off += snprintf(out_buf + off, out_cap - off,
+						" ll_sync=%llu(%llu cyc)",
+						(unsigned long long)mt->ll_ring_sync_iterations,
+						(unsigned long long)mt->ll_ring_sync_total_cycles);
+			}
+			if (mt->num_in_pins > 0 && mt->in_pins[0].active) {
+				struct host_mod_pin_telem *pin = &mt->in_pins[0];
+
+				off += snprintf(out_buf + off, out_cap - off,
+						" | IN0: %u->%uB xfer=%uB(tot=%lluB) rms=%d.%02ddBFS",
+						pin->dp_ring_size ? pin->dp_ring_entry_avail :
+								    pin->entry_avail_bytes,
+						pin->dp_ring_size ? pin->dp_ring_exit_avail :
+								    pin->exit_avail_bytes,
+						pin->last_bytes_transferred,
+						(unsigned long long)pin->total_bytes_transferred,
+						pin->entry_rms_dbfs_x100 / 100,
+						abs(pin->entry_rms_dbfs_x100 % 100));
+			}
+			if (mt->num_out_pins > 0 && mt->out_pins[0].active) {
+				struct host_mod_pin_telem *pin = &mt->out_pins[0];
+
+				off += snprintf(out_buf + off, out_cap - off,
+						" | OUT0: %u->%uB xfer=%uB(tot=%lluB) rms=%d.%02ddBFS",
+						pin->dp_ring_size ? pin->dp_ring_entry_avail :
+								    pin->entry_avail_bytes,
+						pin->dp_ring_size ? pin->dp_ring_exit_avail :
+								    pin->exit_avail_bytes,
+						pin->last_bytes_transferred,
+						(unsigned long long)pin->total_bytes_transferred,
+						pin->exit_rms_dbfs_x100 / 100,
+						abs(pin->exit_rms_dbfs_x100 % 100));
+			}
+			off += snprintf(out_buf + off, out_cap - off, "\n");
+		}
+	} else if (strncmp(cmd, "mod-buffers", 11) == 0) {
+		struct host_sched_telemetry *st = host_telem_get();
+		const char *filter = cmd + 11;
+		uint32_t filter_id = 0xFFFFFFFFU;
+		uint32_t i, p, s;
+
+		while (*filter == ' ' || *filter == '\t')
+			filter++;
+		if (*filter >= '0' && *filter <= '9')
+			filter_id = (uint32_t)strtoul(filter, NULL, 0);
+
+		off += snprintf(out_buf + off, out_cap - off,
+				"=== Module Entry/Exit Buffer Data & Sample Taps ===\n");
+		for (i = 0; i < st->num_mods && off + 384 < out_cap; i++) {
+			struct host_mod_telem *mt = &st->mods[i];
+			struct tplg_comp_info *ci;
+			const char *wname;
+
+			if (!mt->active)
+				continue;
+			ci = find_comp_info_by_ipc_id(g_tp, mt->comp_id);
+			wname = (ci && ci->name) ? ci->name : "comp";
+
+			if (*filter) {
+				if (filter_id != 0xFFFFFFFFU) {
+					if (mt->comp_id != filter_id)
+						continue;
+				} else if (!strstr(wname, filter)) {
+					continue;
+				}
+			}
+
+			off += snprintf(out_buf + off, out_cap - off,
+					"[0x%06x %s] pipe=%u core=%u domain=%s iters=%llu cyc(last=%llu avg=%llu peak=%llu)\n",
+					mt->comp_id, wname, mt->pipeline_id, mt->core_id,
+					mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
+					(unsigned long long)mt->iterations,
+					(unsigned long long)mt->last_cycles,
+					(unsigned long long)mt->avg_cycles,
+					(unsigned long long)mt->peak_cycles);
+
+			for (p = 0; p < mt->num_in_pins && off + 256 < out_cap; p++) {
+				struct host_mod_pin_telem *pin = &mt->in_pins[p];
+
+				if (!pin->active)
+					continue;
+				off += snprintf(out_buf + off, out_cap - off,
+						"  IN [%u] buf=%u peer=0x%x %uHz/%uch/fmt=%u size=%uB LL(entry=%u/%uB -> exit=%u/%uB)",
+						p, pin->buf_id, pin->peer_comp_id,
+						pin->rate, pin->channels, pin->frame_fmt,
+						pin->buf_size,
+						pin->entry_avail_bytes, pin->entry_free_bytes,
+						pin->exit_avail_bytes, pin->exit_free_bytes);
+				if (pin->dp_ring_size > 0) {
+					off += snprintf(out_buf + off, out_cap - off,
+							" DP_RING(size=%uB entry=%u/%uB -> exit=%u/%uB)",
+							pin->dp_ring_size,
+							pin->dp_ring_entry_avail,
+							pin->dp_ring_entry_free,
+							pin->dp_ring_exit_avail,
+							pin->dp_ring_exit_free);
+				}
+				off += snprintf(out_buf + off, out_cap - off,
+						" consumed=%uB(tot=%lluB) entry_rms=%d.%02ddB(pk=%d.%02ddB) exit_rms=%d.%02ddB\n",
+						pin->last_bytes_transferred,
+						(unsigned long long)pin->total_bytes_transferred,
+						pin->entry_rms_dbfs_x100 / 100,
+						abs(pin->entry_rms_dbfs_x100 % 100),
+						pin->entry_peak_dbfs_x100 / 100,
+						abs(pin->entry_peak_dbfs_x100 % 100),
+						pin->exit_rms_dbfs_x100 / 100,
+						abs(pin->exit_rms_dbfs_x100 % 100));
+				if (pin->entry_num_samples > 0 && off + 160 < out_cap) {
+					uint16_t n = pin->entry_num_samples < 8 ?
+						     pin->entry_num_samples : 8;
+					off += snprintf(out_buf + off, out_cap - off,
+							"         entry_samples[%u]:",
+							pin->entry_num_samples);
+					for (s = 0; s < n; s++)
+						off += snprintf(out_buf + off, out_cap - off,
+								" %d", pin->entry_samples[s]);
+					off += snprintf(out_buf + off, out_cap - off, "\n");
+				}
+			}
+
+			for (p = 0; p < mt->num_out_pins && off + 256 < out_cap; p++) {
+				struct host_mod_pin_telem *pin = &mt->out_pins[p];
+
+				if (!pin->active)
+					continue;
+				off += snprintf(out_buf + off, out_cap - off,
+						"  OUT[%u] buf=%u peer=0x%x %uHz/%uch/fmt=%u size=%uB LL(entry=%u/%uB -> exit=%u/%uB)",
+						p, pin->buf_id, pin->peer_comp_id,
+						pin->rate, pin->channels, pin->frame_fmt,
+						pin->buf_size,
+						pin->entry_avail_bytes, pin->entry_free_bytes,
+						pin->exit_avail_bytes, pin->exit_free_bytes);
+				if (pin->dp_ring_size > 0) {
+					off += snprintf(out_buf + off, out_cap - off,
+							" DP_RING(size=%uB entry=%u/%uB -> exit=%u/%uB)",
+							pin->dp_ring_size,
+							pin->dp_ring_entry_avail,
+							pin->dp_ring_entry_free,
+							pin->dp_ring_exit_avail,
+							pin->dp_ring_exit_free);
+				}
+				off += snprintf(out_buf + off, out_cap - off,
+						" produced=%uB(tot=%lluB) entry_rms=%d.%02ddB exit_rms=%d.%02ddB(pk=%d.%02ddB)\n",
+						pin->last_bytes_transferred,
+						(unsigned long long)pin->total_bytes_transferred,
+						pin->entry_rms_dbfs_x100 / 100,
+						abs(pin->entry_rms_dbfs_x100 % 100),
+						pin->exit_rms_dbfs_x100 / 100,
+						abs(pin->exit_rms_dbfs_x100 % 100),
+						pin->exit_peak_dbfs_x100 / 100,
+						abs(pin->exit_peak_dbfs_x100 % 100));
+				if (pin->exit_num_samples > 0 && off + 160 < out_cap) {
+					uint16_t n = pin->exit_num_samples < 8 ?
+						     pin->exit_num_samples : 8;
+					off += snprintf(out_buf + off, out_cap - off,
+							"         exit_samples[%u]: ",
+							pin->exit_num_samples);
+					for (s = 0; s < n; s++)
+						off += snprintf(out_buf + off, out_cap - off,
+								" %d", pin->exit_samples[s]);
+					off += snprintf(out_buf + off, out_cap - off, "\n");
+				}
+			}
+		}
 	} else if (strcmp(cmd, "kernel cycles") == 0) {
 		uint32_t mask = arch_cpu_enabled_cores();
 
@@ -1406,8 +2695,10 @@ static int handle_ipc_large_cfg(int sock, uint32_t req_id, const uint8_t *req_bu
 				st = -EINVAL;
 			} else if (param_type == TB_IPC4_PERF_MEASUREMENTS_STATE) {
 				g_perf_meas_state = *(const uint8_t *)(req_buf + sizeof(*lreq));
-				if (g_perf_meas_state == 1 /* STOPPED */)
+				if (g_perf_meas_state == 1 /* STOPPED */) {
 					memset(g_core_ticks, 0, sizeof(g_core_ticks));
+					host_telem_reset();
+				}
 			}
 		} else {
 			switch (param_type) {
@@ -1474,6 +2765,74 @@ static int handle_ipc_large_cfg(int sock, uint32_t req_id, const uint8_t *req_bu
 			     (st == 0 && lreq->set_get == SOF_CDEV_LARGE_CFG_GET) ? out_len : 0);
 	free(dbuf);
 	return ret;
+}
+
+static int handle_workload_sim_cfg(int sock, uint32_t req_id, const uint8_t *req_buf,
+				   uint32_t req_len)
+{
+	struct sof_net_workload_sim_req req = {0};
+	struct sof_net_workload_sim_rsp rsp = {0};
+	struct host_sched_telemetry *st;
+	int c;
+
+	if (req_len >= sizeof(req))
+		memcpy(&req, req_buf, sizeof(req));
+
+	pthread_mutex_lock(&g_tb_lock);
+	st = host_telem_get();
+
+	if (req.op == SOF_WORKLOAD_SIM_OP_SET) {
+		host_workload_sim_set_mode(req.mode);
+		host_workload_sim_set_mem_domain(req.default_mem_domain,
+						 req.dram_factor_x100,
+						 req.dram_cycles_per_word);
+		for (c = 0; c < TB_TELEM_MAX_CORES && c < 8; c++) {
+			if (req.core_freq_hz[c] > 0) {
+				uint32_t hz = (req.core_freq_hz[c] < 100000U) ?
+					      (req.core_freq_hz[c] * 1000000U) :
+					      req.core_freq_hz[c];
+				host_workload_sim_set_core_freq(c, hz);
+			}
+		}
+		host_telem_reset();
+	} else if (req.op == SOF_WORKLOAD_SIM_OP_MOD_SET) {
+		host_workload_sim_set_mod_override(req.target_comp_id,
+						   req.cpc_override,
+						   req.mem_domain_override);
+		if (host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+			host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+		host_telem_reset();
+	} else if (req.op == SOF_WORKLOAD_SIM_OP_RESET_OVERRIDES) {
+		host_workload_sim_clear_overrides();
+		host_telem_reset();
+	}
+
+	rsp.status = 0;
+	rsp.mode = st->sim_cfg.mode;
+	rsp.default_mem_domain = st->sim_cfg.default_mem_domain;
+	rsp.sram_factor_x100 = st->sim_cfg.sram_factor_x100;
+	rsp.dram_factor_x100 = st->sim_cfg.dram_factor_x100;
+	rsp.dram_cycles_per_word = st->sim_cfg.dram_cycles_per_word;
+	rsp.num_cores = TB_TELEM_MAX_CORES;
+	rsp.num_overrides = st->sim_cfg.num_overrides;
+
+	for (c = 0; c < TB_TELEM_MAX_CORES && c < 8; c++) {
+		rsp.cores[c].active = st->cores[c].active ? 1 : 0;
+		rsp.cores[c].freq_hz = st->sim_cfg.core_freq_hz[c];
+		rsp.cores[c].total_util_x100 = st->cores[c].total_util_x100;
+		rsp.cores[c].ll_deadline_violations = st->cores[c].ll_deadline_violations;
+		rsp.cores[c].ll_avg_kcps = st->cores[c].ll_avg_kcps;
+		rsp.cores[c].ll_peak_kcps = st->cores[c].ll_peak_kcps;
+		rsp.cores[c].ll_avg_exec_ns = st->cores[c].ll_avg_exec_ns;
+		rsp.cores[c].ll_peak_exec_ns = st->cores[c].ll_peak_exec_ns;
+		rsp.cores[c].dp_avg_kcps = st->cores[c].dp_avg_kcps;
+		rsp.cores[c].dp_peak_kcps = st->cores[c].dp_peak_kcps;
+		rsp.cores[c].dp_avg_exec_ns = st->cores[c].dp_avg_exec_ns;
+		rsp.cores[c].dp_peak_exec_ns = st->cores[c].dp_peak_exec_ns;
+	}
+
+	pthread_mutex_unlock(&g_tb_lock);
+	return send_reply(sock, SOF_NET_OP_WORKLOAD_SIM_CFG, req_id, 0, &rsp, sizeof(rsp));
 }
 
 static int handle_telem_snapshot(int sock, uint32_t req_id, const uint8_t *req_buf,
@@ -1558,6 +2917,55 @@ static int handle_probe_ctl(int sock, uint32_t req_id, const uint8_t *req_buf, u
 		return send_reply(sock, SOF_NET_OP_PROBE_CTL, req_id, -EINVAL, NULL, 0);
 
 	const struct sof_net_probe_req *preq = (const struct sof_net_probe_req *)req_buf;
+
+	if (preq->op == SOF_PROBE_OP_READ_BUFFER) {
+		uint32_t target_id = preq->stream_tag;
+		uint32_t max_bytes = (preq->dma_buffer_size && preq->dma_buffer_size <= 8192) ?
+				     preq->dma_buffer_size : 64;
+		uint8_t *out_buf = calloc(1, sizeof(*preq) + max_bytes);
+
+		if (!out_buf)
+			return send_reply(sock, SOF_NET_OP_PROBE_CTL, req_id, -ENOMEM, NULL, 0);
+
+		struct sof_net_probe_req *prsp = (struct sof_net_probe_req *)out_buf;
+		int32_t *dst_samples = (int32_t *)(out_buf + sizeof(*preq));
+		uint32_t copied_bytes = 0;
+
+		*prsp = *preq;
+		pthread_mutex_lock(&g_tb_lock);
+		struct host_sched_telemetry *st = host_telem_get();
+
+		if (st) {
+			for (uint32_t i = 0; i < st->num_mods; i++) {
+				struct host_mod_telem *mt = &st->mods[i];
+
+				if (!mt->active)
+					continue;
+				if (target_id != 0 && mt->comp_id != target_id)
+					continue;
+				if (mt->num_out_pins > 0 && mt->out_pins[0].exit_num_samples > 0) {
+					uint32_t n = mt->out_pins[0].exit_num_samples;
+					uint32_t nb = n * sizeof(int32_t);
+
+					if (nb > max_bytes)
+						nb = max_bytes;
+					memcpy(dst_samples, mt->out_pins[0].exit_samples, nb);
+					copied_bytes = nb;
+					prsp->stream_tag = mt->comp_id;
+					break;
+				}
+			}
+		}
+		pthread_mutex_unlock(&g_tb_lock);
+
+		prsp->dma_buffer_size = copied_bytes;
+		prsp->num_points = copied_bytes / sizeof(int32_t);
+		int ret = send_reply(sock, SOF_NET_OP_PROBE_CTL, req_id, 0,
+				     out_buf, sizeof(*preq) + copied_bytes);
+		free(out_buf);
+		return ret;
+	}
+
 	uint32_t cap = (preq->num_points && preq->num_points <= 64) ? preq->num_points : 64;
 	uint8_t *out_buf = calloc(1, sizeof(*preq) + cap * sizeof(struct sof_cdev_probe_point));
 
@@ -1573,22 +2981,43 @@ static int handle_probe_ctl(int sock, uint32_t req_id, const uint8_t *req_buf, u
 	pthread_mutex_lock(&g_tb_lock);
 	if ((preq->op == SOF_PROBE_OP_INFO_AVAILABLE || preq->op == SOF_PROBE_OP_INFO_ACTIVE) &&
 	    sof_get() && sof_get()->ipc) {
+		struct host_sched_telemetry *st = host_telem_get();
 		struct list_item *clist;
 
 		list_for_item(clist, &sof_get()->ipc->comp_list) {
 			struct ipc_comp_dev *icd = container_of(clist, struct ipc_comp_dev, list);
+			struct host_mod_telem *mt = NULL;
+			uint32_t i;
 
 			if (icd->type != COMP_TYPE_COMPONENT || !icd->cd || count >= cap)
 				continue;
 
 			struct tplg_comp_info *ci = find_comp_info_by_ipc_id(g_tp, icd->id);
+			const char *wname = (ci && ci->name) ? ci->name : "sof_widget";
+
+			if (st) {
+				for (i = 0; i < st->num_mods; i++) {
+					if (st->mods[i].active && st->mods[i].comp_id == icd->id) {
+						mt = &st->mods[i];
+						break;
+					}
+				}
+			}
 
 			pts[count].buffer_id = icd->id;
 			pts[count].purpose = 0; /* EXTRACTION */
 			pts[count].stream_tag = (uint32_t)(icd->cd->pipeline ?
 							   icd->cd->pipeline->pipeline_id : 0);
-			snprintf(pts[count].widget_name, sizeof(pts[count].widget_name),
-				 "%s", (ci && ci->name) ? ci->name : "sof_widget");
+			if (mt && mt->num_out_pins > 0 && mt->out_pins[0].active) {
+				snprintf(pts[count].widget_name, sizeof(pts[count].widget_name),
+					 "%.15s %uB %ddB",
+					 wname,
+					 mt->out_pins[0].last_bytes_transferred & 0xFFFFU,
+					 (int)(mt->out_pins[0].exit_rms_dbfs_x100 / 100));
+			} else {
+				snprintf(pts[count].widget_name, sizeof(pts[count].widget_name),
+					 "%s", wname);
+			}
 			count++;
 		}
 	}
@@ -2821,6 +4250,9 @@ static void *tb_client_worker_fn(void *arg)
 				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG &&
 				    msg_type == SOF_IPC4_GLB_SET_PIPELINE_STATE)
 					schedule_ll_run_tasks();
+				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG &&
+				    msg_type == SOF_IPC4_GLB_CREATE_PIPELINE)
+					pthread_cond_broadcast(&g_tb_cond);
 
 				rsp->reply_primary = mbox[0];
 				rsp->reply_extension = mbox[1];
@@ -2965,6 +4397,10 @@ static void *tb_client_worker_fn(void *arg)
 			rc = handle_telem_snapshot(sock, hdr.req_id, req_buf, hdr.payload_len);
 			break;
 
+		case SOF_NET_OP_WORKLOAD_SIM_CFG:
+			rc = handle_workload_sim_cfg(sock, hdr.req_id, req_buf, hdr.payload_len);
+			break;
+
 		case SOF_NET_OP_LLEXT_LOAD: {
 			if (hdr.payload_len < sizeof(struct sof_net_llext_req)) {
 				rc = send_reply(sock, hdr.opcode, hdr.req_id, -EINVAL, NULL, 0);
@@ -3025,16 +4461,21 @@ static void *tb_client_worker_fn(void *arg)
 			const struct sof_net_shell_req *sreq =
 				(const struct sof_net_shell_req *)req_buf;
 			const char *cmd_str = (const char *)(req_buf + sizeof(*sreq));
-			char out_text[8192];
+			size_t out_cap = 32768;
+			char *out_text = calloc(1, out_cap);
 
-			memset(out_text, 0, sizeof(out_text));
-			int n = execute_tb_shell_cmd(cmd_str, out_text, sizeof(out_text));
+			if (!out_text) {
+				rc = send_reply(sock, hdr.opcode, hdr.req_id, -ENOMEM, NULL, 0);
+				break;
+			}
+			int n = execute_tb_shell_cmd(cmd_str, out_text, out_cap);
 
 			if (n < 0)
 				rc = send_reply(sock, hdr.opcode, hdr.req_id, n, NULL, 0);
 			else
 				rc = send_reply(sock, hdr.opcode, hdr.req_id, 0,
 						out_text, (uint32_t)n);
+			free(out_text);
 			break;
 		}
 

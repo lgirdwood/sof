@@ -34,11 +34,66 @@ LOG_MODULE_REGISTER(testbench, CONFIG_SOF_LOG_LEVEL);
 
 /* testbench helper functions for pipeline setup and trigger */
 
+int tb_configure_audio_params(struct testbench_prm *tp)
+{
+	int bits;
+	int krate;
+
+	if (!tp)
+		return -EINVAL;
+
+	if (!tp->fs_in)
+		tp->fs_in = 48000;
+	if (!tp->fs_out)
+		tp->fs_out = tp->fs_in;
+	if (!tp->channels_in)
+		tp->channels_in = 2;
+	if (!tp->channels_out)
+		tp->channels_out = tp->channels_in;
+
+	/* setup IPC4 audio format */
+	tp->num_configs = 1;
+	krate = tp->fs_in / 1000;
+	switch (tp->frame_fmt) {
+	case SOF_IPC_FRAME_S16_LE:
+		bits = 16;
+		break;
+	case SOF_IPC_FRAME_S24_4LE:
+		bits = 24;
+		break;
+	case SOF_IPC_FRAME_S32_LE:
+		bits = 32;
+		break;
+	default:
+		fprintf(stderr, "error: unsupported frame format %d\n", tp->frame_fmt);
+		return -EINVAL;
+	}
+
+	/* TODO 44.1 kHz like rates */
+	snprintf(tp->config[0].name, TB_MAX_CONFIG_NAME_SIZE, "%dk%dc%db",
+		 krate, tp->channels_in, bits);
+	tp->num_configs = 1;
+	tp->config[0].buffer_frames = 2 * krate;
+	tp->config[0].buffer_time = 0;
+	tp->config[0].period_frames = krate;
+	tp->config[0].period_time = 0;
+	tp->config[0].rate = tp->fs_in;
+	tp->config[0].channels = tp->channels_in;
+	tp->config[0].format = tp->frame_fmt;
+	tp->period_frames = krate;
+
+	/* TODO: Need to set this later for larger topologies with multiple PCMs. The
+	 * pipelines are determined based on just the PCM ID for the device that we
+	 * want to start playback/capture on.
+	 */
+	tp->pcm_id = 0;
+
+	return 0;
+}
+
 int tb_setup(struct sof *sof, struct testbench_prm *tp)
 {
 	struct ll_schedule_domain domain = {0};
-	int bits;
-	int krate;
 
 	/* init components */
 	sys_comp_init(sof);
@@ -114,44 +169,7 @@ int tb_setup(struct sof *sof, struct testbench_prm *tp)
 
 	tb_debug_print("ipc and scheduler initialized\n");
 
-	/* setup IPC4 audio format */
-	tp->num_configs = 1;
-	krate = tp->fs_in / 1000;
-	switch (tp->frame_fmt) {
-	case SOF_IPC_FRAME_S16_LE:
-		bits = 16;
-		break;
-	case SOF_IPC_FRAME_S24_4LE:
-		bits = 24;
-		break;
-	case SOF_IPC_FRAME_S32_LE:
-		bits = 32;
-		break;
-	default:
-		fprintf(stderr, "error: unsupported frame format %d\n", tp->frame_fmt);
-		return -EINVAL;
-	}
-
-	/* TODO 44.1 kHz like rates */
-	snprintf(tp->config[0].name, TB_MAX_CONFIG_NAME_SIZE, "%dk%dc%db",
-		 krate, tp->channels_in, bits);
-	tp->num_configs = 1;
-	tp->config[0].buffer_frames = 2 * krate;
-	tp->config[0].buffer_time = 0;
-	tp->config[0].period_frames = krate;
-	tp->config[0].period_time = 0;
-	tp->config[0].rate = tp->fs_in;
-	tp->config[0].channels = tp->channels_in;
-	tp->config[0].format = tp->frame_fmt;
-	tp->period_frames = krate;
-
-	/* TODO: Need to set this later for larger topologies with multiple PCMs. The
-	 * pipelines are determined based on just the PCM ID for the device that we
-	 * want to start playback/capture on.
-	 */
-	tp->pcm_id = 0;
-
-	return 0;
+	return tb_configure_audio_params(tp);
 }
 
 static int tb_prepare_widget(struct testbench_prm *tp,
@@ -643,12 +661,38 @@ static int tb_free_pipelines(struct testbench_prm *tp, int dir)
 
 int tb_free_all_pipelines(struct testbench_prm *tp)
 {
+	struct list_item *item;
+
 	tb_debug_print("freeing playback direction\n");
 	tb_free_pipelines(tp, SOF_IPC_STREAM_PLAYBACK);
 
 	tb_debug_print("freeing capture direction\n");
 	tb_free_pipelines(tp, SOF_IPC_STREAM_CAPTURE);
 
+	/* Ensure any remaining set-up routes or pipelines are cleaned up */
+	if (tp->route_list.next) {
+		list_for_item(item, &tp->route_list) {
+			struct tplg_route_info *route_info =
+				container_of(item, struct tplg_route_info, item);
+
+			if (route_info->set_up)
+				tb_free_route(tp, route_info);
+		}
+	}
+	if (tp->pipeline_list.next) {
+		list_for_item(item, &tp->pipeline_list) {
+			struct tplg_pipeline_info *pipe_info =
+				container_of(item, struct tplg_pipeline_info, item);
+
+			if (pipe_info->set_up) {
+				tb_delete_pipeline(tp, pipe_info);
+				pipe_info->set_up = false;
+			}
+		}
+	}
+
+	tp->playback_pipeline_list.count = 0;
+	tp->capture_pipeline_list.count = 0;
 	memset(tp->instance_ids, 0, sizeof(tp->instance_ids));
 	return 0;
 }
@@ -664,50 +708,76 @@ void tb_free_topology(struct testbench_prm *tp)
 	struct list_item *item, *_item;
 	uint32_t i;
 
-	list_for_item_safe(item, _item, &tp->pcm_list) {
-		pcm_info = container_of(item, struct tplg_pcm_info, item);
-		list_item_del(item);
-		free(pcm_info->name);
-		free(pcm_info);
-	}
-
-	list_for_item_safe(item, _item, &tp->widget_list) {
-		comp_info = container_of(item, struct tplg_comp_info, item);
-		available_fmts = &comp_info->available_fmt;
-		list_item_del(item);
-		if (comp_info->pins_info.input_pin_binding) {
-			for (i = 0; i < comp_info->pins_info.num_input_pins; i++)
-				free(comp_info->pins_info.input_pin_binding[i]);
-			free(comp_info->pins_info.input_pin_binding);
+	if (tp->pcm_list.next) {
+		list_for_item_safe(item, _item, &tp->pcm_list) {
+			pcm_info = container_of(item, struct tplg_pcm_info, item);
+			list_item_del(item);
+			free(pcm_info->name);
+			free(pcm_info);
 		}
-		if (comp_info->pins_info.output_pin_binding) {
-			for (i = 0; i < comp_info->pins_info.num_output_pins; i++)
-				free(comp_info->pins_info.output_pin_binding[i]);
-			free(comp_info->pins_info.output_pin_binding);
+	}
+
+	if (tp->widget_list.next) {
+		list_for_item_safe(item, _item, &tp->widget_list) {
+			comp_info = container_of(item, struct tplg_comp_info, item);
+			available_fmts = &comp_info->available_fmt;
+			list_item_del(item);
+			if (comp_info->pins_info.input_pin_binding) {
+				for (i = 0; i < comp_info->pins_info.num_input_pins; i++)
+					free(comp_info->pins_info.input_pin_binding[i]);
+				free(comp_info->pins_info.input_pin_binding);
+			}
+			if (comp_info->pins_info.output_pin_binding) {
+				for (i = 0; i < comp_info->pins_info.num_output_pins; i++)
+					free(comp_info->pins_info.output_pin_binding[i]);
+				free(comp_info->pins_info.output_pin_binding);
+			}
+			free(available_fmts->output_pin_fmts);
+			free(available_fmts->input_pin_fmts);
+			free(comp_info->name);
+			free(comp_info->stream_name);
+			free(comp_info->ipc_payload);
+			free(comp_info);
 		}
-		free(available_fmts->output_pin_fmts);
-		free(available_fmts->input_pin_fmts);
-		free(comp_info->name);
-		free(comp_info->stream_name);
-		free(comp_info->ipc_payload);
-		free(comp_info);
 	}
 
-	list_for_item_safe(item, _item, &tp->route_list) {
-		route_info = container_of(item, struct tplg_route_info, item);
-		list_item_del(item);
-		free(route_info);
+	if (tp->route_list.next) {
+		list_for_item_safe(item, _item, &tp->route_list) {
+			route_info = container_of(item, struct tplg_route_info, item);
+			list_item_del(item);
+			free(route_info);
+		}
 	}
 
-	list_for_item_safe(item, _item, &tp->pipeline_list) {
-		pipe_info = container_of(item, struct tplg_pipeline_info, item);
-		list_item_del(item);
-		free(pipe_info->name);
-		free(pipe_info);
+	if (tp->pipeline_list.next) {
+		list_for_item_safe(item, _item, &tp->pipeline_list) {
+			pipe_info = container_of(item, struct tplg_pipeline_info, item);
+			list_item_del(item);
+			free(pipe_info->name);
+			free(pipe_info);
+		}
 	}
+
+	list_init(&tp->pcm_list);
+	list_init(&tp->widget_list);
+	list_init(&tp->route_list);
+	list_init(&tp->pipeline_list);
 
 	free(ctx->tplg_base);
+	ctx->tplg_base = NULL;
 	free(tp->glb_ctx.ctl);
+	tp->glb_ctx.ctl = NULL;
+	tp->glb_ctx.num_ctls = 0;
+	tp->glb_ctx.size = 0;
+	tp->playback_pipeline_list.count = 0;
+	tp->capture_pipeline_list.count = 0;
+	memset(tp->instance_ids, 0, sizeof(tp->instance_ids));
+	memset(tp->fr, 0, sizeof(tp->fr));
+	memset(tp->fw, 0, sizeof(tp->fw));
+	for (i = 0; i < TB_MAX_INPUT_FILE_NUM; i++)
+		tp->fr[i].id = -1;
+	for (i = 0; i < TB_MAX_OUTPUT_FILE_NUM; i++)
+		tp->fw[i].id = -1;
 	tb_debug_print("freed all pipelines, widgets, routes and pcms\n");
 }
 

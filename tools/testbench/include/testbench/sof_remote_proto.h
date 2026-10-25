@@ -114,6 +114,7 @@ struct sof_cdev_win_info {
 #define SOF_PROBE_OP_INFO_AVAILABLE	4
 #define SOF_PROBE_OP_POINTS_ADD		5
 #define SOF_PROBE_OP_POINTS_REMOVE	6
+#define SOF_PROBE_OP_READ_BUFFER	7
 
 struct sof_cdev_probe_point {
 	uint32_t buffer_id;
@@ -141,6 +142,7 @@ enum sof_net_opcode {
 	SOF_NET_OP_WIN_WRITE		= 0x0022,
 	SOF_NET_OP_WINSTREAM_IO		= 0x0023,
 	SOF_NET_OP_TELEM_SNAPSHOT	= 0x0028,
+	SOF_NET_OP_WORKLOAD_SIM_CFG	= 0x0029,
 	SOF_NET_OP_LLEXT_LOAD		= 0x0030,
 	SOF_NET_OP_SHELL_EXEC		= 0x0040,
 	SOF_NET_OP_PROBE_CTL		= 0x0050,
@@ -669,6 +671,56 @@ struct sof_net_kctl_io_rsp {
 	struct sof_net_kctl_info info;
 	uint32_t bytes_len;
 	uint8_t  bytes_data[512];
+} __attribute__((packed));
+
+/* -------------------------------------------------------------------------
+ * SOF_NET_OP_WORKLOAD_SIM_CFG (0x0029)
+ * Configure and query accurate CPC/Frequency/SRAM-DRAM workload simulation
+ * -------------------------------------------------------------------------
+ */
+#define SOF_WORKLOAD_SIM_OP_GET			0
+#define SOF_WORKLOAD_SIM_OP_SET			1
+#define SOF_WORKLOAD_SIM_OP_MOD_SET		2
+#define SOF_WORKLOAD_SIM_OP_RESET_OVERRIDES	3
+
+struct sof_net_workload_sim_req {
+	uint32_t op;			/* SOF_WORKLOAD_SIM_OP_* */
+	uint32_t mode;			/* 0=OFF, 1=VIRTUAL, 2=REALTIME */
+	uint32_t default_mem_domain;	/* 0=SRAM, 1=DRAM */
+	uint32_t dram_factor_x100;	/* e.g. 160 = 1.60x */
+	uint32_t dram_cycles_per_word;	/* e.g. 2 cycles per 32-bit word */
+	uint32_t core_freq_hz[8];	/* 0 = unchanged, else target core frequency in Hz */
+	/* For SOF_WORKLOAD_SIM_OP_MOD_SET */
+	uint32_t target_comp_id;
+	uint32_t cpc_override;
+	uint32_t mem_domain_override;	/* 0=SRAM, 1=DRAM, 0xFF=AUTO */
+} __attribute__((packed));
+
+struct sof_net_workload_core_sim_stat {
+	uint32_t active;
+	uint32_t freq_hz;
+	uint32_t total_util_x100;
+	uint32_t ll_deadline_violations;
+	uint32_t ll_avg_kcps;
+	uint32_t ll_peak_kcps;
+	uint64_t ll_avg_exec_ns;
+	uint64_t ll_peak_exec_ns;
+	uint32_t dp_avg_kcps;
+	uint32_t dp_peak_kcps;
+	uint64_t dp_avg_exec_ns;
+	uint64_t dp_peak_exec_ns;
+} __attribute__((packed));
+
+struct sof_net_workload_sim_rsp {
+	int32_t  status;
+	uint32_t mode;
+	uint32_t default_mem_domain;
+	uint32_t sram_factor_x100;
+	uint32_t dram_factor_x100;
+	uint32_t dram_cycles_per_word;
+	uint32_t num_cores;
+	uint32_t num_overrides;
+	struct sof_net_workload_core_sim_stat cores[8];
 } __attribute__((packed));
 
 #endif /* _TESTBENCH_SOF_REMOTE_PROTO_H */

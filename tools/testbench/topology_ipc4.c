@@ -92,6 +92,55 @@ static int tb_mq_cmd_tx_rx(struct tb_mq_desc *ipc_tx, struct tb_mq_desc *ipc_rx,
 	return 0;
 }
 
+static uint32_t tb_default_cpc_for_widget_name(const char *name, uint32_t proc_domain)
+{
+	if (!name)
+		return (proc_domain == COMP_PROCESSING_DOMAIN_DP) ? 48000 : 12000;
+	if (strncmp(name, "host-copier", 11) == 0 ||
+	    strncmp(name, "dai-copier", 10) == 0 ||
+	    strncmp(name, "module-copier", 13) == 0 ||
+	    strncmp(name, "alh-dai-copier", 14) == 0)
+		return 1647;
+	if (strncmp(name, "gain", 4) == 0 || strncmp(name, "volume", 6) == 0)
+		return 10183;
+	if (strncmp(name, "mixin", 5) == 0)
+		return 910;
+	if (strncmp(name, "mixout", 6) == 0)
+		return 5000;
+	if (strncmp(name, "eqiir", 5) == 0 || strncmp(name, "eq-iir", 6) == 0)
+		return 18500;
+	if (strncmp(name, "eqfir", 5) == 0 || strncmp(name, "eq-fir", 6) == 0)
+		return 26000;
+	if (strncmp(name, "src", 3) == 0)
+		return 24000;
+	if (strncmp(name, "asrc", 4) == 0)
+		return 32000;
+	if (strncmp(name, "multiband_drc", 13) == 0)
+		return 48000;
+	if (strncmp(name, "drc", 3) == 0)
+		return 22000;
+	if (strncmp(name, "tdfb", 4) == 0)
+		return 35000;
+	if (strncmp(name, "crossover", 9) == 0)
+		return 16000;
+	if (strncmp(name, "dcblock", 7) == 0)
+		return 6400;
+	if (strncmp(name, "micsel", 6) == 0 || strncmp(name, "mux", 3) == 0 ||
+	    strncmp(name, "demux", 5) == 0)
+		return 29000;
+	if (strncmp(name, "aria", 4) == 0)
+		return 5000;
+	if (strncmp(name, "stft", 4) == 0)
+		return 64000;
+	if (strncmp(name, "mfcc", 4) == 0)
+		return 42000;
+	if (strncmp(name, "kpb", 3) == 0)
+		return 3500;
+	if (strncmp(name, "smart_amp", 9) == 0)
+		return 38000;
+	return (proc_domain == COMP_PROCESSING_DOMAIN_DP) ? 48000 : 12000;
+}
+
 static int tb_parse_ipc4_comp_tokens(struct testbench_prm *tp,
 				     struct ipc4_base_module_cfg *base_cfg)
 {
@@ -115,6 +164,10 @@ static int tb_parse_ipc4_comp_tokens(struct testbench_prm *tp,
 				   ARRAY_SIZE(ipc4_comp_domain_word_tokens), array, size, 1, 0);
 	if (ret < 0)
 		return ret;
+
+	if (base_cfg->cpc == 0)
+		base_cfg->cpc = tb_default_cpc_for_widget_name(comp_info->name,
+							       comp_info->proc_domain);
 
 	return sof_parse_tokens(&comp_info->uuid, comp_ext_tokens,
 			       ARRAY_SIZE(comp_ext_tokens), array, size);
@@ -1685,10 +1738,18 @@ int tb_parse_topology(struct testbench_prm *tp)
 	ctx->ipc_major = 4;
 	ctx->ctl_arg = tp;
 	ctx->ctl_cb = tb_kcontrol_cb_new;
+	tb_configure_audio_params(tp);
 	tp->input_file_index = 0;
 	tp->output_file_index = 0;
+	memset(tp->fr, 0, sizeof(tp->fr));
+	memset(tp->fw, 0, sizeof(tp->fw));
+	for (i = 0; i < TB_MAX_INPUT_FILE_NUM; i++)
+		tp->fr[i].id = -1;
+	for (i = 0; i < TB_MAX_OUTPUT_FILE_NUM; i++)
+		tp->fw[i].id = -1;
 	tp->glb_ctx.num_ctls = 0;
 	tp->glb_ctx.size = 0;
+	free(tp->glb_ctx.ctl);
 	tp->glb_ctx.ctl = calloc(TB_MAX_CTLS, sizeof(struct tb_ctl));
 	if (!tp->glb_ctx.ctl) {
 		fprintf(stderr, "error: failed to allocate for controls.\n");

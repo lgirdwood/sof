@@ -12,6 +12,7 @@
 #include <sof/schedule/dp_schedule.h>
 #include <platform/lib/ll_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
+#include <platform/lib/telemetry_sched.h>
 #include <sof/lib/cpu.h>
 #include <rtos/wait.h>
 #include <pthread.h>
@@ -130,6 +131,9 @@ static void *ll_core_thread_fn(void *arg)
 		worker->run_tick = false;
 		pthread_mutex_unlock(&ll_sched_lock);
 
+		uint64_t tick_start = host_telem_timestamp_cycles();
+		uint32_t tasks_run = 0;
+
 		/* iterate through this core's LL task list */
 		list_for_item_safe(tlist, tlist_, &worker->sched_list) {
 			task = container_of(tlist, struct task, list);
@@ -139,6 +143,7 @@ static void *ll_core_thread_fn(void *arg)
 				task->state = SOF_TASK_STATE_RUNNING;
 
 				state = task_run(task);
+				tasks_run++;
 
 				if (state == SOF_TASK_STATE_COMPLETED) {
 					task->state = SOF_TASK_STATE_COMPLETED;
@@ -148,6 +153,10 @@ static void *ll_core_thread_fn(void *arg)
 				}
 			}
 		}
+
+		if (tasks_run > 0)
+			host_telem_core_ll_tick(worker->core_id, tasks_run,
+						host_telem_timestamp_cycles() - tick_start);
 
 		pthread_mutex_lock(&ll_sched_lock);
 		if (ll_running_cores > 0) {
@@ -216,6 +225,9 @@ static int schedule_ll_task(void *data, struct task *task, uint64_t start,
 		}
 		worker->host_cpu = host_pin_thread_to_dsp_core(worker->thread_id, core);
 		worker->thread_created = true;
+		tr_info(&ll_tr, "LL worker thread created for DSP core %d (host CPU %d)",
+			core, worker->host_cpu);
+	} else if (list_is_empty(&worker->sched_list)) {
 		tr_info(&ll_tr, "LL worker thread created for DSP core %d (host CPU %d)",
 			core, worker->host_cpu);
 	}

@@ -15,6 +15,9 @@
 #include "testbench/file.h"
 #include "testbench/utils.h"
 #include "testbench/remote_server.h"
+#include "testbench/topology_ipc4.h"
+#include <platform/lib/telemetry_sched.h>
+#include <ipc4/module.h>
 
 #include <ctype.h>
 #include <getopt.h>
@@ -137,7 +140,11 @@ static void print_usage(char *executable)
 	printf("  -P <number of dynamic pipeline iterations>\n");
 	printf("  -s <script file to set controls, with amixer and sleep commands>\n");
 	printf("  -S <port> Start sof-remote TCP server on <port> (default port: 9998)\n");
-	printf("  -W Keep testbench running continuously for remote network control\n\n");
+	printf("  -W Keep testbench running continuously for remote network control\n");
+	printf("  -I Run testbench in interactive network server mode (default port: 9998)\n");
+	printf("  -w <0|1|2|off|virtual|realtime> Enable CPC workload execution time simulation\n");
+	printf("  -F <freq_mhz | core:freq_mhz,...> Set target DSP core clock frequency in MHz\n");
+	printf("  -M <sram|dram[:penalty_x100[:cycles_per_word]]> Set workload memory domain\n\n");
 	printf("Options for input and output format override:\n");
 	printf("  -b <input_format>, S16_LE, S24_LE, or S32_LE\n");
 	printf("  -c <input channels>\n");
@@ -150,12 +157,65 @@ static void print_usage(char *executable)
 	printf("%s -r 48000 -c 2 -b S16_LE -i in.raw -o out.raw -t <test.tplg>\n\n", executable);
 }
 
+static void parse_core_freq_arg(const char *arg)
+{
+	char *copy = strdup(arg);
+	char *saveptr = NULL;
+	char *tok;
+
+	if (!copy)
+		return;
+
+	tok = strtok_r(copy, ",", &saveptr);
+	while (tok) {
+		char *colon = strchr(tok, ':');
+
+		if (colon) {
+			int core = atoi(tok);
+			uint32_t val = (uint32_t)strtoul(colon + 1, NULL, 10);
+			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+
+			host_workload_sim_set_core_freq(core, hz);
+		} else {
+			uint32_t val = (uint32_t)strtoul(tok, NULL, 10);
+			uint32_t hz = (val < 100000U) ? (val * 1000000U) : val;
+
+			host_workload_sim_set_core_freq(-1, hz);
+		}
+		tok = strtok_r(NULL, ",", &saveptr);
+	}
+	free(copy);
+}
+
+static void parse_mem_domain_arg(const char *arg)
+{
+	uint32_t domain = HOST_MEM_DOMAIN_SRAM;
+	uint32_t factor = 0;
+	uint32_t c_per_word = 0;
+	const char *colon;
+
+	if (strncasecmp(arg, "dram", 4) == 0 || strcmp(arg, "1") == 0)
+		domain = HOST_MEM_DOMAIN_DRAM;
+
+	colon = strchr(arg, ':');
+	if (colon) {
+		const char *colon2;
+
+		factor = (uint32_t)strtoul(colon + 1, NULL, 10);
+		colon2 = strchr(colon + 1, ':');
+		if (colon2)
+			c_per_word = (uint32_t)strtoul(colon2 + 1, NULL, 10);
+	}
+	host_workload_sim_set_mem_domain(domain, factor, c_per_word);
+}
+
 static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 {
 	int option = 0;
 	int ret = 0;
+	bool w_explicit_off = false;
 
-	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:S:W")) != -1) {
+	while ((option = getopt(argc, argv, "hd:i:o:t:b:r:R:c:n:C:P:p:s:S:WIw:F:M:")) != -1) {
 		switch (option) {
 		/* input sample file */
 		case 'i':
@@ -239,9 +299,43 @@ static int parse_input_args(int argc, char **argv, struct testbench_prm *tp)
 
 		/* keep testbench running continuously for remote control */
 		case 'W':
+		case 'I':
 			tp->server_wait = true;
 			if (tp->server_port <= 0)
 				tp->server_port = 9998;
+			break;
+
+		/* workload execution time simulation mode */
+		case 'w':
+			if (strcmp(optarg, "0") == 0 || strcasecmp(optarg, "off") == 0 ||
+			    strcasecmp(optarg, "disable") == 0) {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_OFF);
+				w_explicit_off = true;
+			} else if (strcmp(optarg, "2") == 0 ||
+				   strcasecmp(optarg, "realtime") == 0 ||
+				   strcasecmp(optarg, "pace") == 0) {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_REALTIME);
+				w_explicit_off = false;
+			} else {
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+				w_explicit_off = false;
+			}
+			break;
+
+		/* target DSP core clock frequency in MHz */
+		case 'F':
+			parse_core_freq_arg(optarg);
+			if (!w_explicit_off &&
+			    host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
+			break;
+
+		/* workload execution memory domain (sram vs dram) */
+		case 'M':
+			parse_mem_domain_arg(optarg);
+			if (!w_explicit_off &&
+			    host_workload_sim_get_mode() == HOST_WORKLOAD_SIM_OFF)
+				host_workload_sim_set_mode(HOST_WORKLOAD_SIM_VIRTUAL);
 			break;
 
 		/* print usage */
@@ -330,6 +424,165 @@ static void test_pipeline_stats(struct testbench_prm *tp, long long delta_t,
 	if (delta_t)
 		printf("Total execution time: %lld us, %.2f x realtime\n\n", delta_t,
 		       (float)frames_out / tp->fs_out * 1000000 / delta_t);
+
+	/* Print Per-Core, Per-Pipeline, and Per-Module (LL + DP + Buffer) Telemetry */
+	{
+		struct host_sched_telemetry *st = host_telem_get();
+		uint32_t u;
+
+		if (st && (st->num_pipes > 0 || st->num_mods > 0)) {
+			const char *mode_str =
+				(st->sim_cfg.mode == HOST_WORKLOAD_SIM_REALTIME) ? "REALTIME-PACED" :
+				(st->sim_cfg.mode == HOST_WORKLOAD_SIM_VIRTUAL)  ? "VIRTUAL-SIM" :
+										   "HOST-MEASURED";
+			const char *mem_str =
+				(st->sim_cfg.default_mem_domain == HOST_MEM_DOMAIN_DRAM) ? "DRAM" :
+											   "SRAM";
+
+			printf("--- Per-Core LL & DP Scheduler Telemetry [Mode=%s Mem=%s DRAM_Factor=%u.%02ux] ---\n",
+			       mode_str, mem_str,
+			       st->sim_cfg.dram_factor_x100 / 100,
+			       st->sim_cfg.dram_factor_x100 % 100);
+			for (u = 0; u < TB_TELEM_MAX_CORES; u++) {
+				struct host_core_telem *ct = &st->cores[u];
+
+				if (!ct->active)
+					continue;
+				printf("  Core %u (%u MHz): util=%u.%02u%% overruns=%u | LL: ticks=%u tasks=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus | DP: runs=%u thr=%u avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus\n",
+				       u, ct->freq_hz / 1000000U,
+				       ct->total_util_x100 / 100, ct->total_util_x100 % 100,
+				       ct->ll_deadline_violations,
+				       ct->ll_tick_count, ct->ll_active_tasks,
+				       (unsigned long long)ct->ll_avg_cycles,
+				       (unsigned long long)ct->ll_peak_cycles,
+				       (unsigned long long)ct->ll_total_cycles,
+				       ct->ll_avg_kcps, ct->ll_peak_kcps,
+				       (unsigned long long)(ct->ll_avg_exec_ns / 1000ULL),
+				       (unsigned long long)(ct->ll_avg_exec_ns % 1000ULL),
+				       (unsigned long long)(ct->ll_peak_exec_ns / 1000ULL),
+				       (unsigned long long)(ct->ll_peak_exec_ns % 1000ULL),
+				       ct->dp_run_count, ct->dp_active_threads,
+				       (unsigned long long)ct->dp_avg_cycles,
+				       (unsigned long long)ct->dp_peak_cycles,
+				       (unsigned long long)ct->dp_total_cycles,
+				       ct->dp_avg_kcps, ct->dp_peak_kcps,
+				       (unsigned long long)(ct->dp_avg_exec_ns / 1000ULL),
+				       (unsigned long long)(ct->dp_avg_exec_ns % 1000ULL),
+				       (unsigned long long)(ct->dp_peak_exec_ns / 1000ULL),
+				       (unsigned long long)(ct->dp_peak_exec_ns % 1000ULL));
+			}
+
+			printf("\n--- Per-Pipeline Scheduling Telemetry (%u active) ---\n",
+			       st->num_pipes);
+			for (u = 0; u < st->num_pipes; u++) {
+				struct host_pipe_telem *pt = &st->pipes[u];
+
+				if (!pt->active)
+					continue;
+				printf("  Pipe %2u: core=%u prio=%u per=%uus mem=%s mods=%uLL/%uDP copies=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus xruns=%u\n",
+				       pt->pipeline_id, pt->core_id, pt->priority, pt->period_us,
+				       pt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+				       pt->num_ll_modules, pt->num_dp_modules,
+				       (unsigned long long)pt->copy_iterations,
+				       (unsigned long long)pt->avg_cycles,
+				       (unsigned long long)pt->peak_cycles,
+				       (unsigned long long)pt->total_cycles,
+				       pt->avg_kcps, pt->peak_kcps,
+				       (unsigned long long)(pt->avg_exec_ns / 1000ULL),
+				       (unsigned long long)(pt->avg_exec_ns % 1000ULL),
+				       (unsigned long long)(pt->peak_exec_ns / 1000ULL),
+				       (unsigned long long)(pt->peak_exec_ns % 1000ULL),
+				       pt->xrun_count);
+			}
+
+			printf("\n--- Per-Module LL & DP Scheduling + Entry/Exit Buffer Telemetry (%u active) ---\n",
+			       st->num_mods);
+			for (u = 0; u < st->num_mods; u++) {
+				struct host_mod_telem *mt = &st->mods[u];
+				const char *wname = "comp";
+
+				if (!mt->active)
+					continue;
+
+				if (tp->widget_list.next) {
+					struct list_item *it;
+
+					list_for_item(it, &tp->widget_list) {
+						struct tplg_comp_info *ci =
+							container_of(it, struct tplg_comp_info, item);
+						uint32_t cid = (uint32_t)IPC4_COMP_ID(ci->module_id,
+										      ci->instance_id);
+						if (cid == mt->comp_id) {
+							if (ci->name)
+								wname = ci->name;
+							break;
+						}
+					}
+				} else if (tp->info) {
+					int k;
+
+					for (k = 0; k < tp->info_elems; k++) {
+						uint32_t cid = (uint32_t)IPC4_COMP_ID(
+							tp->info[k].module_id,
+							tp->info[k].instance_id);
+						if (cid == mt->comp_id) {
+							if (tp->info[k].name)
+								wname = tp->info[k].name;
+							break;
+						}
+					}
+				}
+
+				printf("  [0x%06x %-24s] pipe=%u core=%u %s mem=%s iters=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus ibs=%u obs=%u cpc=%u(viol=%u)",
+				       mt->comp_id, wname, mt->pipeline_id, mt->core_id,
+				       mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
+				       mt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
+				       (unsigned long long)mt->iterations,
+				       (unsigned long long)mt->avg_cycles,
+				       (unsigned long long)mt->peak_cycles,
+				       (unsigned long long)mt->total_cycles,
+				       mt->avg_kcps, mt->peak_kcps,
+				       (unsigned long long)(mt->avg_exec_ns / 1000ULL),
+				       (unsigned long long)(mt->avg_exec_ns % 1000ULL),
+				       (unsigned long long)(mt->peak_exec_ns / 1000ULL),
+				       (unsigned long long)(mt->peak_exec_ns % 1000ULL),
+				       mt->ibs, mt->obs, mt->effective_cpc, mt->cpc_violations);
+				if (mt->proc_domain == COMP_PROCESSING_DOMAIN_DP) {
+					printf(" ll_sync=%llu(%llu cyc)",
+					       (unsigned long long)mt->ll_ring_sync_iterations,
+					       (unsigned long long)mt->ll_ring_sync_total_cycles);
+				}
+				if (mt->num_in_pins > 0 && mt->in_pins[0].active) {
+					struct host_mod_pin_telem *pin = &mt->in_pins[0];
+
+					printf(" | IN0: %u->%uB xfer=%uB(tot=%lluB) rms=%d.%02ddBFS",
+					       pin->dp_ring_size ? pin->dp_ring_entry_avail :
+								   pin->entry_avail_bytes,
+					       pin->dp_ring_size ? pin->dp_ring_exit_avail :
+								   pin->exit_avail_bytes,
+					       pin->last_bytes_transferred,
+					       (unsigned long long)pin->total_bytes_transferred,
+					       pin->entry_rms_dbfs_x100 / 100,
+					       abs(pin->entry_rms_dbfs_x100 % 100));
+				}
+				if (mt->num_out_pins > 0 && mt->out_pins[0].active) {
+					struct host_mod_pin_telem *pin = &mt->out_pins[0];
+
+					printf(" | OUT0: %u->%uB xfer=%uB(tot=%lluB) rms=%d.%02ddBFS",
+					       pin->dp_ring_size ? pin->dp_ring_entry_avail :
+								   pin->entry_avail_bytes,
+					       pin->dp_ring_size ? pin->dp_ring_exit_avail :
+								   pin->exit_avail_bytes,
+					       pin->last_bytes_transferred,
+					       (unsigned long long)pin->total_bytes_transferred,
+					       pin->exit_rms_dbfs_x100 / 100,
+					       abs(pin->exit_rms_dbfs_x100 % 100));
+				}
+				printf("\n");
+			}
+			printf("\n");
+		}
+	}
 }
 
 /*
@@ -358,6 +611,8 @@ static int pipline_test(struct testbench_prm *tp)
 		printf("==========================================================\n");
 		printf("		           Test Start %d\n", dp_count);
 		printf("==========================================================\n");
+
+		host_telem_reset();
 
 		if (tp->tplg_file) {
 			err = tb_load_topology(tp);
@@ -485,6 +740,15 @@ int main(int argc, char **argv)
 	if (!tp)
 		return EXIT_FAILURE;
 
+	list_init(&tp->widget_list);
+	list_init(&tp->route_list);
+	list_init(&tp->pcm_list);
+	list_init(&tp->pipeline_list);
+	for (i = 0; i < TB_MAX_INPUT_FILE_NUM; i++)
+		tp->fr[i].id = -1;
+	for (i = 0; i < TB_MAX_OUTPUT_FILE_NUM; i++)
+		tp->fw[i].id = -1;
+
 	/* initialize input and output sample rates, files, etc. */
 	tp->channels_in = TESTBENCH_NCH;
 	tp->copy_check = false;
@@ -514,10 +778,27 @@ int main(int argc, char **argv)
 			FILE *sfp = fopen("/tmp/sof_tb_srv_in.raw", "wb");
 
 			if (sfp) {
-				uint8_t zero[3840] = {0};
+				int16_t wave[1920];
+				int s;
 
+				for (s = 0; s < 1920; s += 2) {
+					/* 1 kHz sine wave at 48 kHz (48-sample period) */
+					static const int16_t lut48[12] = {
+						0, 2129, 4186, 6103, 7812, 9256,
+						10386, 11163, 11560, 11560, 11163, 10386
+					};
+					int idx = (s / 2) % 48;
+					int q = idx / 12;
+					int pos = idx % 12;
+					int16_t v = (q == 0) ? lut48[pos] :
+						    (q == 1) ? lut48[11 - pos] :
+						    (q == 2) ? -lut48[pos] : -lut48[11 - pos];
+
+					wave[s] = v;
+					wave[s + 1] = v;
+				}
 				for (i = 0; i < 20; i++)
-					fwrite(zero, 1, sizeof(zero), sfp);
+					fwrite(wave, 1, sizeof(wave), sfp);
 				fclose(sfp);
 			}
 			for (i = 0; i < TB_MAX_INPUT_FILE_NUM; i++)

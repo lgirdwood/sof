@@ -182,6 +182,7 @@ int tb_set_reset_state(struct testbench_prm *tp);
 int tb_set_mixer_control(struct testbench_prm *tp, struct tb_ctl *ctl, char *control_params);
 int tb_set_running_state(struct testbench_prm *tp);
 int tb_set_up_all_pipelines(struct testbench_prm *tp);
+int tb_configure_audio_params(struct testbench_prm *tp);
 int tb_setup(struct sof *sof, struct testbench_prm *tp);
 bool tb_is_pipeline_enabled(struct testbench_prm *tp, int pipeline_id);
 bool tb_schedule_pipeline_check_state(struct testbench_prm *tp);

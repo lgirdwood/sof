@@ -11,6 +11,7 @@
 #include <sof/schedule/dp_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
 #include <platform/lib/ll_schedule.h>
+#include <platform/lib/telemetry_sched.h>
 #include <sof/lib/cpu.h>
 #include <sof/lib/memory.h>
 #include <sof/list.h>
@@ -127,8 +128,22 @@ static void *dp_thread_fn(void *arg)
 		if (event & DP_TASK_EVENT_PROCESS) {
 			state = task->state;
 			if (task->state == SOF_TASK_STATE_RUNNING) {
+				uint64_t t0, t1;
+				uint32_t core_dp_cnt = 0;
+				struct list_item *it;
+
+				list_for_item(it, &dp_sch->tasks) {
+					struct task *t = container_of(it, struct task, list);
+
+					if (t->core == task->core)
+						core_dp_cnt++;
+				}
 				pthread_mutex_unlock(&dp_sch->lock);
+				t0 = host_telem_timestamp_cycles();
 				state = task_run(task);
+				t1 = host_telem_timestamp_cycles();
+				host_telem_core_dp_run(task->core, core_dp_cnt,
+						       (t1 > t0) ? (t1 - t0) : 1);
 				pthread_mutex_lock(&dp_sch->lock);
 			}
 

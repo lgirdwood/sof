@@ -34,6 +34,18 @@ if [[ -z "${TB_BIN:-}" ]]; then
 	fi
 fi
 
+# Locate sof-tb-ctl binary
+if [[ -z "${TB_CTL_BIN:-}" ]]; then
+	if [[ -x "${SCRIPT_DIR}/build_testbench/sof-tb-ctl" ]]; then
+		TB_CTL_BIN="${SCRIPT_DIR}/build_testbench/sof-tb-ctl"
+	elif [[ -x "${SCRIPT_DIR}/build_testbench/install/bin/sof-tb-ctl" ]]; then
+		TB_CTL_BIN="${SCRIPT_DIR}/build_testbench/install/bin/sof-tb-ctl"
+	else
+		echo "ERROR: sof-tb-ctl binary not found under ${SCRIPT_DIR}/build_testbench" >&2
+		exit 1
+	fi
+fi
+
 TPLG_DIR="${TPLG_DIR:-${SOF_TOP}/tools/build_tools/topology/topology2}"
 DEV_TPLG="${TPLG_DIR}/development"
 PROD_TPLG="${TPLG_DIR}/production"
@@ -43,6 +55,7 @@ TIER_FILTER="all"
 NAME_FILTER=""
 LIST_ONLY=0
 VERBOSE=0
+SINGLE_SESSION=1
 
 usage() {
 	cat <<EOF
@@ -51,6 +64,8 @@ Usage: $(basename "$0") [options]
 Options:
   --tier <1|2|3|4|5|all>  Run only the specified test tier (default: all)
   --filter <regex>        Run only tests whose name matches <regex>
+  --single-session        Run all tests in 1 persistent sof-testbench4 -I session (default)
+  --per-process           Spawn a fresh sof-testbench4 process per test
   --list                  List all registered test cases and exit
   -v, --verbose           Show full testbench output for passing tests
   -h, --help              Show this help message
@@ -66,6 +81,14 @@ while [[ $# -gt 0 ]]; do
 		--filter)
 			NAME_FILTER="$2"
 			shift 2
+			;;
+		--single-session)
+			SINGLE_SESSION=1
+			shift
+			;;
+		--per-process)
+			SINGLE_SESSION=0
+			shift
 			;;
 		--list)
 			LIST_ONLY=1
@@ -88,10 +111,36 @@ while [[ $# -gt 0 ]]; do
 done
 
 WORK_DIR="$(mktemp -d /tmp/sof_tb_suite_XXXXXX)"
+TB_PORT=$((19400 + (RANDOM % 500)))
+TB_SERVER_PID=""
+TB_SERVER_LOG="${WORK_DIR}/persistent_server.log"
+
 cleanup() {
+	if [[ -n "${TB_SERVER_PID}" ]] && kill -0 "${TB_SERVER_PID}" 2>/dev/null; then
+		"${TB_CTL_BIN}" -H 127.0.0.1 -p "${TB_PORT}" quit >/dev/null 2>&1 || true
+		wait "${TB_SERVER_PID}" 2>/dev/null || true
+	fi
 	rm -rf "${WORK_DIR}"
 }
 trap cleanup EXIT
+
+start_persistent_server() {
+	"${TB_BIN}" -I -S "${TB_PORT}" >"${TB_SERVER_LOG}" 2>&1 &
+	TB_SERVER_PID=$!
+	local ready=0
+	for _ in {1..40}; do
+		if "${TB_CTL_BIN}" -H 127.0.0.1 -p "${TB_PORT}" ping >/dev/null 2>&1; then
+			ready=1
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ "${ready}" -ne 1 ]]; then
+		echo "ERROR: persistent sof-testbench4 -I failed to start on port ${TB_PORT}" >&2
+		cat "${TB_SERVER_LOG}" >&2 || true
+		exit 1
+	fi
+}
 
 # Generate deterministic multi-tone PCM input files
 generate_inputs() {
@@ -208,20 +257,36 @@ run_tb_case() {
 
 	local log_file="${WORK_DIR}/log_${name}.txt"
 	local rc=0
-	"${TB_BIN}" -t "${tplg}" -p "${pipelines}" -i "${in_arg}" -o "${out_arg}" "${extra_args[@]}" >"${log_file}" 2>&1 || rc=$?
-
 	local fail_reason=""
-	if [[ "${rc}" -ne 0 ]]; then
-		fail_reason="exit code ${rc}"
-	elif grep -q "^error:" "${log_file}"; then
-		fail_reason="error in testbench output"
-	elif [[ "${name}" != "mod_igo_nr32" ]]; then
-		for of in "${out_files[@]}"; do
-			if [[ ! -s "${of}" ]]; then
-				fail_reason="empty or missing output file $(basename "${of}")"
-				break
+
+	if [[ "${SINGLE_SESSION}" -eq 1 ]]; then
+		if [[ -z "${TB_SERVER_PID}" ]] || ! kill -0 "${TB_SERVER_PID}" 2>/dev/null; then
+			fail_reason="persistent sof-testbench4 server (PID ${TB_SERVER_PID:-none}) is not running"
+		else
+			"${TB_CTL_BIN}" -H 127.0.0.1 -p "${TB_PORT}" \
+				run-test -t "${tplg}" -p "${pipelines}" -i "${in_arg}" -o "${out_arg}" "${extra_args[@]}" \
+				>"${log_file}" 2>&1 || rc=$?
+			if ! kill -0 "${TB_SERVER_PID}" 2>/dev/null; then
+				fail_reason="persistent sof-testbench4 server (PID ${TB_SERVER_PID}) died during test"
 			fi
-		done
+		fi
+	else
+		"${TB_BIN}" -t "${tplg}" -p "${pipelines}" -i "${in_arg}" -o "${out_arg}" "${extra_args[@]}" >"${log_file}" 2>&1 || rc=$?
+	fi
+
+	if [[ -z "${fail_reason}" ]]; then
+		if [[ "${rc}" -ne 0 ]]; then
+			fail_reason="exit code ${rc}"
+		elif grep -q "^error:" "${log_file}"; then
+			fail_reason="error in testbench output"
+		elif [[ "${name}" != "mod_igo_nr32" ]]; then
+			for of in "${out_files[@]}"; do
+				if [[ ! -s "${of}" ]]; then
+					fail_reason="empty or missing output file $(basename "${of}")"
+					break
+				fi
+			done
+		fi
 	fi
 
 	if [[ -z "${fail_reason}" && -n "${expect_regex}" ]]; then
@@ -278,64 +343,94 @@ EOF
 		else
 			TOTAL_RUN=$((TOTAL_RUN + 1))
 			TIER_TOTAL[5]=$((TIER_TOTAL[5] + 1))
-			local port=$((19900 + (RANDOM % 500)))
-			local srv_log="${WORK_DIR}/remote_srv.log"
 			local cli_log="${WORK_DIR}/remote_cli.log"
 			local dot_file="${WORK_DIR}/dapm.dot"
-
-			"${TB_BIN}" -r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
-				-t "${DEV_TPLG}/sof-mtl-nocodec-dp-core-test.tplg" \
-				-p 5,6,7,8,11,12 \
-				-i "${WORK_DIR}/in_48k_2ch_s32.raw,${WORK_DIR}/in_48k_2ch_s32.raw,${WORK_DIR}/in_48k_2ch_s32.raw" \
-				-o "${WORK_DIR}/ro1.raw,${WORK_DIR}/ro2.raw,${WORK_DIR}/ro3.raw" \
-				-S "${port}" -W >"${srv_log}" 2>&1 &
-			local tb_pid=$!
-
-			# Wait for TCP server readiness
-			local ready=0
-			for _ in {1..30}; do
-				if "${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" ping >/dev/null 2>&1; then
-					ready=1
-					break
-				fi
-				sleep 0.1
-			done
-
+			local port="${TB_PORT}"
+			local tb_pid=""
 			local fail_reason=""
-			if [[ "${ready}" -ne 1 ]]; then
-				fail_reason="TCP server did not come up on port ${port}"
+
+			if [[ "${SINGLE_SESSION}" -eq 1 ]]; then
+				if [[ -z "${TB_SERVER_PID}" ]] || ! kill -0 "${TB_SERVER_PID}" 2>/dev/null; then
+					fail_reason="persistent sof-testbench4 server is not running"
+				fi
 			else
-				{
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" info
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" cards
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" pcm-caps
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" dapm "${dot_file}"
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" compr caps
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" kctl list
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" kctl get 1
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" kctl set 1 25 25
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" telem
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" probes avail
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" pcm status
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" shell "pipelines"
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" shell "modules"
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" shell "kernel threads"
-					"${REMOTE_CLI}" -H 127.0.0.1 -p "${port}" shell "quit"
-				} >"${cli_log}" 2>&1 || fail_reason="sof-remote CLI command failed"
+				port=$((19900 + (RANDOM % 500)))
+				local srv_log="${WORK_DIR}/remote_srv.log"
+				"${TB_BIN}" -I -S "${port}" >"${srv_log}" 2>&1 &
+				tb_pid=$!
+				local ready=0
+				for _ in {1..30}; do
+					if "${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" ping >/dev/null 2>&1; then
+						ready=1
+						break
+					fi
+					sleep 0.1
+				done
+				[[ "${ready}" -ne 1 ]] && fail_reason="TCP server did not come up on port ${port}"
 			fi
 
-			wait "${tb_pid}" 2>/dev/null || true
+			if [[ -z "${fail_reason}" ]]; then
+				{
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" io-cfg \
+						-r 48000 -R 48000 -c 2 -n 2 -b S32_LE \
+						-p 5,6,7,8,11,12 \
+						-i "${WORK_DIR}/in_48k_2ch_s32.raw,${WORK_DIR}/in_48k_2ch_s32.raw,${WORK_DIR}/in_48k_2ch_s32.raw" \
+						-o "${WORK_DIR}/ro1.raw,${WORK_DIR}/ro2.raw,${WORK_DIR}/ro3.raw"
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" tplg-load \
+						"${DEV_TPLG}/sof-mtl-nocodec-dp-core-test.tplg" 5,6,7,8,11,12
+					sleep 0.05
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" ping
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" info
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" pm query
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" win-info
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" win-read 0 0 32
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" large-cfg-get 0 0 9 512
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" cards
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" pcm-caps
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" dapm "${dot_file}"
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" compr caps
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" kctl list
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" kctl get 1
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" kctl set 1 25 25
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" telem
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" probes avail
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" probes extract
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" pcm status
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" pipelines
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" modules
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" shell "kernel threads"
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" sched-telem
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" mod-buffers src
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" workload-sim set virtual dram 200 180
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" workload-sim freq 0:400,1:200,2:120
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" workload-sim status
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" tplg-unload
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" workload-sim reset
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" workload-sim disable
+				} >"${cli_log}" 2>&1 || fail_reason="sof-tb-ctl command failed"
+			fi
+
+			if [[ -n "${tb_pid}" ]]; then
+				"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" quit >/dev/null 2>&1 || true
+				wait "${tb_pid}" 2>/dev/null || true
+			fi
 
 			if [[ -z "${fail_reason}" ]]; then
 				if ! grep -q "digraph DAPM" "${dot_file}"; then
 					fail_reason="DAPM DOT graph missing"
 				elif ! grep -q "DP Worker Core 1" "${cli_log}"; then
 					fail_reason="Cross-core DP Worker Core 1 thread missing in telemetry"
+				elif ! grep -q "Per-Module LL & DP Scheduling" "${cli_log}"; then
+					fail_reason="sched-telem output missing in remote shell"
+				elif ! grep -q "DP_RING(" "${cli_log}"; then
+					fail_reason="mod-buffers DP_RING telemetry missing in remote shell"
+				elif ! grep -q "Workload Execution Time Simulation" "${cli_log}"; then
+					fail_reason="workload-sim status output missing in remote shell"
 				fi
 			fi
 
 			if [[ -z "${fail_reason}" ]]; then
-				printf "  [PASS] [T5] %-36s | %-44s | 15 RPCs OK\n" \
+				printf "  [PASS] [T5] %-36s | %-44s | 25 RPCs OK\n" \
 					"remote_tcp_multicore_dp" "Live SOFR TCP control & 3-core telemetry"
 				TOTAL_PASS=$((TOTAL_PASS + 1))
 				TIER_PASS[5]=$((TIER_PASS[5] + 1))
@@ -348,6 +443,106 @@ EOF
 			fi
 		fi
 	fi
+
+	# 5.3 CLI Workload Execution Time Simulation (-w 1 -F 0:400,1:200,2:120 -M dram:160)
+	run_tb_case 5 "workload_sim_cli_dram_multicore" \
+		"CPC Workload Sim (DRAM 1.6x, C0=400/C1=200/C2=120MHz)" \
+		"${DEV_TPLG}/sof-mtl-nocodec-dp-core-test.tplg" "5,6,7,8,11,12" \
+		3 "${WORK_DIR}/in_48k_2ch_s32.raw" 3 \
+		"Mode=VIRTUAL-SIM Mem=DRAM DRAM_Factor=1.60x" \
+		-r 48000 -R 48000 -c 2 -n 2 -b S32_LE -w 1 -F 0:400,1:200,2:120 -M dram:160
+
+	# 5.4 Interactive sof-tb-ctl Batch Script (-f), REPL & Dynamic IPC4 Pipeline/Module Ops
+	if should_run 5 "interactive_tb_ctl_batch_repl"; then
+		if [[ "${LIST_ONLY}" -eq 1 ]]; then
+			printf "  [Tier 5] %-36s : %s\n" "interactive_tb_ctl_batch_repl" "Interactive sof-tb-ctl batch (-f), REPL & dynamic IPC4 ops"
+		else
+			TOTAL_RUN=$((TOTAL_RUN + 1))
+			TIER_TOTAL[5]=$((TIER_TOTAL[5] + 1))
+			local batch_file="${WORK_DIR}/tb_batch.cmd"
+			local batch_log="${WORK_DIR}/tb_batch.log"
+			local port="${TB_PORT}"
+			local tb_pid=""
+			local fail_reason=""
+
+			if [[ "${SINGLE_SESSION}" -ne 1 ]]; then
+				port=$((19900 + (RANDOM % 500)))
+				"${TB_BIN}" -I -S "${port}" >"${WORK_DIR}/batch_srv.log" 2>&1 &
+				tb_pid=$!
+				for _ in {1..30}; do
+					"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" ping >/dev/null 2>&1 && break
+					sleep 0.05
+				done
+			fi
+
+			cat >"${batch_file}" <<EOF
+ping
+info
+core enable 1
+core enable 2
+ppl-create 99 0 1
+mod-init 0x2 0 99 1 0
+mod-init 0x3 0 99 1 0
+mod-bind 0x2 0 0 0x3 0 0
+pipelines
+ppl-state 99 paused
+ppl-state 99 reset
+mod-unbind 0x2 0 0 0x3 0 0
+mod-delete 0x2 0
+mod-delete 0x3 0
+ppl-delete 99
+winstream version
+win-write 1 0 0xdeadbeef
+pcm start-tone hw:0,0 1000 48000 2
+pcm status
+pcm stop-tone
+pause
+step 2
+resume
+tplg-unload
+EOF
+			"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" -f "${batch_file}" >"${batch_log}" 2>&1 || \
+				fail_reason="sof-tb-ctl -f batch script failed"
+
+			if [[ -z "${fail_reason}" ]]; then
+				"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" repl >>"${batch_log}" 2>&1 <<EOF || fail_reason="sof-tb-ctl repl failed"
+ping
+info
+exit
+EOF
+			fi
+
+			if [[ -n "${tb_pid}" ]]; then
+				"${TB_CTL_BIN}" -H 127.0.0.1 -p "${port}" quit >/dev/null 2>&1 || true
+				wait "${tb_pid}" 2>/dev/null || true
+			fi
+
+			if [[ -z "${fail_reason}" ]]; then
+				if ! grep -q "CREATE_PIPELINE(inst=99, prio=0, core=1) -> status=0 (IPC4_SUCCESS)" "${batch_log}"; then
+					fail_reason="Dynamic CREATE_PIPELINE failed"
+				elif ! grep -q "MOD_INIT_INSTANCE(mod=0x2, inst=0, ppl=99, core=1, dom=LL) -> status=0 (IPC4_SUCCESS)" "${batch_log}"; then
+					fail_reason="Dynamic MOD_INIT_INSTANCE failed"
+				elif ! grep -q "MOD_BIND(0x2:0 q0 -> 0x3:0 q0) -> status=0 (IPC4_SUCCESS)" "${batch_log}"; then
+					fail_reason="Dynamic MOD_BIND failed"
+				elif ! grep -q "DELETE_PIPELINE(inst=99) -> status=0 (IPC4_SUCCESS)" "${batch_log}"; then
+					fail_reason="Dynamic DELETE_PIPELINE failed"
+				fi
+			fi
+
+			if [[ -z "${fail_reason}" ]]; then
+				printf "  [PASS] [T5] %-36s | %-44s | Batch+REPL OK\n" \
+					"interactive_tb_ctl_batch_repl" "Interactive sof-tb-ctl batch, REPL & IPC4 ops"
+				TOTAL_PASS=$((TOTAL_PASS + 1))
+				TIER_PASS[5]=$((TIER_PASS[5] + 1))
+			else
+				printf "  [FAIL] [T5] %-36s | %-44s | %s\n" \
+					"interactive_tb_ctl_batch_repl" "Interactive sof-tb-ctl batch, REPL & IPC4 ops" "${fail_reason}"
+				cat "${batch_log}" >&2 || true
+				TOTAL_FAIL=$((TOTAL_FAIL + 1))
+				FAILED_TESTS+=("interactive_tb_ctl_batch_repl")
+			fi
+		fi
+	fi
 }
 
 # ==============================================================================
@@ -355,12 +550,19 @@ EOF
 # ==============================================================================
 if [[ "${LIST_ONLY}" -eq 0 ]]; then
 	generate_inputs
+	if [[ "${SINGLE_SESSION}" -eq 1 ]]; then
+		start_persistent_server
+	fi
 fi
 
 echo "=========================================================================================================="
 echo " SOF Testbench4 Comprehensive Topology & Module Test Suite"
 echo " Binary   : ${TB_BIN}"
+echo " Ctl Tool : ${TB_CTL_BIN}"
 echo " Topologies: ${TPLG_DIR}"
+if [[ "${SINGLE_SESSION}" -eq 1 && -n "${TB_SERVER_PID}" ]]; then
+	echo " Session  : Single Persistent sof-testbench4 -I Server (PID ${TB_SERVER_PID}, TCP port ${TB_PORT}, 0 restarts)"
+fi
 echo "=========================================================================================================="
 
 # ------------------------------------------------------------------------------
@@ -602,6 +804,13 @@ if [[ "${LIST_ONLY}" -eq 1 ]]; then
 	exit 0
 fi
 
+if [[ "${SINGLE_SESSION}" -eq 1 && -n "${TB_SERVER_PID}" ]]; then
+	if ! kill -0 "${TB_SERVER_PID}" 2>/dev/null; then
+		echo "ERROR: persistent sof-testbench4 server (PID ${TB_SERVER_PID}) died before suite completion!" >&2
+		TOTAL_FAIL=$((TOTAL_FAIL + 1))
+	fi
+fi
+
 echo ""
 echo "=========================================================================================================="
 echo " Test Suite Summary by Tier"
@@ -612,6 +821,9 @@ printf "  Tier 3 (LL + DP & Multi-Thread DP Combinations) : %2d / %2d passed\n" 
 printf "  Tier 4 (Multi-Core LL & Cross-Core DP 0/1/2)    : %2d / %2d passed\n" "${TIER_PASS[4]}" "${TIER_TOTAL[4]}"
 printf "  Tier 5 (Runtime Controls & Remote TCP Server)   : %2d / %2d passed\n" "${TIER_PASS[5]}" "${TIER_TOTAL[5]}"
 echo "----------------------------------------------------------------------------------------------------------"
+if [[ "${SINGLE_SESSION}" -eq 1 && -n "${TB_SERVER_PID}" ]]; then
+	printf "  Session Mode                                    : 1 persistent sof-testbench4 process (PID %s, 0 restarts)\n" "${TB_SERVER_PID}"
+fi
 printf "  TOTAL                                           : %2d / %2d passed (%d failed)\n" \
 	"${TOTAL_PASS}" "${TOTAL_RUN}" "${TOTAL_FAIL}"
 echo "=========================================================================================================="

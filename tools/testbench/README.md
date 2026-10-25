@@ -48,6 +48,24 @@
    * When built for the Xtensa simulator (`xt-run` via `scripts/rebuild-testbench.sh -p <platform>`, or manually with `-DTESTBENCH_XTENSA_SIM=ON`), CMake automatically selects the pure standard-C cooperative schedulers (`ll_schedule.c` and `dp_schedule.c`) instead of `ll_schedule_pthread.c` and `dp_schedule_pthread.c`.
    * This eliminates dependencies on `<pthread.h>`, `-lpthread`, `<sched.h>`, and `clock_gettime` that are unavailable in the Xtensa newlib (`-mlsp=sim`) runtime, while executing DP modules synchronously inside `scheduler_dp_ll_tick()` so their instruction cycles are included in `XT_RSR_CCOUNT()` profiling.
 
+#### Per-Core, Per-Pipeline, and Per-Module Scheduling & Buffer Entry/Exit Telemetry (`telemetry_sched.c`)
+
+`sof-testbench4` instruments every DSP core's LL and DP schedulers, every pipeline walk (`pipeline_copy()`), and every LL (`comp_copy()`) and DP (`dp_task_run()`) module execution:
+
+ * **Per-Core LL & DP Scheduler Telemetry**: Tracks LL tick counts, active LL tasks, LL average/peak/total DSP cycles and KCPS, DP thread run counts, active DP threads, DP average/peak/total DSP cycles and KCPS, and combined core utilization (`total_util_x100`) on every DSP core (`0 .. CONFIG_CORE_COUNT - 1`).
+ * **Per-Pipeline Telemetry**: Tracks copy iterations, priority, period, core assignment, LL and DP module counts, average/peak/total cycles, KCPS, and XRUN counts for each active pipeline.
+ * **Per-Module Scheduling & Buffer Entry/Exit Telemetry**:
+   * Tracks `iterations`, `last/avg/peak/total_cycles`, `avg/peak_kcps`, `ibs`, `obs`, `cpc` budget and `cpc_violations`, plus LL ring-buffer sync iterations and cycles for DP modules.
+   * On **entry** (before processing) and **exit** (after processing) of every module's `copy()` / `dp_task_run()` call, captures for each input (producer) and output (consumer) pin:
+     * Primary LL `comp_buffer` fill levels (`entry_avail_bytes`, `entry_free_bytes`, `exit_avail_bytes`, `exit_free_bytes`) and secondary DP `ring_buffer` fill levels (`dp_ring_size`, `dp_ring_entry_avail`, `dp_ring_exit_avail`).
+     * Exact bytes consumed/produced (`last_bytes_transferred`, `total_bytes_transferred`).
+     * Signal levels in `0.01 dBFS` (`entry_rms_dbfs_x100`, `entry_peak_dbfs_x100`, `exit_rms_dbfs_x100`, `exit_peak_dbfs_x100`) and rolling S16-normalized sample taps (`entry_samples[64]`, `exit_samples[64]`).
+ * **CLI & Remote Exposure**: Printed automatically at the end of every testbench run, exposed in SRAM Windows 2 & 3 and `SOF_NET_OP_TELEM_SNAPSHOT`, and queryable live via `sof-remote shell "sched-telem"` and `sof-remote shell "mod-buffers [comp_id|name]"`.
+ * **Accurate CPC, Core Frequency & SRAM/DRAM Workload Execution Time Simulation**:
+   * Enabled via `-w <0|1|2|off|virtual|realtime>`, `-F <freq_mhz | core:freq_mhz,...>`, and `-M <sram|dram[:penalty_x100[:cycles_per_word]]>` or dynamically over TCP via `SOF_NET_OP_WORKLOAD_SIM_CFG` (`0x0029`) and `sof-remote shell "workload-sim ..."`.
+   * Computes module cycle consumption from each module's topology `SOF_TKN_COMP_CPC` (`base_cfg.cpc`, per-module override, or calibrated module-type CPC), scales cycles by memory residency (`SRAM` 1.00x vs `DRAM` cache/bus stall multiplier + per-word transfer penalty), and computes execution time ($T_{\text{exec}} = \text{cycles} / f_{\text{core}}$), core utilization %, and 1 ms LL tick deadline overruns against each core's target clock frequency.
+   * Supports both fast virtual cycle/time accounting (`-w 1` / `virtual`) and real-time wall-clock pacing (`-w 2` / `realtime`).
+
 #### Network Remote Control & Telemetry Interface (`remote_server.c`)
 
 `sof-testbench4` exposes the `sof-remote` TCP binary framing protocol (`SOF_NET_MAGIC = 0x534F4652` `'SOFR'`, `SOF_NET_VERSION = 1`, default TCP port `9998`) via `-S <port>` and `-W`:
@@ -57,7 +75,8 @@
    * `SOF_NET_OP_IPC_TX` (direct IPC4 message dispatch) and `SOF_NET_OP_IPC_LARGE_CFG` (BaseFW params 9, 12, 14, 15, 17, 18, 30 and live module `LARGE_CONFIG_GET`/`SET`)
    * `SOF_NET_OP_WIN_INFO`, `SOF_NET_OP_WIN_READ`, `SOF_NET_OP_WIN_WRITE`, `SOF_NET_OP_WINSTREAM_IO` (emulated SRAM Windows 0–3 and debug slots)
    * `SOF_NET_OP_TELEM_SNAPSHOT` (single-RPC composite telemetry snapshot consumed by `tools/softop/softop.py` and `sof-remote telem`)
-   * `SOF_NET_OP_SHELL_EXEC` (`info`, `pipelines`, `modules`, `tplg-load <file> [p1,p2,...]`, `ppl-create`, `ppl-state`, `ppl-delete`, `mod-bind`, `mod-unbind`, `mod-delete`, `controls`, live `amixer cset ...`, live `sof-ctl ...`, `stats`, `heap`, `kernel cycles`, `kernel threads`, `pause`, `resume`, `step [N]`, `loglevel <0..4>`, `quit`)
+   * `SOF_NET_OP_WORKLOAD_SIM_CFG` (`0x0029`, query/configure CPC workload execution simulation mode, SRAM/DRAM residency, DRAM stall multiplier, per-core target clock frequencies, and per-module CPC/memory overrides via `sof-remote workload-sim ...`)
+   * `SOF_NET_OP_SHELL_EXEC` (`info`, `pipelines`, `modules`, `tplg-load <file> [p1,p2,...]`, `ppl-create`, `ppl-state`, `ppl-delete`, `mod-bind`, `mod-unbind`, `mod-delete`, `controls`, live `amixer cset ...`, live `sof-ctl ...`, `stats`, `heap`, `sched-telem`, `sched-telem-reset`, `workload-sim [status|enable|disable|freq|mem|mod|reset]`, `mod-buffers [id|name]`, `kernel cycles`, `kernel threads`, `pause`, `resume`, `step [N]`, `loglevel <0..4>`, `quit`)
    * `SOF_NET_OP_LLEXT_LOAD` (upload and load dynamic `.so` / `.llext` module images via `dlopen` / LLEXT table registration)
    * `SOF_NET_OP_PROBE_CTL` (enumerate and read inter-component `struct comp_buffer` audio streams as probe points)
    * `SOF_NET_OP_PCM_CTL` (`start-tone`, `stop-tone`, `status`, and `capture` from output streams)
@@ -86,6 +105,9 @@ Options to control test:
   -s <script file to set controls, with amixer and sleep commands>
   -S <port> Start sof-remote TCP server on <port> (default port: 9998)
   -W Keep testbench running continuously for remote network control
+  -w <0|1|2|off|virtual|realtime> Enable CPC workload execution time simulation
+  -F <freq_mhz | core:freq_mhz,...> Set target DSP core clock frequency in MHz
+  -M <sram|dram[:penalty_x100[:cycles_per_word]]> Set workload memory domain
 
 Options for input and output format override:
   -b <input_format>, S16_LE, S24_LE, or S32_LE
@@ -187,6 +209,8 @@ tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl list
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl get 1
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 kctl set 1 28 28
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "pipelines"
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "sched-telem"
+tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "mod-buffers"
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "controls"
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 shell "amixer cset name=\"Pre Mixer Analog Playback Volume\" 20,20"
 tools/sof-remote-server/sof-remote -H 127.0.0.1 -p 9998 pcm start-tone hw:0,0 1000

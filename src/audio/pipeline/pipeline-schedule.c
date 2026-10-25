@@ -31,6 +31,10 @@
 #include <stdint.h>
 #include <sof/audio/module_adapter/module/generic.h>
 
+#if CONFIG_LIBRARY
+#include <platform/lib/telemetry_sched.h>
+#endif
+
 LOG_MODULE_DECLARE(pipe, CONFIG_SOF_LOG_LEVEL);
 
 SOF_DEFINE_REG_UUID(pipe_task);
@@ -577,9 +581,23 @@ void pipeline_comp_ll_task_free(struct pipeline *p)
 static enum task_state dp_task_run(void *data)
 {
 	struct processing_module *mod = data;
+#if CONFIG_LIBRARY
+	uint32_t i;
+	uint64_t telem_start;
+
+	for (i = 0; i < mod->num_of_sources; i++)
+		source_reset_num_of_processed_bytes(mod->sources[i]);
+	for (i = 0; i < mod->num_of_sinks; i++)
+		sink_reset_num_of_processed_bytes(mod->sinks[i]);
+
+	telem_start = host_telem_mod_entry(mod->dev, true);
+#endif
 
 	int ret = module_process_sink_src(mod, mod->sources, mod->num_of_sources,
 					  mod->sinks, mod->num_of_sinks);
+#if CONFIG_LIBRARY
+	host_telem_mod_exit(mod->dev, true, telem_start, ret);
+#endif
 	if (ret)
 		pipeline_comp_copy_error_notify(mod->dev, ret);
 

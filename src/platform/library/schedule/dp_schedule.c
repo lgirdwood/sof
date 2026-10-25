@@ -8,6 +8,7 @@
 #include <sof/schedule/schedule.h>
 #include <sof/schedule/dp_schedule.h>
 #include <sof/schedule/ll_schedule_domain.h>
+#include <platform/lib/telemetry_sched.h>
 #include <sof/lib/cpu.h>
 #include <sof/lib/memory.h>
 #include <sof/list.h>
@@ -74,7 +75,15 @@ void scheduler_dp_ll_tick(void)
 				}
 
 				host_cpu_set_id(curr_task->core);
-				state = task_run(curr_task);
+				{
+					uint64_t t0 = host_telem_timestamp_cycles();
+					uint64_t t1;
+
+					state = task_run(curr_task);
+					t1 = host_telem_timestamp_cycles();
+					host_telem_core_dp_run(curr_task->core, 1,
+							       (t1 > t0) ? (t1 - t0) : 1);
+				}
 				host_cpu_set_id(0);
 
 				if (curr_task->state == SOF_TASK_STATE_RUNNING) {
