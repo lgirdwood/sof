@@ -1691,11 +1691,15 @@ class TopologyGraphCanvas(Gtk.Widget):
         rrect: Gsk.RoundedRect,
         is_selected: bool,
     ) -> None:
-        """Render interactive Testbench Host Source/Sink card with pipeline radio and File/ALSA selector."""
+        """Render interactive Testbench Host Source/Sink card with pipeline radio, I/O Mode Enum, and File/ALSA/SigGen selector."""
         is_enabled = str(node.config.get_scalar("enabled", "false")).lower() == "true"
+        is_source = node.class_name == "testbench-source"
         io_type = str(node.config.get_scalar("io_type", "file")).lower()
+        if not is_source and io_type == "sig_gen":
+            io_type = "file"
         file_path = str(node.config.get_scalar("file_path", "audio.wav"))
         alsa_pcm = str(node.config.get_scalar("alsa_pcm", "default"))
+        sig_type = str(node.config.get_scalar("signal_type", "sine_997")).lower()
         pipes_str = str(node.config.get_scalar("target_pipelines", ""))
 
         header_col = rgba(0.14, 0.58, 0.38, 1.0) if is_enabled else rgba(0.24, 0.29, 0.38, 1.0)
@@ -1727,37 +1731,50 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_layout(title_layout, TEXT_WHITE)
         snapshot.restore()
 
-        # Row 1: Mode radio pills ([ ● File ]  [ ○ ALSA PCM ])
+        # Row 1: I/O Mode Enum Control (File / ALSA PCM / Signal Generator)
         pill_y = node.y + 31.0
-        pill_h = 19.0
-        avail_w = node.width - 26.0
-        file_pw = round(avail_w * 0.46, 1)
-        alsa_pw = round(avail_w - file_pw, 1)
-        for mode_key, label_txt, px_off, pw in (
-            ("file", "File", 10.0, file_pw),
-            ("alsa_pcm", "ALSA PCM", 16.0 + file_pw, alsa_pw),
-        ):
-            active_mode = io_type == mode_key
-            p_rect = Graphene.Rect.alloc()
-            p_rect.init(node.x + px_off, pill_y, pw, pill_h)
-            p_rr = Gsk.RoundedRect()
-            p_rr.init_from_rect(p_rect, 4.5)
-            p_bg = rgba(0.20, 0.48, 0.72, 0.95) if active_mode else rgba(0.17, 0.20, 0.26, 0.92)
-            snapshot.push_rounded_clip(p_rr)
-            snapshot.append_color(p_bg, p_rect)
-            snapshot.pop()
-            p_bcol = rgba(0.42, 0.76, 1.0, 0.95) if active_mode else rgba(0.28, 0.33, 0.42, 0.85)
-            snapshot.append_border(p_rr, [1.0, 1.0, 1.0, 1.0], [p_bcol, p_bcol, p_bcol, p_bcol])
+        pill_h = 20.0
+        mode_rect = Graphene.Rect.alloc()
+        mode_rect.init(node.x + 10.0, pill_y, node.width - 20.0, pill_h)
+        mode_rr = Gsk.RoundedRect()
+        mode_rr.init_from_rect(mode_rect, 4.5)
+        mode_bg = (
+            rgba(0.16, 0.34, 0.54, 0.95)
+            if io_type == "sig_gen"
+            else rgba(0.14, 0.22, 0.34, 0.95)
+        )
+        snapshot.push_rounded_clip(mode_rr)
+        snapshot.append_color(mode_bg, mode_rect)
+        snapshot.pop()
+        mode_bcol = (
+            rgba(0.38, 0.78, 1.0, 0.95)
+            if io_type == "sig_gen"
+            else rgba(0.34, 0.56, 0.82, 0.92)
+        )
+        snapshot.append_border(mode_rr, [1.0, 1.0, 1.0, 1.0], [mode_bcol, mode_bcol, mode_bcol, mode_bcol])
 
-            dot_prefix = "● " if active_mode else "○ "
-            m_layout = self._get_pango_layout(dot_prefix + label_txt, size_pt=7, bold=active_mode)
-            snapshot.save()
-            pt.init(node.x + px_off + 7.0, pill_y + 3.0)
-            snapshot.translate(pt)
-            snapshot.append_layout(m_layout, TEXT_WHITE if active_mode else TEXT_MUTED)
-            snapshot.restore()
+        mode_names = {
+            "file": "Audio File",
+            "alsa_pcm": "ALSA PCM",
+            "sig_gen": "Signal Generator",
+        }
+        prefix_lbl = "Source" if is_source else "Sink"
+        mode_txt = f"{prefix_lbl}: {mode_names.get(io_type, 'Audio File')}"
+        m_layout = self._get_pango_layout(mode_txt, size_pt=7, bold=True)
+        snapshot.save()
+        pt.init(node.x + 16.0, pill_y + 3.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(m_layout, TEXT_WHITE)
+        snapshot.restore()
 
-        # Row 2: Clickable File / ALSA PCM selector box
+        m_caret = self._get_pango_layout("▾", size_pt=7, bold=True)
+        snapshot.save()
+        pt.init(node.x + node.width - 22.0, pill_y + 3.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(m_caret, BADGE_FG)
+        snapshot.restore()
+
+        # Row 2: Clickable File / ALSA PCM / Signal Type selector box
         sel_y = node.y + 54.0
         sel_h = 20.0
         sel_rect = Graphene.Rect.alloc()
@@ -1767,17 +1784,24 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.push_rounded_clip(sel_rr)
         snapshot.append_color(rgba(0.08, 0.10, 0.14, 0.95), sel_rect)
         snapshot.pop()
-        sel_bcol = rgba(0.34, 0.44, 0.58, 0.95)
+        sel_bcol = (
+            rgba(0.30, 0.72, 0.88, 0.95)
+            if io_type == "sig_gen"
+            else rgba(0.34, 0.44, 0.58, 0.95)
+        )
         snapshot.append_border(sel_rr, [1.0, 1.0, 1.0, 1.0], [sel_bcol, sel_bcol, sel_bcol, sel_bcol])
 
-        if io_type == "file":
+        if io_type == "sig_gen":
+            sig_short = self.get_signal_type_short_label(sig_type)
+            sel_txt = f"Sig: {sig_short}"
+        elif io_type == "alsa_pcm":
+            sel_txt = f"PCM: {alsa_pcm}"
+        else:
             disp_val = os.path.basename(file_path) or file_path
             sel_txt = f"File: {disp_val}"
-        else:
-            sel_txt = f"PCM: {alsa_pcm}"
         if len(sel_txt) > 26:
             sel_txt = sel_txt[:24] + "…"
-        sel_layout = self._get_pango_layout(sel_txt, size_pt=7, bold=False)
+        sel_layout = self._get_pango_layout(sel_txt, size_pt=7, bold=(io_type == "sig_gen"))
         snapshot.save()
         pt.init(node.x + 16.0, sel_y + 3.0)
         snapshot.translate(pt)
@@ -2060,34 +2084,16 @@ class TopologyGraphCanvas(Gtk.Widget):
                 if 0.0 <= ly <= 26.0:
                     self.select_testbench_io_radio(nid)
                     return
-                # Row 1: [ File ] vs [ ALSA PCM ] mode pills
-                if 30.0 <= ly <= 51.0:
-                    avail_w = node.width - 26.0
-                    file_pw = round(avail_w * 0.46, 1)
-                    if 10.0 <= lx <= 10.0 + file_pw:
-                        if (node.config.get_scalar("io_type") or "").strip().lower() != "file":
-                            self.record_undo_snapshot(f"Set {node.title} mode to File")
-                            node.config.set_scalar("io_type", "file", origin="instance")
-                            self.vm.dirty = True
-                            self.select_node(nid)
-                            if self.on_graph_modified:
-                                self.on_graph_modified()
-                            self.queue_draw()
-                        return
-                    if 16.0 + file_pw <= lx <= node.width - 10.0:
-                        if (node.config.get_scalar("io_type") or "").strip().lower() != "alsa_pcm":
-                            self.record_undo_snapshot(f"Set {node.title} mode to ALSA PCM")
-                            node.config.set_scalar("io_type", "alsa_pcm", origin="instance")
-                            self.vm.dirty = True
-                            self.select_node(nid)
-                            if self.on_graph_modified:
-                                self.on_graph_modified()
-                            self.queue_draw()
-                        return
-                # Row 2: Selector box click -> open FileChooser or ALSA PCM popover
+                # Row 1: I/O Mode Enum Control (File / ALSA PCM / Signal Generator)
+                if 30.0 <= ly <= 51.0 and 10.0 <= lx <= node.width - 10.0:
+                    self._open_tb_io_type_enum_popover(node, sx, sy)
+                    return
+                # Row 2: Selector box click -> open FileChooser, ALSA PCM popover, or Signal Type Enum popover
                 if 53.0 <= ly <= 75.0 and 10.0 <= lx <= node.width - 10.0:
                     io_type = (node.config.get_scalar("io_type") or "file").strip().lower()
-                    if io_type == "alsa_pcm":
+                    if io_type == "sig_gen" and node.class_name == "testbench-source":
+                        self._open_tb_sig_gen_popover(node, sx, sy)
+                    elif io_type == "alsa_pcm":
                         self._open_tb_alsa_popover(node, sx, sy)
                     else:
                         self._open_tb_file_chooser(node)
@@ -3562,6 +3568,160 @@ class TopologyGraphCanvas(Gtk.Widget):
         entry.connect("activate", _apply)
         apply_btn.connect("clicked", _apply)
         box.append(apply_btn)
+
+        pop.set_child(box)
+        pop.connect("closed", lambda p: p.unparent())
+        pop.popup()
+
+    SIGNAL_TYPE_OPTIONS: List[Tuple[str, str, str]] = [
+        ("sine_997", "Sine 997 Hz", "Sine 997 Hz (-6 dBFS)"),
+        ("sine_1000", "Sine 1 kHz", "Sine 1 kHz (-6 dBFS)"),
+        ("sine_440", "Sine 440 Hz", "Sine 440 Hz (-6 dBFS)"),
+        ("chirp", "Chirp 100-12kHz", "Chirp Sweep 100 Hz – 12 kHz"),
+        ("multitone", "Multitone", "Multitone (250 Hz + 997 Hz + 4 kHz)"),
+        ("square", "Square 500 Hz", "Square Wave 500 Hz"),
+        ("sawtooth", "Sawtooth 500 Hz", "Sawtooth Wave 500 Hz"),
+        ("noise", "White Noise", "White Noise (-9 dBFS)"),
+        ("pink_noise", "Pink Noise", "Pink Noise (1/f Spectrum)"),
+        ("impulse", "Impulse Train", "Dirac Impulse Train (20 Hz)"),
+        ("remote_tone", "Remote 1kHz Tone", "SOFR Remote 1 kHz Tone"),
+    ]
+
+    @classmethod
+    def get_signal_type_short_label(cls, sig_type: str) -> str:
+        """Return compact human-readable label for a signal_type key."""
+        key = (sig_type or "sine_997").strip().lower()
+        for skey, short_lbl, _full_lbl in cls.SIGNAL_TYPE_OPTIONS:
+            if skey == key:
+                return short_lbl
+        return sig_type or "Sine 997 Hz"
+
+    def _open_tb_io_type_enum_popover(self, node: GraphNode, sx: float, sy: float) -> None:
+        """Open a GTK4 Enum Popover at (sx, sy) to select I/O mode (Audio File, ALSA PCM, or Signal Generator)."""
+        is_source = node.class_name == "testbench-source"
+        cur_mode = (node.config.get_scalar("io_type") or "file").strip().lower()
+        if not is_source and cur_mode == "sig_gen":
+            cur_mode = "file"
+
+        options: List[Tuple[str, str]] = [
+            ("file", "Audio File (.wav / .raw)"),
+            ("alsa_pcm", "ALSA PCM Device"),
+        ]
+        if is_source:
+            options.append(("sig_gen", "Signal Generator"))
+
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x = int(sx)
+        rect.y = int(sy)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        hdr = Gtk.Label(
+            label=f"{node.title} — {'Source' if is_source else 'Sink'} I/O Mode",
+            xalign=0.0,
+        )
+        hdr.add_css_class("heading")
+        box.append(hdr)
+
+        for mode_key, mode_label in options:
+            prefix = "● " if mode_key == cur_mode else "○ "
+            btn = Gtk.Button(label=f"{prefix}{mode_label}")
+            if mode_key == cur_mode:
+                btn.add_css_class("suggested-action")
+
+            def _on_pick(_b: Gtk.Button, chosen: str = mode_key) -> None:
+                if chosen != cur_mode:
+                    self.record_undo_snapshot(f"Set {node.title} I/O mode to {chosen}")
+                    node.config.set_scalar(
+                        "io_type",
+                        chosen,
+                        origin="instance",
+                        valid_values=["file", "alsa_pcm", "sig_gen"] if is_source else ["file", "alsa_pcm"],
+                    )
+                    if chosen == "sig_gen" and not node.config.get_scalar("signal_type"):
+                        node.config.set_scalar(
+                            "signal_type",
+                            "sine_997",
+                            category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                            origin="instance",
+                            valid_values=[opt[0] for opt in self.SIGNAL_TYPE_OPTIONS],
+                        )
+                    if self.vm:
+                        self.vm.dirty = True
+                    self.select_node(node.id)
+                    if self.on_graph_modified:
+                        self.on_graph_modified()
+                    self.queue_draw()
+                pop.popdown()
+
+            btn.connect("clicked", _on_pick)
+            box.append(btn)
+
+        pop.set_child(box)
+        pop.connect("closed", lambda p: p.unparent())
+        pop.popup()
+
+    def _open_tb_sig_gen_popover(self, node: GraphNode, sx: float, sy: float) -> None:
+        """Open a GTK4 Enum Popover at (sx, sy) to select Signal Generator waveform type."""
+        cur_sig = (node.config.get_scalar("signal_type") or "sine_997").strip().lower()
+
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x = int(sx)
+        rect.y = int(sy)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        hdr = Gtk.Label(
+            label=f"{node.title} — Signal Generator Type",
+            xalign=0.0,
+        )
+        hdr.add_css_class("heading")
+        box.append(hdr)
+
+        for sig_key, _short_lbl, full_lbl in self.SIGNAL_TYPE_OPTIONS:
+            prefix = "● " if sig_key == cur_sig else "○ "
+            btn = Gtk.Button(label=f"{prefix}{full_lbl}")
+            if sig_key == cur_sig:
+                btn.add_css_class("suggested-action")
+
+            def _on_pick_sig(_b: Gtk.Button, chosen_sig: str = sig_key) -> None:
+                self.record_undo_snapshot(f"Set {node.title} signal type to {chosen_sig}")
+                node.config.set_scalar(
+                    "signal_type",
+                    chosen_sig,
+                    category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                    origin="instance",
+                    valid_values=[opt[0] for opt in self.SIGNAL_TYPE_OPTIONS],
+                )
+                node.config.set_scalar("io_type", "sig_gen", origin="instance")
+                if self.vm:
+                    self.vm.dirty = True
+                self.select_node(node.id)
+                if self.on_graph_modified:
+                    self.on_graph_modified()
+                self.queue_draw()
+                pop.popdown()
+
+            btn.connect("clicked", _on_pick_sig)
+            box.append(btn)
 
         pop.set_child(box)
         pop.connect("closed", lambda p: p.unparent())

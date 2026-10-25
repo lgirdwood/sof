@@ -98,6 +98,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self._rt_poll_busy: bool = False
         self.graph_tabs: List[GraphTabPage] = []
         self._new_file_counter: int = 0
+        self.target_platform: str = "mtl"
+        self.target_harness_kind: str = "hda_analog"
+        self.target_platform_def_path: str = "platform/intel/mtl.conf"
+        self.target_variant_name: str = "sof-hda-generic"
         self._fallback_canvas = TopologyGraphCanvas(
             on_selection_changed=self._on_canvas_selection_changed,
             on_graph_modified=self._on_graph_modified,
@@ -230,8 +234,37 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.add_action(act)
         return act
 
+    def _register_stateful_str_action(
+        self,
+        name: str,
+        initial_val: str,
+        callback: Callable[[str], None],
+    ) -> Gio.SimpleAction:
+        act = Gio.SimpleAction.new_stateful(
+            name,
+            GLib.VariantType.new("s"),
+            GLib.Variant.new_string(initial_val),
+        )
+
+        def on_activate(action: Gio.SimpleAction, param: Optional[GLib.Variant]) -> None:
+            if param is None:
+                return
+            val = param.get_string()
+            action.set_state(GLib.Variant.new_string(val))
+            callback(val)
+
+        act.connect("activate", on_activate)
+        self.add_action(act)
+        return act
+
+    @staticmethod
+    def _append_str_action_item(menu: Gio.Menu, label: str, action_name: str, target_val: str) -> None:
+        item = Gio.MenuItem.new(label, None)
+        item.set_action_and_target_value(action_name, GLib.Variant.new_string(target_val))
+        menu.append_item(item)
+
     def _build_menubar(self) -> Gtk.PopoverMenuBar:
-        """Create the main application Gtk.PopoverMenuBar with File, Edit, and View menus."""
+        """Create the main application Gtk.PopoverMenuBar with File, Edit, View, and Target menus."""
         # Register window Gio.SimpleActions
         self._register_win_action("new_module", lambda: self.action_new_module())
         self._register_win_action("new_feature_topology", lambda: self.action_new_feature_topology())
@@ -266,6 +299,29 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             "toggle_fullscreen",
             lambda: self.unfullscreen() if self.is_fullscreen() else self.fullscreen(),
         )
+
+        # Target Menu Actions
+        self.target_platform_action = self._register_stateful_str_action(
+            "select_target_platform",
+            self.target_platform,
+            self.action_select_target_platform,
+        )
+        self.target_harness_action = self._register_stateful_str_action(
+            "select_target_harness",
+            self.target_harness_kind,
+            self.action_select_target_harness,
+        )
+        self.target_platform_def_action = self._register_stateful_str_action(
+            "select_platform_def",
+            self.target_platform_def_path,
+            self.action_select_platform_def,
+        )
+        self.target_variant_action = self._register_stateful_str_action(
+            "select_target_variant",
+            self.target_variant_name,
+            self.action_select_target_variant,
+        )
+        self._register_win_action("open_active_platform_def", lambda: self.action_open_active_platform_def())
 
         app = self.get_application()
         if app is not None:
@@ -361,9 +417,188 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         menubar_model.append_submenu("View", view_menu)
 
+        # 4. Target Menu (Platform Architecture)
+        self.target_menu = Gio.Menu.new()
+        self._populate_target_menu()
+        menubar_model.append_submenu("Target", self.target_menu)
+
         self.menubar_model = menubar_model
         menubar = Gtk.PopoverMenuBar.new_from_model(menubar_model)
         return menubar
+
+    def _populate_target_menu(self) -> None:
+        """Populate the Target menu with Platform Architecture choices."""
+        if not hasattr(self, "target_menu") or self.target_menu is None:
+            return
+        self.target_menu.remove_all()
+
+        plat_sec = Gio.Menu.new()
+        plat_choices = [
+            ("mtl", "MTL / ARL — ACE 1.x (platform/intel/mtl.conf)"),
+            ("lnl", "LNL — ACE 2.0 (platform/intel/lnl.conf)"),
+            ("ptl", "PTL — ACE 3.0 (platform/intel/ptl.conf)"),
+            ("nvl", "NVL — ACE 4.0 (platform/intel/ptl.conf)"),
+            ("tgl", "TGL — CAVS 2.5 (platform/intel/tgl.conf)"),
+            ("adl", "ADL / RPL — CAVS 2.5 (platform/intel/tgl.conf)"),
+        ]
+        for pid, plabel in plat_choices:
+            self._append_str_action_item(plat_sec, plabel, "win.select_target_platform", pid)
+        self.target_menu.append_section(None, plat_sec)
+
+    def action_select_target_platform(self, platform_id: str) -> None:
+        """Select the target SoC platform definition (tgl, adl, mtl, lnl, ptl, nvl) for testbench compilation."""
+        plat = platform_id.strip().lower()
+        self.target_platform = plat
+        plat_conf_map = {
+            "tgl": "platform/intel/tgl.conf",
+            "adl": "platform/intel/tgl.conf",
+            "mtl": "platform/intel/mtl.conf",
+            "lnl": "platform/intel/lnl.conf",
+            "ptl": "platform/intel/ptl.conf",
+            "nvl": "platform/intel/ptl.conf",
+        }
+        if plat in plat_conf_map:
+            self.target_platform_def_path = plat_conf_map[plat]
+            if hasattr(self, "target_platform_def_action"):
+                self.target_platform_def_action.set_state(
+                    GLib.Variant.new_string(self.target_platform_def_path)
+                )
+        if self.compiler:
+            self.compiler.target_platform = plat
+            self.compiler.extra_platform_conf = self.target_platform_def_path
+
+        # Update PLATFORM variable in the active tab's GraphViewModel if present
+        active = self.get_active_tab()
+        if active is not None and active.canvas.vm is not None:
+            vm = active.canvas.vm
+            vm.defines["PLATFORM"] = plat
+            def_node = vm.root_config.get_child("Define (Active Variables)")
+            if def_node is not None:
+                def_node.set_scalar("PLATFORM", plat, category_info="Define", origin="instance")
+            # Merge SoC platform defines (e.g. DMIC_DRIVER_VERSION, SSP_BLOB_VERSION) into vm.defines
+            if self.workspace:
+                for pdef in self.workspace.platform_definitions:
+                    if pdef.get("rel_path") == self.target_platform_def_path:
+                        p_defs = pdef.get("defines", {})
+                        if isinstance(p_defs, dict):
+                            for k, v in p_defs.items():
+                                vm.defines[k] = str(v)
+                                if def_node is not None:
+                                    def_node.set_scalar(k, str(v), category_info="Platform Define", origin="define")
+                        break
+            self._sync_ui_to_tab(active)
+
+        msg = (
+            f"Target Platform set to PLATFORM={plat.upper()} "
+            f"({self.target_platform_def_path})"
+        )
+        self.append_log(msg)
+        self.status_lbl.set_text(msg)
+
+    def action_select_target_harness(self, harness_id: str) -> None:
+        """Select the testbench harness configuration used when wrapping standalone modules/pipelines."""
+        self.target_harness_kind = harness_id
+        if self.compiler:
+            self.compiler.target_harness = harness_id
+        harness_names = {
+            "hda_analog": "HDA Analog Duplex",
+            "hda_generic": "HDA Generic + DMIC / HDMI",
+            "sdw_alh": "SoundWire ALH Jack Duplex",
+            "ssp_nocodec": "NoCodec SSP0 I2S Duplex",
+            "dmic_capture": "PDM DMIC Capture",
+            "hdmi_playback": "HDMI Display Audio",
+            "bt_ssp": "Bluetooth Sideband SSP",
+            "deep_buffer": "Deep Buffer Playback",
+        }
+        h_label = harness_names.get(harness_id, harness_id)
+        msg = f"Testbench Harness Config set to: {h_label} [{harness_id}] (PLATFORM={self.target_platform})"
+        self.append_log(msg)
+        self.status_lbl.set_text(msg)
+
+    def action_select_platform_def(self, rel_path: str) -> None:
+        """Select a platform definition file from platform/intel/*.conf and apply its target config."""
+        self.target_platform_def_path = rel_path
+        if self.compiler:
+            self.compiler.extra_platform_conf = rel_path
+
+        stem = os.path.splitext(os.path.basename(rel_path))[0]
+        if stem in ("tgl", "mtl", "lnl", "ptl"):
+            self.target_platform = stem
+            if self.compiler:
+                self.compiler.target_platform = stem
+            if hasattr(self, "target_platform_action"):
+                self.target_platform_action.set_state(GLib.Variant.new_string(stem))
+
+        applied_defs: List[str] = []
+        has_objs = False
+        abs_p = ""
+        if self.workspace:
+            abs_p = os.path.join(self.workspace.root_dir, rel_path)
+            for pdef in self.workspace.platform_definitions:
+                if pdef.get("rel_path") == rel_path:
+                    has_objs = bool(pdef.get("has_objects", False))
+                    p_defs = pdef.get("defines", {})
+                    active = self.get_active_tab()
+                    if isinstance(p_defs, dict) and p_defs:
+                        for k, v in p_defs.items():
+                            applied_defs.append(f"{k}={v}")
+                            if active and active.canvas.vm:
+                                active.canvas.vm.defines[k] = str(v)
+                                def_node = active.canvas.vm.root_config.get_child("Define (Active Variables)")
+                                if def_node is not None:
+                                    def_node.set_scalar(
+                                        k,
+                                        str(v),
+                                        category_info=f"From {rel_path}",
+                                        origin="instance",
+                                    )
+                    break
+
+        active = self.get_active_tab()
+        if active is not None:
+            self._sync_ui_to_tab(active)
+
+        defs_preview = f" ({', '.join(applied_defs[:4])}{'…' if len(applied_defs) > 4 else ''})" if applied_defs else ""
+        msg = f"Selected Platform Definition: {rel_path}{defs_preview}"
+        self.append_log(msg)
+        self.status_lbl.set_text(msg)
+
+    def action_open_active_platform_def(self) -> Optional[GraphTabPage]:
+        """Open the currently selected platform/intel/*.conf definition file in a Main View tab."""
+        if not self.workspace or not self.target_platform_def_path:
+            return None
+        abs_p = os.path.join(self.workspace.root_dir, self.target_platform_def_path)
+        if os.path.isfile(abs_p):
+            tab = self.open_conf_file_in_tab(abs_p)
+            # If the platform file is a pure Define file (0 nodes), switch it to Text Editor view automatically
+            if tab is not None and tab.canvas.vm is not None and len(tab.canvas.vm.nodes) == 0:
+                tab.mode_switch_btn.set_active(True)
+            return tab
+        return None
+
+    def action_select_target_variant(self, output_name: str) -> None:
+        """Select a platform topology target configuration (CMakeTargetVariant) and open/configure it for testbench."""
+        if not self.workspace:
+            return
+        self.target_variant_name = output_name
+        for entry in self.workspace.machine_topologies:
+            for var in entry.variants:
+                if var.output_name == output_name:
+                    plat = var.defines.get("PLATFORM", "")
+                    if plat:
+                        self.target_platform = plat
+                        if self.compiler:
+                            self.compiler.target_platform = plat
+                        if hasattr(self, "target_platform_action"):
+                            self.target_platform_action.set_state(GLib.Variant.new_string(plat))
+                    self._on_left_pane_item_selected("topology", entry.conf_path, var.output_name)
+                    msg = (
+                        f"Selected Target Config: {var.output_name} "
+                        f"({entry.name}.conf  [{var.defines_str or 'default'}])"
+                    )
+                    self.append_log(msg)
+                    self.status_lbl.set_text(msg)
+                    return
 
     def _build_header_bar(self) -> None:
         header = Gtk.HeaderBar()
@@ -399,39 +634,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.compile_btn.set_tooltip_text("Compile current topology/pipeline with alsatplg -p")
         self.compile_btn.connect("clicked", self._on_compile_clicked)
         header.pack_end(self.compile_btn)
-
-        # Pipeline IDs entry for testbench (-p)
-        self.pipes_entry = Gtk.Entry()
-        self.pipes_entry.set_text("1,2")
-        self.pipes_entry.set_width_chars(6)
-        self.pipes_entry.set_tooltip_text("Pipeline IDs passed to sof-testbench4 -p (e.g. 1,2)")
-        header.pack_end(self.pipes_entry)
-
-        pipe_lbl = Gtk.Label(label="Pipes (-p):")
-        header.pack_end(pipe_lbl)
-
-        # Format selector
-        self.fmt_combo = Gtk.DropDown.new_from_strings(["S32_LE", "S24_LE", "S16_LE"])
-        self.fmt_combo.set_selected(0)
-        self.fmt_combo.set_tooltip_text("Testbench PCM Sample Format (-b)")
-        self.fmt_combo.connect("notify::selected", lambda *_a: self._update_waveform_stream_labels())
-        header.pack_end(self.fmt_combo)
-
-        # Signal selector
-        self.sig_combo = Gtk.DropDown.new_from_strings(
-            [
-                "Sine 997 Hz",
-                "Chirp 100-12kHz",
-                "Multitone",
-                "White Noise",
-                "ALSA Front_Center.wav",
-                "SOFR Remote 1kHz Tone",
-            ]
-        )
-        self.sig_combo.set_selected(0)
-        self.sig_combo.set_tooltip_text("Test audio signal to run through the pipeline")
-        self.sig_combo.connect("notify::selected", lambda *_a: self._update_waveform_stream_labels())
-        header.pack_end(self.sig_combo)
 
     def _build_main_3panel_layout(self) -> None:
         # Outer horizontal paned: [Left Panel (25%)] | [Center (50%) + Right (25%) Paned]
@@ -795,8 +997,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         ws.scan_all()
         self.workspace = ws
         self.compiler = TopologyCompiler(abs_path)
+        self.compiler.target_platform = self.target_platform
+        self.compiler.target_harness = self.target_harness_kind
+        self.compiler.extra_platform_conf = self.target_platform_def_path
         self.tb_runner = TestbenchRunner(abs_path)
         self.left_panel.populate(ws)
+        self._populate_target_menu()
 
         summary = (
             f"Loaded {len(ws.base_classes)} Base Classes, "
@@ -1116,10 +1322,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         else:
             self.right_inspector.set_node_config(vm.title, vm.root_config, vm.source_file)
 
-        if self.workspace:
-            _, _, tb_pipes = generate_compilable_conf(vm, self.workspace.root_dir)
-            if tb_pipes:
-                self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
         self._update_waveform_stream_labels()
         self.status_lbl.set_text(
             f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
@@ -1498,20 +1700,76 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.canvas.delete_selected()
         self._update_active_tab_header()
 
+    def _extract_graph_stream_params(self) -> Tuple[str, str, str, int, int, int]:
+        """Extract (sig_kind, wav_src, sig_label, rate, channels, bits) from the active Main Graph panel."""
+        sig_kind = "sine_997"
+        wav_src = ""
+        sig_label = "Sine 997 Hz"
+        rate = 48000
+        channels = 2
+        bits = 32
+
+        vm = self.canvas.vm
+        if not vm:
+            return (sig_kind, wav_src, sig_label, rate, channels, bits)
+
+        enabled_sources = [
+            n for n in vm.nodes.values()
+            if n.class_category == "TestbenchIO"
+            and n.class_name == "testbench-source"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        snode = enabled_sources[0] if enabled_sources else None
+        if snode is not None:
+            io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
+            if io_mode == "sig_gen":
+                sig_kind = str(snode.config.get_scalar("signal_type", "sine_997")).strip().lower() or "sine_997"
+                sig_label = TopologyGraphCanvas.get_signal_type_short_label(sig_kind)
+            elif io_mode == "alsa_pcm":
+                apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
+                sig_label = f"ALSA {apcm}"
+            else:
+                fpath = str(snode.config.get_scalar("file_path", "")).strip()
+                if fpath and os.path.isfile(fpath):
+                    sig_kind = "wav_file"
+                    wav_src = fpath
+                    sig_label = os.path.basename(fpath)
+                else:
+                    sig_label = os.path.basename(fpath) if fpath else "Audio File"
+
+        # Inspect connected host/dai copier or first active pipeline module for audio format (rate, channels, bit depth)
+        fmt_candidates: List[GraphNode] = []
+        if snode and snode.parent_node_id and snode.parent_node_id in vm.nodes:
+            fmt_candidates.append(vm.nodes[snode.parent_node_id])
+        for n in vm.nodes.values():
+            if n.class_category not in ("Control", "TestbenchIO") and n not in fmt_candidates:
+                fmt_candidates.append(n)
+
+        for cand in fmt_candidates:
+            for ch in cand.config.children:
+                if "input_audio_format" in ch.key or "output_audio_format" in ch.key:
+                    r_val = str(ch.get_scalar("in_rate") or ch.get_scalar("out_rate") or "").strip()
+                    c_val = str(ch.get_scalar("in_channels") or ch.get_scalar("out_channels") or "").strip()
+                    b_val = str(
+                        ch.get_scalar("in_valid_bit_depth")
+                        or ch.get_scalar("in_bit_depth")
+                        or ch.get_scalar("out_valid_bit_depth")
+                        or ch.get_scalar("out_bit_depth")
+                        or ""
+                    ).strip()
+                    if r_val.isdigit() and int(r_val) > 0:
+                        rate = int(r_val)
+                    if c_val.isdigit() and int(c_val) > 0:
+                        channels = int(c_val)
+                    if b_val.isdigit() and int(b_val) in (16, 24, 32):
+                        bits = int(b_val)
+                    return (sig_kind, wav_src, sig_label, rate, channels, bits)
+
+        return (sig_kind, wav_src, sig_label, rate, channels, bits)
+
     def _update_waveform_stream_labels(self) -> None:
         """Update Input and Output waveform lane labels from active TestbenchIO or pipeline endpoints."""
-        sig_names = [
-            "Sine 997 Hz",
-            "Chirp 100-12kHz",
-            "Multitone",
-            "White Noise",
-            "ALSA Front_Center.wav",
-            "SOFR Remote 1kHz Tone",
-        ]
-        sig_idx = self.sig_combo.get_selected()
-        sig_label = sig_names[sig_idx] if 0 <= sig_idx < len(sig_names) else "Sine 997 Hz"
-        fmt_idx = self.fmt_combo.get_selected()
-        bits = {0: 32, 1: 24, 2: 16}.get(fmt_idx, 32)
+        _sig_kind, _wav_src, sig_label, rate, channels, bits = self._extract_graph_stream_params()
 
         in_lbl = "INPUT PCM: Source (Host/DAI)"
         out_lbl = "OUTPUT PCM: Sink (DAI/Host)"
@@ -1533,7 +1791,18 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 snode = enabled_sources[0]
                 target_p = snode.config.get_scalar("target_pipelines", "")
                 p_badge = f" (Pipes: {target_p})" if target_p else ""
-                in_lbl = f"INPUT PCM: {snode.title} ({snode.subtitle}){p_badge}"
+                io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
+                if io_mode == "sig_gen":
+                    stype = str(snode.config.get_scalar("signal_type", "sine_997")).strip().lower()
+                    sig_label = TopologyGraphCanvas.get_signal_type_short_label(stype)
+                    in_lbl = f"INPUT PCM: {snode.title} [SigGen: {sig_label}]{p_badge}"
+                elif io_mode == "alsa_pcm":
+                    apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
+                    in_lbl = f"INPUT PCM: {snode.title} [ALSA: {apcm}]{p_badge}"
+                else:
+                    fpath = str(snode.config.get_scalar("file_path", "")).strip()
+                    fname = os.path.basename(fpath) if fpath else "audio.wav"
+                    in_lbl = f"INPUT PCM: {snode.title} [File: {fname}]{p_badge}"
             else:
                 host_in = [
                     n for n in vm.nodes.values()
@@ -1557,8 +1826,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             in_label=in_lbl,
             out_label=out_lbl,
             signal_label=sig_label,
-            rate=48000,
-            channels=2,
+            rate=rate,
+            channels=channels,
             bits=bits,
         )
 
@@ -1687,6 +1956,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                         self.canvas.select_testbench_io_radio(node.id)
                     finally:
                         self.canvas._suppress_auto_history = False
+                elif key == "io_type" and new_val.strip().lower() == "sig_gen" and node.class_name == "testbench-source":
+                    if not node.config.get_scalar("signal_type"):
+                        node.config.set_scalar(
+                            "signal_type",
+                            "sine_997",
+                            category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                            origin="instance",
+                            valid_values=[opt[0] for opt in TopologyGraphCanvas.SIGNAL_TYPE_OPTIONS],
+                        )
+                        self.right_inspector.set_node_config(
+                            f"{node.title} ({node.class_name})",
+                            node.config,
+                            node.subtitle,
+                        )
             else:
                 node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
                 node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
@@ -1725,10 +2008,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
             self._update_active_tab_header()
-            if self.workspace:
-                _, _, tb_pipes = generate_compilable_conf(self.canvas.vm, self.workspace.root_dir)
-                if tb_pipes:
-                    self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
             self.status_lbl.set_text(
                 f"Graph modified: {len(self.canvas.vm.nodes)} nodes, {len(self.canvas.vm.edges)} routes"
             )
@@ -1875,23 +2154,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.run_tb_btn.set_sensitive(True)
             return False
 
-        # Parse testbench parameters from header bar controls
-        sig_idx = self.sig_combo.get_selected()
-        sig_map = {
-            0: ("sine_997", ""),
-            1: ("chirp", ""),
-            2: ("multitone", ""),
-            3: ("noise", ""),
-            4: ("wav_file", "/usr/share/sounds/alsa/Front_Center.wav"),
-            5: ("remote_tone", ""),
-        }
-        sig_kind, wav_src = sig_map.get(sig_idx, ("sine_997", ""))
-
-        fmt_idx = self.fmt_combo.get_selected()
-        bits = {0: 32, 1: 24, 2: 16}.get(fmt_idx, 32)
-
-        pipe_txt = self.pipes_entry.get_text().strip()
-        pipes = [int(x.strip()) for x in pipe_txt.split(",") if x.strip().isdigit()] or res.pipeline_ids
+        # Resolve testbench signal, format, and pipeline IDs from the active Main Graph panel
+        sig_kind, wav_src, _sig_lbl, rate, channels, bits = self._extract_graph_stream_params()
+        pipes = list(res.pipeline_ids) if res.pipeline_ids else [1, 2]
         kctl_overrides = self._collect_kcontrol_overrides()
         keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
         self._stop_realtime_waveform_timer()
@@ -1915,8 +2180,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 tplg_path=res.tplg_path,
                 pipeline_ids=pipes,
                 signal_kind=sig_kind,
-                rate=48000,
-                channels=2,
+                rate=rate,
+                channels=channels,
                 bits=bits,
                 duration_sec=0.15,
                 wav_source=wav_src,

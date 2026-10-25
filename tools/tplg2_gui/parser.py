@@ -316,6 +316,8 @@ class Topology2Workspace:
         # Global lookup of all classes by "Category.Name"
         self.all_classes: Dict[str, TplgClassDef] = {}
         self.global_defines: Dict[str, str] = {}
+        self.platform_defaults: Dict[str, str] = {}
+        self.platform_definitions: List[Dict[str, object]] = []
 
     def get_ast(self, abs_path: str) -> List[AstStmt]:
         abs_path = os.path.abspath(abs_path)
@@ -346,6 +348,8 @@ class Topology2Workspace:
         self.machine_topologies.clear()
         self.all_classes.clear()
         self.global_defines.clear()
+        self.platform_defaults.clear()
+        self.platform_definitions.clear()
 
         # 1. Load common definitions first (so $HDA_HOST_OUTPUT_CLASS etc. are known)
         self.global_defines["DEEP_BUF_JACK_RATE"] = "48000"
@@ -403,6 +407,54 @@ class Topology2Workspace:
                     variants=unique_vars,
                 )
             )
+
+        # 5. Scan platform/ directory for Platform Topology Definitions & Defaults
+        plat_dir = os.path.join(self.root_dir, "platform")
+        if os.path.isdir(plat_dir):
+            for dirpath, _dirnames, filenames in os.walk(plat_dir):
+                for fname in sorted(filenames):
+                    if not fname.endswith(".conf"):
+                        continue
+                    fpath = os.path.join(dirpath, fname)
+                    rel_p = os.path.relpath(fpath, self.root_dir)
+                    self._extract_classes_from_file(fpath)
+                    stmts = self.get_ast(fpath)
+                    defs_map: Dict[str, str] = {}
+                    has_objs = False
+                    for st in stmts:
+                        if st.stmt_type == "block" and st.key == "Define":
+                            for ch in st.children:
+                                if ch.stmt_type == "kv":
+                                    defs_map[ch.key] = str(ch.value)
+                        elif st.key.startswith("Object."):
+                            has_objs = True
+                    if fname.endswith("-default.conf"):
+                        self.platform_defaults.update(defs_map)
+                    stem = fname[:-5]
+                    if stem in ("tgl", "mtl", "lnl", "ptl"):
+                        pcat = "soc"
+                    elif stem.startswith("dmic"):
+                        pcat = "dmic"
+                    elif stem.startswith("hdmi"):
+                        pcat = "hdmi"
+                    elif stem.startswith("sdw"):
+                        pcat = "sdw"
+                    elif stem.startswith(("bt", "ssp", "nocodec", "uaol")):
+                        pcat = "bt_ssp"
+                    else:
+                        pcat = "feature"
+                    self.platform_definitions.append(
+                        {
+                            "name": fname,
+                            "stem": stem,
+                            "rel_path": rel_p,
+                            "abs_path": fpath,
+                            "category": pcat,
+                            "defines": defs_map,
+                            "has_objects": has_objs,
+                        }
+                    )
+            self.platform_definitions.sort(key=lambda d: str(d["rel_path"]))
 
     def _extract_classes_from_file(self, fpath: str) -> None:
         stmts = self.get_ast(fpath)
@@ -1166,6 +1218,8 @@ class Topology2Workspace:
         subtitle = f"{rel_path}  [{variant.defines_str}]" if (variant and variant.defines_str) else rel_path
 
         defines = dict(self.global_defines)
+        if rel_path.startswith("platform" + os.sep) or "/platform/" in conf_path:
+            defines.update(self.platform_defaults)
         if variant:
             defines.update(variant.defines)
         else:
@@ -2364,11 +2418,35 @@ class Topology2Workspace:
             )
             tb_cfg.set_scalar(
                 "io_type",
-                "file",
-                category_info="Select Audio File or ALSA PCM",
+                "file" if is_cap else "sig_gen",
+                category_info=(
+                    "Select Audio File or ALSA PCM"
+                    if is_cap
+                    else "Select Audio File, ALSA PCM, or Signal Generator"
+                ),
                 origin="instance",
-                valid_values=["file", "alsa_pcm"],
+                valid_values=["file", "alsa_pcm"] if is_cap else ["file", "alsa_pcm", "sig_gen"],
             )
+            if not is_cap:
+                tb_cfg.set_scalar(
+                    "signal_type",
+                    "sine_997",
+                    category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                    origin="instance",
+                    valid_values=[
+                        "sine_997",
+                        "sine_1000",
+                        "sine_440",
+                        "chirp",
+                        "multitone",
+                        "square",
+                        "sawtooth",
+                        "noise",
+                        "pink_noise",
+                        "impulse",
+                        "remote_tone",
+                    ],
+                )
             tb_cfg.set_scalar(
                 "file_path",
                 f"capture_pcm{pcm_id}.wav" if is_cap else f"playback_pcm{pcm_id}.wav",
@@ -2515,11 +2593,35 @@ class Topology2Workspace:
             )
             tb_cfg.set_scalar(
                 "io_type",
-                "file",
-                category_info="Select Audio File or ALSA PCM",
+                "sig_gen" if is_cap else "file",
+                category_info=(
+                    "Select Audio File, ALSA PCM, or Signal Generator"
+                    if is_cap
+                    else "Select Audio File or ALSA PCM"
+                ),
                 origin="instance",
-                valid_values=["file", "alsa_pcm"],
+                valid_values=["file", "alsa_pcm", "sig_gen"] if is_cap else ["file", "alsa_pcm"],
             )
+            if is_cap:
+                tb_cfg.set_scalar(
+                    "signal_type",
+                    "sine_997",
+                    category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                    origin="instance",
+                    valid_values=[
+                        "sine_997",
+                        "sine_1000",
+                        "sine_440",
+                        "chirp",
+                        "multitone",
+                        "square",
+                        "sawtooth",
+                        "noise",
+                        "pink_noise",
+                        "impulse",
+                        "remote_tone",
+                    ],
+                )
             tb_cfg.set_scalar(
                 "file_path",
                 f"capture_{safe_dai}.wav" if is_cap else f"playback_{safe_dai}.wav",

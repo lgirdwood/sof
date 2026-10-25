@@ -62,20 +62,39 @@ def serialize_config_node(node: ConfigNode, indent: int = 0) -> str:
     return "".join(lines)
 
 
-def generate_compilable_conf(vm: GraphViewModel, topology2_root: str) -> Tuple[str, str, List[int]]:
+def generate_compilable_conf(
+    vm: GraphViewModel,
+    topology2_root: str,
+    target_platform: str = "mtl",
+    target_harness: str = "hda_analog",
+    extra_platform_conf: str = "",
+) -> Tuple[str, str, List[int]]:
     """Generate a compilable Topology2 .conf string for the current GraphViewModel.
 
     Returns:
         (conf_text, defines_str, pipeline_ids_for_testbench)
     """
     if vm.view_kind == "topology" and vm.source_file and os.path.isfile(vm.source_file):
-        return _generate_modified_topology_conf(vm, topology2_root)
-    return _generate_standalone_harness_conf(vm, topology2_root)
+        return _generate_modified_topology_conf(
+            vm,
+            topology2_root,
+            target_platform=target_platform,
+            extra_platform_conf=extra_platform_conf,
+        )
+    return _generate_standalone_harness_conf(
+        vm,
+        topology2_root,
+        target_platform=target_platform,
+        target_harness=target_harness,
+        extra_platform_conf=extra_platform_conf,
+    )
 
 
 def _generate_modified_topology_conf(
     vm: GraphViewModel,
     topology2_root: str,
+    target_platform: str = "mtl",
+    extra_platform_conf: str = "",
 ) -> Tuple[str, str, List[int]]:
     """Serialize the machine topology with any user edits applied."""
     with open(vm.source_file, "r", encoding="utf-8", errors="replace") as f:
@@ -84,6 +103,9 @@ def _generate_modified_topology_conf(
     defines_parts = []
     if vm.target_variant and vm.target_variant.defines_str:
         defines_parts.append(vm.target_variant.defines_str)
+    if target_platform and not any("PLATFORM=" in p for p in defines_parts):
+        if "IncludeByKey.PLATFORM" in base_text or "PLATFORM" in base_text:
+            defines_parts.append(f"PLATFORM={target_platform}")
 
     extra_blocks: List[str] = []
     def_node = vm.root_config.get_child("Define (Active Variables)")
@@ -125,6 +147,9 @@ def _generate_modified_topology_conf(
 def _generate_standalone_harness_conf(
     vm: GraphViewModel,
     topology2_root: str,
+    target_platform: str = "mtl",
+    target_harness: str = "hda_analog",
+    extra_platform_conf: str = "",
 ) -> Tuple[str, str, List[int]]:
     """Generate a self-contained, compilable Topology2 testbench harness wrapping the current graph.
 
@@ -240,6 +265,29 @@ def _generate_standalone_harness_conf(
     )
     routes_text = "\n".join(route_entries)
 
+    plat_key = (target_platform or vm.defines.get("PLATFORM", "mtl") or "mtl").strip().lower()
+    if plat_key not in ("tgl", "adl", "mtl", "lnl", "ptl", "nvl"):
+        plat_key = "mtl"
+
+    extra_plat_includes: List[str] = []
+    harness_defaults = {
+        "hda_generic": ["dmic-default.conf", "hdmi-default.conf", "deep-buffer-default.conf", "compr-default.conf"],
+        "ssp_nocodec": ["ssp-default.conf", "dmic-default.conf", "deep-buffer-default.conf"],
+        "dmic_capture": ["dmic-default.conf"],
+        "hdmi_playback": ["hdmi-default.conf", "hdmi-in-default.conf"],
+        "bt_ssp": ["bt-default.conf", "ssp-default.conf"],
+        "deep_buffer": ["deep-buffer-default.conf", "efx-default.conf"],
+    }
+    for def_inc in harness_defaults.get(target_harness, []):
+        if os.path.isfile(os.path.join(topology2_root, "platform", "intel", def_inc)):
+            extra_plat_includes.append(f"<{def_inc}>")
+    if extra_platform_conf and extra_platform_conf.endswith("-default.conf"):
+        base_inc = os.path.basename(extra_platform_conf)
+        tag = f"<{base_inc}>"
+        if tag not in extra_plat_includes and os.path.isfile(os.path.join(topology2_root, extra_platform_conf)):
+            extra_plat_includes.append(tag)
+    extra_plat_inc_block = ("\n" + "\n".join(extra_plat_includes)) if extra_plat_includes else ""
+
     conf_text = f"""<searchdir:include>
 <searchdir:include/common>
 <searchdir:include/components>
@@ -269,11 +317,11 @@ def _generate_standalone_harness_conf(
 <hw_config_simple.conf>
 <manifest.conf>
 <route.conf>
-<common_definitions.conf>
+<common_definitions.conf>{extra_plat_inc_block}
 {inc_lines}
 
 Define {{
-\tPLATFORM\t\t\t"mtl"
+\tPLATFORM\t\t\t"{plat_key}"
 \tANALOG_PLAYBACK_PCM\t\t'Analog Playback'
 \tANALOG_CAPTURE_PCM\t\t'Analog Capture'
 \tHDA_ANALOG_DAI_NAME\t\t'Analog'
@@ -299,7 +347,12 @@ Define {{
 }}
 
 IncludeByKey.PLATFORM {{
+\t"tgl"\t"platform/intel/tgl.conf"
+\t"adl"\t"platform/intel/tgl.conf"
 \t"mtl"\t"platform/intel/mtl.conf"
+\t"lnl"\t"platform/intel/lnl.conf"
+\t"ptl"\t"platform/intel/ptl.conf"
+\t"nvl"\t"platform/intel/ptl.conf"
 }}
 
 Object.Dai.HDA [

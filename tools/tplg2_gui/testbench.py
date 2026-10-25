@@ -1167,9 +1167,15 @@ class TestbenchRunner:
 
         # Synthesize clean mathematical test waveform
         rng = random.Random(42)
+        pink_b0 = pink_b1 = pink_b2 = 0.0
+        impulse_period = max(1, rate // 20)
         for i in range(n_frames):
             t = i / float(rate)
-            if signal_kind == "chirp":
+            if signal_kind == "sine_1000":
+                val = 0.50 * math.sin(2.0 * math.pi * 1000.0 * t)
+            elif signal_kind == "sine_440":
+                val = 0.50 * math.sin(2.0 * math.pi * 440.0 * t)
+            elif signal_kind == "chirp":
                 f0, f1 = 100.0, min(12000.0, rate * 0.4)
                 k = (f1 - f0) / max(duration_sec, 0.01)
                 phase = 2.0 * math.pi * (f0 * t + 0.5 * k * t * t)
@@ -1180,8 +1186,21 @@ class TestbenchRunner:
                     + 0.25 * math.sin(2.0 * math.pi * 997.0 * t)
                     + 0.20 * math.sin(2.0 * math.pi * 4000.0 * t)
                 )
-            elif signal_kind == "noise":
-                val = 0.35 * (rng.uniform(-1.0, 1.0))
+            elif signal_kind == "square":
+                val = 0.45 if math.sin(2.0 * math.pi * 500.0 * t) >= 0.0 else -0.45
+            elif signal_kind == "sawtooth":
+                cyc = 500.0 * t
+                val = 0.45 * (2.0 * (cyc - math.floor(0.5 + cyc)))
+            elif signal_kind in ("noise", "white_noise"):
+                val = 0.35 * rng.uniform(-1.0, 1.0)
+            elif signal_kind == "pink_noise":
+                wn = rng.uniform(-1.0, 1.0)
+                pink_b0 = 0.99765 * pink_b0 + wn * 0.0990460
+                pink_b1 = 0.96300 * pink_b1 + wn * 0.2965164
+                pink_b2 = 0.57000 * pink_b2 + wn * 1.0526913
+                val = max(-0.85, min(0.85, 0.14 * (pink_b0 + pink_b1 + pink_b2 + wn * 0.1848)))
+            elif signal_kind == "impulse":
+                val = 0.85 if (i % impulse_period) == 0 else 0.0
             elif signal_kind == "remote_tone":
                 val = 0.50 * math.sin(2.0 * math.pi * 1000.0 * t)
             else:

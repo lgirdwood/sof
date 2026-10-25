@@ -403,6 +403,9 @@ class TopologyCompiler:
         self.build_dir = build_dir or os.path.join(tempfile.gettempdir(), "sof_tplg2_gui_build")
         os.makedirs(self.build_dir, exist_ok=True)
         self.alsatplg_bin = self._find_alsatplg()
+        self.target_platform: str = "mtl"
+        self.target_harness: str = "hda_analog"
+        self.extra_platform_conf: str = ""
 
     def _find_alsatplg(self) -> str:
         # Check workspace tools/bin/alsatplg first
@@ -457,7 +460,13 @@ class TopologyCompiler:
         with open(abi_path, "r", encoding="utf-8") as f:
             abi_text = f.read()
 
-        body_text, defines_str, tb_pipes = generate_compilable_conf(vm, self.topology2_root)
+        body_text, defines_str, tb_pipes = generate_compilable_conf(
+            vm,
+            self.topology2_root,
+            target_platform=self.target_platform,
+            target_harness=self.target_harness,
+            extra_platform_conf=self.extra_platform_conf,
+        )
         if extra_defines.strip():
             defines_str = f"{defines_str},{extra_defines.strip()}" if defines_str else extra_defines.strip()
 
