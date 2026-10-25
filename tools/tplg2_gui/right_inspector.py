@@ -247,3 +247,77 @@ class RightAttributeInspector(Gtk.Box):
         self._rebuild_tree()
         if self.on_attribute_edited:
             self.on_attribute_edited(self.current_config, k, v)
+
+    def highlight_attribute(
+        self,
+        attr_key: Optional[str],
+        severity: str = "error",
+        message: Optional[str] = None,
+        target_kind: str = "root",
+    ) -> bool:
+        """Select, scroll to, and highlight `attr_key` in the attribute TreeView."""
+        color = "#ff6b6b" if severity == "error" else "#ffd166"
+        prefix = "⛔ ERROR" if severity == "error" else "⚠ WARN"
+        if message:
+            self.node_sub_lbl.set_markup(
+                f"<span foreground='{color}' weight='bold'>{prefix}:</span> {GLib_markup_escape(message)}"
+            )
+
+        if not self.current_config or not attr_key:
+            return False
+
+        # Clear filter if active so the target attribute is guaranteed visible
+        if self.filter_entry.get_text().strip():
+            self.filter_entry.set_text("")
+            self._rebuild_tree()
+
+        best_path_str: Optional[str] = None
+        for path_str, cnode in self._path_to_node.items():
+            if cnode.key == attr_key:
+                best_path_str = path_str
+                # Prefer scalar nodes (or Define children when target_kind == 'define')
+                if cnode.node_type == "scalar":
+                    break
+
+        if best_path_str is None:
+            # Case-insensitive or suffix fallback
+            ak_low = attr_key.lower()
+            for path_str, cnode in self._path_to_node.items():
+                if cnode.key.lower() == ak_low or cnode.key.lower().endswith(f".{ak_low}"):
+                    best_path_str = path_str
+                    break
+
+        if best_path_str is None:
+            # Attribute is missing on the selected node (e.g. Mandatory attribute not set):
+            # open the quick-add attribute row pre-populated with attr_key
+            self.new_key_entry.set_text(attr_key)
+            self.add_row_revealer.set_reveal_child(True)
+            return False
+
+        it = self.store.get_iter_from_string(best_path_str)
+        if not it:
+            return False
+
+        old_meta = self.store.get_value(it, 2) or ""
+        diag_note = f"{prefix}: {message}" if message else prefix
+        new_meta = f"{diag_note} • {old_meta}" if old_meta and diag_note not in old_meta else diag_note
+        self.store.set_value(it, 2, new_meta)
+        self.store.set_value(it, 4, color)
+
+        tree_path = Gtk.TreePath.new_from_string(best_path_str)
+        self.tree.expand_to_path(tree_path)
+        sel = self.tree.get_selection()
+        sel.select_path(tree_path)
+        self.tree.scroll_to_cell(tree_path, None, True, 0.5, 0.0)
+        self.tree.columns_autosize()
+        return True
+
+
+def GLib_markup_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )

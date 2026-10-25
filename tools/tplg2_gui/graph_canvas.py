@@ -184,6 +184,13 @@ class TopologyGraphCanvas(Gtk.Widget):
         self._drag_pause_timer_id: Optional[int] = None
         self.drop_preview: Optional[DropOutcomePreview] = None
 
+        # Compilation diagnostic highlight state (set when double-clicking an error/warning)
+        self.diag_highlight_node_id: Optional[str] = None
+        self.diag_highlight_container_id: Optional[int] = None
+        self.diag_highlight_edge_id: Optional[str] = None
+        self.diag_banner_text: Optional[str] = None
+        self.diag_banner_severity: str = "error"
+
         # Pango layout cache: key -> Pango.Layout
         self._layout_cache: Dict[Tuple[str, int, bool], Pango.Layout] = {}
 
@@ -265,6 +272,13 @@ class TopologyGraphCanvas(Gtk.Widget):
             return True
         return False
 
+    def clear_diagnostic_highlights(self) -> None:
+        self.diag_highlight_node_id = None
+        self.diag_highlight_container_id = None
+        self.diag_highlight_edge_id = None
+        self.diag_banner_text = None
+        self.queue_draw()
+
     def set_graph(self, vm: GraphViewModel, workspace: Optional[Topology2Workspace] = None) -> None:
         """Load a new GraphViewModel, auto-layout its nodes, and trigger snapshot redraw."""
         self.workspace = workspace
@@ -276,6 +290,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.selected_container_ids.clear()
         self.hovered_warning_pid = None
         self._pending_drag_history_entry = None
+        self.clear_diagnostic_highlights()
         self.history.clear()
         self._layout_cache.clear()
         layout_graph(vm)
@@ -463,6 +478,121 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.pan_y = (alloc_h - graph_h * self.zoom) / 2.0 - min_y * self.zoom
         self.queue_draw()
 
+    def focus_on_world_rect(self, wx: float, wy: float, ww: float, wh: float) -> None:
+        """Center and zoom the canvas camera onto a specific world rectangle `(wx, wy, ww, wh)`."""
+        self._is_fitted = False
+        alloc_w = float(self.get_width() or 860)
+        alloc_h = float(self.get_height() or 600)
+        pad_w = max(ww + 220.0, 480.0)
+        pad_h = max(wh + 180.0, 320.0)
+        self.zoom = max(0.35, min(1.35, min(alloc_w / pad_w, alloc_h / pad_h)))
+        cx = wx + ww / 2.0
+        cy = wy + wh / 2.0
+        self.pan_x = (alloc_w / 2.0) - cx * self.zoom
+        self.pan_y = (alloc_h / 2.0) - cy * self.zoom
+        self.queue_draw()
+
+    def focus_diagnostic(self, diag: object) -> None:
+        """Focus and highlight the failing object on the main graph canvas for a CompileDiagnostic."""
+        if not self.vm:
+            return
+        self.diag_highlight_node_id = None
+        self.diag_highlight_container_id = None
+        self.diag_highlight_edge_id = None
+
+        sev = getattr(diag, "severity", "error")
+        msg = getattr(diag, "message", "")
+        sym = getattr(diag, "symbol_or_attr", None)
+        tk = getattr(diag, "target_kind", "root")
+        tid = getattr(diag, "target_id", None)
+        lno = getattr(diag, "line_no", None)
+        cno = getattr(diag, "col_no", None)
+
+        loc_tag = f" (line {lno}{f':{cno}' if cno else ''})" if lno else ""
+        sym_tag = f" [{sym}]" if sym and sym not in msg else ""
+        self.diag_banner_severity = sev
+        self.diag_banner_text = f"{'ERROR' if sev == 'error' else 'WARNING'}{loc_tag}{sym_tag}: {msg}"
+
+        if tk == "node" and tid and tid in self.vm.nodes:
+            self.diag_highlight_node_id = tid
+            self.select_node(tid)
+            n = self.vm.nodes[tid]
+            self.focus_on_world_rect(n.x, n.y, n.width, n.height)
+            return
+
+        if tk == "container" and tid and str(tid).isdigit() and int(tid) in self.vm.containers:
+            pid = int(tid)
+            self.diag_highlight_container_id = pid
+            self.selected_node_id = None
+            self.selected_node_ids.clear()
+            self.selected_edge_id = None
+            self.selected_container_id = pid
+            self.selected_container_ids = {pid}
+            cont = self.vm.containers[pid]
+            if self.on_selection_changed:
+                self.on_selection_changed(
+                    f"Pipeline {pid}: {cont.class_name}",
+                    cont.config,
+                    f"Direction: {cont.direction}",
+                )
+            self.focus_on_world_rect(cont.x, cont.y, cont.width, cont.height)
+            return
+
+        if tk == "edge" and tid:
+            edge = next((e for e in self.vm.edges if e.id == tid), None)
+            if edge:
+                self.diag_highlight_edge_id = edge.id
+                self.selected_node_id = None
+                self.selected_node_ids.clear()
+                self.selected_container_id = None
+                self.selected_container_ids.clear()
+                self.selected_edge_id = edge.id
+                if self.on_selection_changed:
+                    self.on_selection_changed(
+                        f"Route: {edge.source_node} ({edge.source_port}) → {edge.sink_node} ({edge.sink_port})",
+                        edge.config,
+                        "Object.Base.route",
+                    )
+                u = self.vm.nodes.get(edge.source_node)
+                v = self.vm.nodes.get(edge.sink_node)
+                if u and v:
+                    min_x = min(u.x, v.x)
+                    min_y = min(u.y, v.y)
+                    max_x = max(u.x + u.width, v.x + v.width)
+                    max_y = max(u.y + u.height, v.y + v.height)
+                    self.focus_on_world_rect(min_x, min_y, max_x - min_x, max_y - min_y)
+                else:
+                    self.queue_draw()
+                return
+
+        # Default / Define / Root level error: select topology root config so Define (Active Variables) is shown
+        self.select_node(None)
+        if self.on_selection_changed:
+            self.on_selection_changed(self.vm.title, self.vm.root_config, self.vm.subtitle)
+
+        # If a Define variable corresponds to a specific node or pipeline container on the graph, highlight & pan to it
+        if sym:
+            def_node = self.vm.root_config.get_child("Define (Active Variables)")
+            def_val = str(def_node.get_scalar(sym) or "").strip("'\"") if def_node else ""
+            if def_val in self.vm.nodes:
+                n = self.vm.nodes[def_val]
+                self.diag_highlight_node_id = def_val
+                self.focus_on_world_rect(n.x, n.y, n.width, n.height)
+                return
+            if sym.endswith("_PIPELINE_ID") and def_val.isdigit() and int(def_val) in self.vm.containers:
+                pid = int(def_val)
+                c = self.vm.containers[pid]
+                self.diag_highlight_container_id = pid
+                self.focus_on_world_rect(c.x, c.y, c.width, c.height)
+                return
+            for pid, c in self.vm.containers.items():
+                if sym in c.enabled_by:
+                    self.diag_highlight_container_id = pid
+                    self.focus_on_world_rect(c.x, c.y, c.width, c.height)
+                    return
+
+        self.fit_to_view()
+
     def _handle_canvas_resize(self, new_w: int, new_h: int) -> None:
         """Scale and re-center the graph when the canvas widget is resized."""
         old_w, old_h = self._last_canvas_size
@@ -583,6 +713,44 @@ class TopologyGraphCanvas(Gtk.Widget):
         if self.drop_preview is not None:
             self._snapshot_drop_preview_overlay(snapshot, w, h, self.drop_preview)
 
+        # 11. Draw Compilation Diagnostic Banner at top of canvas when an error/warning is focused
+        if self.diag_banner_text:
+            self._snapshot_diagnostic_banner(snapshot, w, h)
+
+    def _snapshot_diagnostic_banner(self, snapshot: Gtk.Snapshot, canvas_w: float, _canvas_h: float) -> None:
+        if not self.diag_banner_text:
+            return
+        is_err = self.diag_banner_severity == "error"
+        accent_col = rgba(1.0, 0.34, 0.34, 1.0) if is_err else rgba(1.0, 0.82, 0.25, 1.0)
+        bg_col = rgba(0.26, 0.08, 0.10, 0.96) if is_err else rgba(0.24, 0.19, 0.06, 0.96)
+
+        lyt = self._get_pango_layout(self.diag_banner_text, size_pt=9, bold=True)
+        _, ext = lyt.get_pixel_extents()
+        bw = min(canvas_w - 28.0, float(ext.width) + 32.0)
+        bh = float(ext.height) + 16.0
+        bx = max(14.0, (canvas_w - bw) / 2.0)
+        by = 38.0
+
+        rect = Graphene.Rect.alloc()
+        rect.init(bx, by, bw, bh)
+        rrect = Gsk.RoundedRect()
+        rrect.init_from_rect(rect, 8.0)
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(bg_col, rect)
+        bar_rect = Graphene.Rect.alloc()
+        bar_rect.init(bx, by, 5.0, bh)
+        snapshot.append_color(accent_col, bar_rect)
+        snapshot.pop()
+
+        snapshot.append_border(rrect, [1.8, 1.8, 1.8, 1.8], [accent_col, accent_col, accent_col, accent_col])
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(bx + 14.0, by + 8.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(lyt, TEXT_WHITE)
+        snapshot.restore()
+
     def _snapshot_grid(self, snapshot: Gtk.Snapshot, w: float, h: float) -> None:
         step = max(18.0, 32.0 * self.zoom)
         pb = Gsk.PathBuilder.new()
@@ -675,7 +843,15 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.pop()
 
         bw = 2.2 if (is_cont_selected or is_tb_enabled or has_warn) else 1.4
-        snapshot.append_border(rrect, [bw, bw, bw, bw], [border_col, border_col, border_col, border_col])
+        if self.diag_highlight_container_id == pid:
+            diag_col = (
+                rgba(1.0, 0.30, 0.30, 0.98)
+                if self.diag_banner_severity == "error"
+                else rgba(1.0, 0.82, 0.25, 0.98)
+            )
+            snapshot.append_border(rrect, [3.2, 3.2, 3.2, 3.2], [diag_col, diag_col, diag_col, diag_col])
+        else:
+            snapshot.append_border(rrect, [bw, bw, bw, bw], [border_col, border_col, border_col, border_col])
 
         text_x = cont.x + 14.0
         if has_warn:
@@ -975,6 +1151,26 @@ class TopologyGraphCanvas(Gtk.Widget):
         rrect.init_from_rect(rect, 6.0 if node.class_category == "Control" else 9.0)
 
         header_col, body_col = CATEGORY_COLORS.get(node.category, CATEGORY_COLORS["widget"])
+
+        if self.diag_highlight_node_id == node.id:
+            d_rect = Graphene.Rect.alloc()
+            d_rect.init(node.x - 6.0, node.y - 6.0, node.width + 12.0, node.height + 12.0)
+            d_rr = Gsk.RoundedRect()
+            d_rr.init_from_rect(d_rect, 13.0)
+            d_fill = (
+                rgba(1.0, 0.24, 0.24, 0.26)
+                if self.diag_banner_severity == "error"
+                else rgba(1.0, 0.80, 0.20, 0.26)
+            )
+            d_bcol = (
+                rgba(1.0, 0.30, 0.30, 0.98)
+                if self.diag_banner_severity == "error"
+                else rgba(1.0, 0.82, 0.25, 0.98)
+            )
+            snapshot.push_rounded_clip(d_rr)
+            snapshot.append_color(d_fill, d_rect)
+            snapshot.pop()
+            snapshot.append_border(d_rr, [2.8, 2.8, 2.8, 2.8], [d_bcol, d_bcol, d_bcol, d_bcol])
 
         # Selection glow shadow
         if is_selected:
@@ -1332,8 +1528,17 @@ class TopologyGraphCanvas(Gtk.Widget):
         x2 = v.x + v_port.rel_x
         y2 = v.y + v_port.rel_y
 
-        color = EDGE_SELECTED_COLOR if is_sel else (EDGE_INTER_COLOR if edge.is_inter_pipeline else EDGE_INTRA_COLOR)
-        width = 3.2 if is_sel else (2.4 if edge.is_inter_pipeline else 2.0)
+        is_diag = edge.id == self.diag_highlight_edge_id
+        if is_diag:
+            color = (
+                rgba(1.0, 0.30, 0.30, 1.0)
+                if self.diag_banner_severity == "error"
+                else rgba(1.0, 0.82, 0.25, 1.0)
+            )
+            width = 3.6
+        else:
+            color = EDGE_SELECTED_COLOR if is_sel else (EDGE_INTER_COLOR if edge.is_inter_pipeline else EDGE_INTRA_COLOR)
+            width = 3.2 if is_sel else (2.4 if edge.is_inter_pipeline else 2.0)
         self._snapshot_bezier_wire(snapshot, x1, y1, x2, y2, color, width=width, dashed=edge.is_inter_pipeline)
 
     @staticmethod

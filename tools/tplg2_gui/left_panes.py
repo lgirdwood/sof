@@ -202,8 +202,25 @@ class LeftNavigationPanel(Gtk.Box):
         vpaned_main.set_position(345)
 
         self.main_notebook.append_page(vpaned_main, Gtk.Label(label="File View"))
+        self.compile_tab_lbl: Optional[Gtk.Label] = None
+        self._compile_page_idx: int = -1
         self.main_notebook.set_current_page(0)
         self.append(self.main_notebook)
+
+    def attach_compile_pane(self, compile_widget: Gtk.Widget) -> int:
+        """Attach the Compile output/diagnostics pane as a tab on the Object View / File View notebook."""
+        self.compile_tab_lbl = Gtk.Label(label="Compile")
+        self._compile_page_idx = self.main_notebook.append_page(compile_widget, self.compile_tab_lbl)
+        return self._compile_page_idx
+
+    def show_compile_pane(self) -> None:
+        """Switch the Object View / File View notebook to the Compile tab."""
+        if self._compile_page_idx >= 0:
+            self.main_notebook.set_current_page(self._compile_page_idx)
+
+    def set_compile_tab_title(self, title: str) -> None:
+        if self.compile_tab_lbl is not None:
+            self.compile_tab_lbl.set_text(title)
 
     def _create_tree_subpane(
         self,

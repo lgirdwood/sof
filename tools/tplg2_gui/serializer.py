@@ -90,10 +90,19 @@ def _generate_modified_topology_conf(
     if def_node and vm.dirty:
         def_lines = ["Define {\n"]
         for ch in def_node.children:
-            if ch.node_type == "scalar" and ch.value != "":
-                def_lines.append(f"\t{ch.key}\t'{ch.value}'\n")
-        def_lines.append("}\n")
-        extra_blocks.append("".join(def_lines))
+            if ch.node_type == "scalar" and ch.origin == "instance" and ch.value != "":
+                val_s = str(ch.value).strip()
+                if val_s.lstrip("-").isdigit() or val_s.startswith("0x"):
+                    def_lines.append(f"\t{ch.key}\t{val_s}\n")
+                elif (val_s.startswith("'") and val_s.endswith("'")) or (
+                    val_s.startswith('"') and val_s.endswith('"')
+                ):
+                    def_lines.append(f"\t{ch.key}\t{val_s}\n")
+                else:
+                    def_lines.append(f"\t{ch.key}\t'{val_s}'\n")
+        if len(def_lines) > 1:
+            def_lines.append("}\n")
+            extra_blocks.append("".join(def_lines))
 
     pipe_ids = sorted(vm.containers.keys())
     tb_pipes = [1, 2]

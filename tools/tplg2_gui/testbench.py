@@ -20,7 +20,7 @@ import tempfile
 import time
 import wave
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gi
 gi.require_version("Gdk", "4.0")
@@ -1087,6 +1087,14 @@ class TestbenchRunner:
         self.live_proc: Optional[subprocess.Popen] = None
         self.live_client: Optional[TestbenchRemoteClient] = None
         self.live_port: int = 0
+        # Cached parameters & buffers for real-time waveform streaming
+        self.last_in_samples: List[float] = []
+        self.last_out_raw_path: str = ""
+        self.last_rate: int = 48000
+        self.last_channels: int = 2
+        self.last_bits: int = 32
+        self.last_signal_kind: str = "sine_997"
+        self.rt_phase_idx: int = 0
 
     def _find_testbench_bin(self) -> str:
         sof_root = os.path.abspath(os.path.join(self.topology2_root, "..", "..", ".."))
@@ -1217,6 +1225,7 @@ class TestbenchRunner:
         control_script: str = "",
         kcontrol_overrides: Optional[Dict[str, List[int]]] = None,
         keep_alive: bool = False,
+        on_live_waveform: Optional[Callable[[List[float], List[float], int], None]] = None,
     ) -> TestbenchRunResult:
         """Launch sof-testbench4 with `-S <port> -W`, configure and control it via the SOFR
         network protocol, collect full DSP telemetry & processed audio, and return TestbenchRunResult.
@@ -1235,6 +1244,14 @@ class TestbenchRunner:
         out_wav = os.path.join(self.work_dir, "tb_output.wav")
         if os.path.exists(out_raw):
             os.remove(out_raw)
+
+        self.last_in_samples = list(in_norm)
+        self.last_out_raw_path = out_raw
+        self.last_rate = rate
+        self.last_channels = channels
+        self.last_bits = bits
+        self.last_signal_kind = signal_kind
+        self.rt_phase_idx = 0
 
         pipe_arg = ",".join(str(p) for p in pipeline_ids) if pipeline_ids else "1,2"
         fmt_arg = f"S{bits}_LE"
@@ -1336,7 +1353,12 @@ class TestbenchRunner:
                     if proc.poll() is not None:
                         break
                     st_p, p_stat, _ = client.pcm_control(SOF_PCM_OP_STATUS)
-                    if st_p == 0 and p_stat.get("frames_played", 0) >= target_frames:
+                    frames_so_far = int(p_stat.get("frames_played", 0)) if st_p == 0 else 0
+                    if on_live_waveform is not None and os.path.isfile(out_raw) and os.path.getsize(out_raw) > 0:
+                        partial_out = self._read_raw_tail_normalized(out_raw, channels, bits, target_frames)
+                        if partial_out:
+                            on_live_waveform(in_norm[: len(partial_out)], partial_out, frames_so_far)
+                    if st_p == 0 and frames_so_far >= target_frames:
                         break
                     time.sleep(0.025)
 
@@ -1379,9 +1401,7 @@ class TestbenchRunner:
             # Read output samples from out_raw (or fallback to SOFR captured PCM ring buffer)
             out_norm: List[float] = []
             if os.path.isfile(out_raw) and os.path.getsize(out_raw) > 0:
-                out_norm = self._read_raw_normalized(out_raw, channels, bits)
-                if len(out_norm) > target_frames:
-                    out_norm = out_norm[:target_frames]
+                out_norm = self._read_raw_tail_normalized(out_raw, channels, bits, target_frames)
             if not out_norm and captured_pcm_bytes:
                 out_norm = self._decode_s16_bytes_normalized(captured_pcm_bytes, channels)
                 if out_norm:
@@ -1439,6 +1459,77 @@ class TestbenchRunner:
                 telemetry=None,
             )
 
+    def poll_live_waveforms(
+        self,
+        window_frames: int = 3600,
+    ) -> Optional[Tuple[List[float], List[float], int, bool, bool]]:
+        """Poll real-time Input and Output waveform slices from the active live testbench session.
+        Returns (in_samples, out_samples, frames_played, dsp_active, tone_running) or None if disconnected.
+        """
+        if not self.live_client or not self.live_proc or self.live_proc.poll() is not None:
+            return None
+
+        st, pcm_info, pcm_bytes = self.live_client.pcm_control(
+            SOF_PCM_OP_CAPTURE_BUFFER,
+            duration_ms=max(40, int((window_frames / max(1, self.last_rate)) * 1000)),
+        )
+        if st != 0:
+            return None
+
+        frames_played = int(pcm_info.get("frames_played", 0))
+        tone_running = bool(pcm_info.get("tone_running", False))
+        tone_freq = int(pcm_info.get("freq_hz", 1000)) or 1000
+
+        # Check DSP power state (D0 active vs D3 paused) via lightweight GET_INFO
+        info = self.live_client.get_info()
+        dsp_active = bool(info.get("dsp_power_state", 1) == 1) if info else True
+
+        # Advance rolling phase when DSP is active
+        if dsp_active:
+            self.rt_phase_idx = (self.rt_phase_idx + 96) % max(1, len(self.last_in_samples) or window_frames)
+
+        # Build live Input window
+        in_slice: List[float] = []
+        if tone_running:
+            for i in range(window_frames):
+                t = (self.rt_phase_idx + i) / float(max(1, self.last_rate))
+                in_slice.append(0.50 * math.sin(2.0 * math.pi * float(tone_freq) * t))
+        elif self.last_in_samples:
+            n_in = len(self.last_in_samples)
+            start = self.rt_phase_idx % n_in
+            if start + window_frames <= n_in:
+                in_slice = self.last_in_samples[start : start + window_frames]
+            else:
+                rem = (start + window_frames) - n_in
+                in_slice = self.last_in_samples[start:] + self.last_in_samples[: min(n_in, rem)]
+
+        # Build live Output window from latest tail of tb_output.raw or SOFR PCM ring buffer
+        out_slice: List[float] = []
+        if pcm_bytes and tone_running:
+            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels)
+        if not out_slice and self.last_out_raw_path and os.path.isfile(self.last_out_raw_path):
+            raw_tail = self._read_raw_tail_normalized(
+                self.last_out_raw_path,
+                self.last_channels,
+                self.last_bits,
+                max(window_frames * 2, 7200),
+            )
+            if raw_tail:
+                n_out = len(raw_tail)
+                if n_out <= window_frames:
+                    out_slice = raw_tail
+                else:
+                    start = self.rt_phase_idx % n_out
+                    if start + window_frames <= n_out:
+                        out_slice = raw_tail[start : start + window_frames]
+                    else:
+                        rem = (start + window_frames) - n_out
+                        out_slice = raw_tail[start:] + raw_tail[: min(n_out, rem)]
+        if not out_slice and pcm_bytes:
+            out_slice = self._decode_s16_bytes_normalized(pcm_bytes, self.last_channels)
+
+        return (in_slice, out_slice, frames_played, dsp_active, tone_running)
+
     @staticmethod
     def _decode_s16_bytes_normalized(pcm_bytes: bytes, channels: int) -> List[float]:
         ch = max(1, channels)
@@ -1470,31 +1561,49 @@ class TestbenchRunner:
                     f.write(struct.pack("<" + "i" * channels, *([v] * channels)))
 
     @staticmethod
-    def _read_raw_normalized(raw_path: str, channels: int, bits: int) -> List[float]:
+    def _read_raw_tail_normalized(
+        raw_path: str,
+        channels: int,
+        bits: int,
+        max_frames: int = 7200,
+    ) -> List[float]:
+        """Read up to the last `max_frames` frames from a raw PCM file normalized to [-1.0, 1.0]."""
         if not os.path.isfile(raw_path):
             return []
-        data = open(raw_path, "rb").read()
         ch = max(1, channels)
+        frame_sz = (2 if bits == 16 else 4) * ch
+        try:
+            file_sz = os.path.getsize(raw_path)
+            total_frames = file_sz // frame_sz
+            if total_frames <= 0:
+                return []
+            frames_to_read = min(total_frames, max_frames)
+            byte_offset = (total_frames - frames_to_read) * frame_sz
+            with open(raw_path, "rb") as f:
+                f.seek(byte_offset)
+                data = f.read(frames_to_read * frame_sz)
+        except Exception:
+            return []
+
+        n = len(data) // frame_sz
         out: List[float] = []
         if bits == 16:
-            frame_sz = 2 * ch
-            n = len(data) // frame_sz
             for i in range(n):
                 vals = struct.unpack_from("<" + "h" * ch, data, i * frame_sz)
                 out.append(vals[0] / 32768.0)
         elif bits == 24:
-            frame_sz = 4 * ch
-            n = len(data) // frame_sz
             for i in range(n):
                 vals = struct.unpack_from("<" + "i" * ch, data, i * frame_sz)
                 out.append(max(-1.0, min(1.0, vals[0] / 8388608.0)))
         else:
-            frame_sz = 4 * ch
-            n = len(data) // frame_sz
             for i in range(n):
                 vals = struct.unpack_from("<" + "i" * ch, data, i * frame_sz)
                 out.append(vals[0] / 2147483648.0)
         return out
+
+    @staticmethod
+    def _read_raw_normalized(raw_path: str, channels: int, bits: int) -> List[float]:
+        return TestbenchRunner._read_raw_tail_normalized(raw_path, channels, bits, max_frames=200000)
 
     @staticmethod
     def _write_wav_from_normalized(wav_path: str, samples: List[float], rate: int) -> None:
@@ -1520,94 +1629,714 @@ class TestbenchRunner:
 
 
 class WaveformSnapshotWidget(Gtk.Widget):
-    """Hardware-accelerated Gtk.Snapshot widget comparing Input vs Output testbench waveforms."""
+    """Hardware-accelerated Gtk.Snapshot dual-channel oscilloscope & waveform viewer.
+    Supports:
+    - Separate, clearly labelled INPUT PCM (top) and OUTPUT PCM (bottom) waveform lanes
+    - Real-time streaming mode with optional rising zero-crossing trigger lock or free-scroll
+    - Horizontal time-axis Zoom In / Zoom Out (mouse wheel or toolbar buttons) and drag-to-pan
+    - Vertical amplitude magnification (Ctrl + mouse wheel or Amp +/- buttons)
+    - Y-axis amplitude scale markers, X-axis time (ms) & sample (#) ruler, viewport scrollbar,
+      and interactive hover crosshair cursor with exact sample/dBFS readout.
+    """
 
     __gtype_name__ = "WaveformSnapshotWidget"
 
-    def __init__(self):
+    BASE_VISIBLE_SAMPLES = 600
+
+    def __init__(self, on_zoom_changed: Optional[Callable[[], None]] = None):
         super().__init__()
         self.set_hexpand(True)
-        self.set_size_request(-1, 110)
+        self.set_vexpand(True)
+        self.set_size_request(-1, 175)
+        self.set_focusable(True)
+
+        self.on_zoom_changed = on_zoom_changed
+
+        # Waveform sample buffers & stream metadata
         self.in_samples: List[float] = []
         self.out_samples: List[float] = []
-        self.summary_label: str = "Run Testbench to inspect Input vs. Output audio waveforms & SOFR telemetry"
+        self.sample_rate: int = 48000
+        self.channels: int = 2
+        self.bits: int = 32
+        self.in_label: str = "INPUT PCM: Source (Host/DAI)"
+        self.out_label: str = "OUTPUT PCM: Sink (DAI/Host)"
+        self.signal_label: str = "Sine 997 Hz"
+        self.in_peak_db: float = -120.0
+        self.in_rms_db: float = -120.0
+        self.out_peak_db: float = -120.0
+        self.out_rms_db: float = -120.0
+        self.summary_label: str = "Run Testbench or enable Real-Time to inspect Input vs. Output audio waveforms"
 
-    def set_waveforms(self, in_samples: List[float], out_samples: List[float], summary: str = "") -> None:
+        # Real-time oscilloscope state
+        self.is_realtime: bool = False
+        self.dsp_active: bool = False
+        self.trigger_lock: bool = True
+        self.live_frames_played: int = 0
+
+        # Zoom & Pan state
+        self.time_zoom: float = 1.0  # 1.0x = 600 samples (~12.5 ms @ 48 kHz)
+        self.amp_zoom: float = 1.0   # 1.0x = [-1.0, +1.0] full scale
+        self.pan_offset: int = 0     # Starting sample index
+
+        # Mouse interaction state
+        self._hover_x: Optional[float] = None
+        self._hover_y: Optional[float] = None
+        self._drag_start_pan: int = 0
+
+        self._setup_controllers()
+
+    def _setup_controllers(self) -> None:
+        # Scroll wheel: Time zoom (default), Amp zoom (Ctrl), or Horizontal pan (Shift)
+        scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL
+        )
+        scroll.connect("scroll", self._on_scroll)
+        self.add_controller(scroll)
+
+        # Drag (left or right mouse button) to pan horizontally along time axis
+        drag = Gtk.GestureDrag.new()
+        drag.set_button(0)
+        drag.connect("drag-begin", self._on_drag_begin)
+        drag.connect("drag-update", self._on_drag_update)
+        self.add_controller(drag)
+
+        # Double-click to reset zoom/pan
+        click = Gtk.GestureClick.new()
+        click.set_button(1)
+        click.connect("pressed", self._on_pressed)
+        self.add_controller(click)
+
+        # Pointer motion for interactive sample crosshair readout
+        motion = Gtk.EventControllerMotion.new()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave", self._on_leave)
+        self.add_controller(motion)
+
+    # -------------------------------------------------------------------------
+    # Public API for Labels, Waveforms, Real-Time & Zoom/Pan
+    # -------------------------------------------------------------------------
+
+    def set_stream_labels(
+        self,
+        in_label: str,
+        out_label: str,
+        signal_label: str = "",
+        rate: int = 48000,
+        channels: int = 2,
+        bits: int = 32,
+    ) -> None:
+        self.in_label = in_label
+        self.out_label = out_label
+        if signal_label:
+            self.signal_label = signal_label
+        self.sample_rate = max(1000, rate)
+        self.channels = max(1, channels)
+        self.bits = bits
+        self.queue_draw()
+
+    def set_waveforms(
+        self,
+        in_samples: List[float],
+        out_samples: List[float],
+        summary: str = "",
+        is_realtime: bool = False,
+        frames_played: int = 0,
+        dsp_active: bool = True,
+    ) -> None:
         self.in_samples = in_samples
         self.out_samples = out_samples
+        self.in_peak_db, self.in_rms_db = TestbenchRunner._compute_metrics(in_samples)
+        self.out_peak_db, self.out_rms_db = TestbenchRunner._compute_metrics(out_samples)
         if summary:
             self.summary_label = summary
+        self.is_realtime = is_realtime
+        self.dsp_active = dsp_active
+        if frames_played > 0:
+            self.live_frames_played = frames_played
+        self._clamp_pan()
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
         self.queue_draw()
+
+    def total_samples(self) -> int:
+        return max(len(self.in_samples), len(self.out_samples), 0)
+
+    def visible_sample_count(self) -> int:
+        total = max(self.total_samples(), self.BASE_VISIBLE_SAMPLES)
+        raw_vis = int(round(self.BASE_VISIBLE_SAMPLES / max(0.05, self.time_zoom)))
+        return max(16, min(total, raw_vis))
+
+    def get_zoom_summary_text(self) -> str:
+        vis = self.visible_sample_count()
+        dur_ms = (vis / float(max(1, self.sample_rate))) * 1000.0
+        return f"Time: {self.time_zoom:.2g}× ({dur_ms:.2f} ms / {vis} smp)  |  Amp: {self.amp_zoom:.2g}×"
+
+    def zoom_in_time(self, factor: float = 1.5, anchor_ratio: float = 0.5) -> None:
+        self._set_time_zoom(self.time_zoom * factor, anchor_ratio)
+
+    def zoom_out_time(self, factor: float = 1.5, anchor_ratio: float = 0.5) -> None:
+        self._set_time_zoom(self.time_zoom / factor, anchor_ratio)
+
+    def zoom_in_amp(self, factor: float = 1.4142) -> None:
+        self.amp_zoom = min(16.0, self.amp_zoom * factor)
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
+        self.queue_draw()
+
+    def zoom_out_amp(self, factor: float = 1.4142) -> None:
+        self.amp_zoom = max(0.25, self.amp_zoom / factor)
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
+        self.queue_draw()
+
+    def reset_zoom(self) -> None:
+        self.time_zoom = 1.0
+        self.amp_zoom = 1.0
+        self.pan_offset = 0
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
+        self.queue_draw()
+
+    def _set_time_zoom(self, new_zoom: float, anchor_ratio: float = 0.5) -> None:
+        total = max(self.total_samples(), self.BASE_VISIBLE_SAMPLES)
+        min_zoom = max(0.05, float(self.BASE_VISIBLE_SAMPLES) / float(max(1, total)))
+        max_zoom = 37.5  # down to 16 samples
+        old_vis = self.visible_sample_count()
+        anchor_sample = self.pan_offset + int(old_vis * max(0.0, min(1.0, anchor_ratio)))
+
+        self.time_zoom = max(min_zoom, min(max_zoom, new_zoom))
+        new_vis = self.visible_sample_count()
+        self.pan_offset = anchor_sample - int(new_vis * max(0.0, min(1.0, anchor_ratio)))
+        self._clamp_pan()
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
+        self.queue_draw()
+
+    def _clamp_pan(self) -> None:
+        total = self.total_samples()
+        vis = self.visible_sample_count()
+        max_pan = max(0, total - vis)
+        self.pan_offset = max(0, min(max_pan, self.pan_offset))
+
+    @staticmethod
+    def _find_rising_zero_crossing(samples: List[float], max_search: int = 240) -> int:
+        """Find first rising zero-crossing index for stable real-time oscilloscope triggering."""
+        limit = min(len(samples) - 1, max_search)
+        for i in range(1, limit):
+            if samples[i - 1] <= 0.0 < samples[i]:
+                return i
+        return 0
+
+    # -------------------------------------------------------------------------
+    # Event Handlers
+    # -------------------------------------------------------------------------
+
+    def _on_scroll(
+        self,
+        ctrl: Gtk.EventControllerScroll,
+        dx: float,
+        dy: float,
+    ) -> bool:
+        state = ctrl.get_current_event_state()
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+
+        if ctrl_held:
+            if dy < 0:
+                self.zoom_in_amp(1.25)
+            elif dy > 0:
+                self.zoom_out_amp(1.25)
+            return True
+
+        if shift_held or (abs(dx) > abs(dy) and abs(dx) > 0.01):
+            delta = dx if abs(dx) > abs(dy) else dy
+            step = max(1, int(self.visible_sample_count() * 0.12))
+            self.pan_offset += int(math.copysign(step, delta))
+            self._clamp_pan()
+            self.queue_draw()
+            return True
+
+        w = max(1.0, float(self.get_width()))
+        left_gutter = 62.0
+        plot_w = max(10.0, w - left_gutter - 10.0)
+        anchor = 0.5
+        if self._hover_x is not None and self._hover_x >= left_gutter:
+            anchor = max(0.0, min(1.0, (self._hover_x - left_gutter) / plot_w))
+
+        if dy < 0:
+            self.zoom_in_time(1.25, anchor_ratio=anchor)
+        elif dy > 0:
+            self.zoom_out_time(1.25, anchor_ratio=anchor)
+        return True
+
+    def _on_drag_begin(self, _gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
+        self._drag_start_pan = self.pan_offset
+
+    def _on_drag_update(self, _gesture: Gtk.GestureDrag, offset_x: float, _offset_y: float) -> None:
+        w = max(1.0, float(self.get_width()))
+        plot_w = max(10.0, w - 72.0)
+        vis = self.visible_sample_count()
+        delta_samples = int(round((-offset_x / plot_w) * vis))
+        self.pan_offset = self._drag_start_pan + delta_samples
+        self._clamp_pan()
+        self.queue_draw()
+
+    def _on_pressed(self, _gesture: Gtk.GestureClick, n_press: int, _x: float, _y: float) -> None:
+        if n_press == 2:
+            self.reset_zoom()
+
+    def _on_motion(self, _ctrl: Gtk.EventControllerMotion, x: float, y: float) -> None:
+        self._hover_x = x
+        self._hover_y = y
+        self.queue_draw()
+
+    def _on_leave(self, _ctrl: Gtk.EventControllerMotion) -> None:
+        self._hover_x = None
+        self._hover_y = None
+        self.queue_draw()
+
+    # -------------------------------------------------------------------------
+    # Rendering (Gtk.Snapshot)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _rgba(r: float, g: float, b: float, a: float = 1.0) -> Gdk.RGBA:
+        c = Gdk.RGBA()
+        c.red, c.green, c.blue, c.alpha = (r, g, b, a)
+        return c
+
+    def _draw_text(
+        self,
+        snapshot: Gtk.Snapshot,
+        text: str,
+        x: float,
+        y: float,
+        font_str: str,
+        color: Gdk.RGBA,
+    ) -> Tuple[int, int]:
+        layout = self.create_pango_layout(text)
+        layout.set_font_description(Pango.FontDescription.from_string(font_str))
+        pw, ph = layout.get_pixel_size()
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(x, y)
+        snapshot.translate(pt)
+        snapshot.append_layout(layout, color)
+        snapshot.restore()
+        return (pw, ph)
 
     def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:
         w = float(self.get_width())
         h = float(self.get_height())
-        if w <= 0 or h <= 0:
+        if w <= 20 or h <= 20:
             return
 
-        bg = Gdk.RGBA()
-        bg.red, bg.green, bg.blue, bg.alpha = (0.07, 0.08, 0.11, 1.0)
+        # Overall dark background
         bounds = Graphene.Rect.alloc()
         bounds.init(0.0, 0.0, w, h)
-        snapshot.append_color(bg, bounds)
+        snapshot.append_color(self._rgba(0.06, 0.07, 0.10, 1.0), bounds)
 
-        mid_in_y = h * 0.32
-        mid_out_y = h * 0.74
-        amp = h * 0.18
+        left_gutter = 62.0
+        right_pad = 8.0
+        top_pad = 4.0
+        bottom_ruler_h = 22.0
+        lane_gap = 6.0
 
-        # Draw center zero-lines
-        zero_col = Gdk.RGBA()
-        zero_col.red, zero_col.green, zero_col.blue, zero_col.alpha = (0.22, 0.26, 0.34, 1.0)
+        plot_x = left_gutter
+        plot_w = max(20.0, w - left_gutter - right_pad)
+        avail_h = max(40.0, h - top_pad - bottom_ruler_h - lane_gap)
+        lane_h = avail_h * 0.5
+
+        in_lane_y = top_pad
+        out_lane_y = top_pad + lane_h + lane_gap
+        ruler_y = out_lane_y + lane_h + 2.0
+
+        # Determine sample slice to display
+        total = self.total_samples()
+        vis = self.visible_sample_count()
+        trig_shift = 0
+        if self.is_realtime and self.trigger_lock and self.pan_offset == 0:
+            ref = self.out_samples if self.out_samples else self.in_samples
+            if ref:
+                trig_shift = self._find_rising_zero_crossing(ref, max_search=min(240, max(1, len(ref) - vis)))
+        start_idx = min(max(0, total - vis), self.pan_offset + trig_shift) if total > vis else 0
+
+        # Draw Lane 1: INPUT WAVEFORM
+        in_fmt_str = f"{self.signal_label} @ {self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+        in_dur_ms = (len(self.in_samples) / float(max(1, self.sample_rate))) * 1000.0
+        in_metrics = (
+            f"Peak: {self.in_peak_db:+.1f} dBFS  |  RMS: {self.in_rms_db:+.1f} dBFS  |  "
+            f"{len(self.in_samples)} smp ({in_dur_ms:.1f} ms)"
+            if self.in_samples
+            else "No input signal loaded"
+        )
+        self._draw_waveform_lane(
+            snapshot=snapshot,
+            lane_x=plot_x,
+            lane_y=in_lane_y,
+            lane_w=plot_w,
+            lane_h=lane_h,
+            left_gutter=left_gutter,
+            title_badge=f"● {self.in_label}   [{in_fmt_str}]",
+            metrics_badge=in_metrics,
+            samples=self.in_samples,
+            start_idx=start_idx,
+            vis_count=vis,
+            trace_color=self._rgba(0.28, 0.80, 0.98, 0.96),
+            fill_color=self._rgba(0.28, 0.80, 0.98, 0.13),
+            header_bg=self._rgba(0.10, 0.16, 0.24, 0.95),
+            accent_color=self._rgba(0.35, 0.85, 1.0, 1.0),
+        )
+
+        # Draw Lane 2: OUTPUT WAVEFORM
+        out_fmt_str = f"{self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+        out_dur_ms = (len(self.out_samples) / float(max(1, self.sample_rate))) * 1000.0
+        out_metrics = (
+            f"Peak: {self.out_peak_db:+.1f} dBFS  |  RMS: {self.out_rms_db:+.1f} dBFS  |  "
+            f"{len(self.out_samples)} smp ({out_dur_ms:.1f} ms)"
+            if self.out_samples
+            else "No output captured yet"
+        )
+        self._draw_waveform_lane(
+            snapshot=snapshot,
+            lane_x=plot_x,
+            lane_y=out_lane_y,
+            lane_w=plot_w,
+            lane_h=lane_h,
+            left_gutter=left_gutter,
+            title_badge=f"● {self.out_label}   [{out_fmt_str}]",
+            metrics_badge=out_metrics,
+            samples=self.out_samples,
+            start_idx=start_idx,
+            vis_count=vis,
+            trace_color=self._rgba(0.24, 0.92, 0.58, 0.96),
+            fill_color=self._rgba(0.24, 0.92, 0.58, 0.13),
+            header_bg=self._rgba(0.09, 0.20, 0.16, 0.95),
+            accent_color=self._rgba(0.30, 0.96, 0.64, 1.0),
+        )
+
+        # Draw Bottom Time-Axis Ruler & Mini Viewport Scrollbar
+        self._draw_time_ruler(
+            snapshot=snapshot,
+            plot_x=plot_x,
+            ruler_y=ruler_y,
+            plot_w=plot_w,
+            ruler_h=bottom_ruler_h - 2.0,
+            start_idx=start_idx,
+            vis_count=vis,
+            total_count=total,
+        )
+
+        # Draw Interactive Crosshair Cursor & Sample Value Tooltip on Hover
+        if (
+            self._hover_x is not None
+            and self._hover_y is not None
+            and plot_x <= self._hover_x <= plot_x + plot_w
+            and in_lane_y <= self._hover_y <= out_lane_y + lane_h
+        ):
+            self._draw_hover_crosshair(
+                snapshot=snapshot,
+                hx=self._hover_x,
+                plot_x=plot_x,
+                plot_w=plot_w,
+                top_y=in_lane_y,
+                bot_y=out_lane_y + lane_h,
+                start_idx=start_idx,
+                vis_count=vis,
+            )
+
+    def _draw_waveform_lane(
+        self,
+        snapshot: Gtk.Snapshot,
+        lane_x: float,
+        lane_y: float,
+        lane_w: float,
+        lane_h: float,
+        left_gutter: float,
+        title_badge: str,
+        metrics_badge: str,
+        samples: List[float],
+        start_idx: int,
+        vis_count: int,
+        trace_color: Gdk.RGBA,
+        fill_color: Gdk.RGBA,
+        header_bg: Gdk.RGBA,
+        accent_color: Gdk.RGBA,
+    ) -> None:
+        hdr_h = min(19.0, max(15.0, lane_h * 0.24))
+        body_y = lane_y + hdr_h
+        body_h = max(16.0, lane_h - hdr_h)
+        mid_y = body_y + body_h * 0.5
+        amp_px = (body_h * 0.44)
+
+        # Lane background & header strip
+        lane_rect = Graphene.Rect.alloc()
+        lane_rect.init(lane_x, lane_y, lane_w, lane_h)
+        snapshot.append_color(self._rgba(0.08, 0.10, 0.14, 1.0), lane_rect)
+
+        hdr_rect = Graphene.Rect.alloc()
+        hdr_rect.init(lane_x, lane_y, lane_w, hdr_h)
+        snapshot.append_color(header_bg, hdr_rect)
+
+        # Left gutter background for this lane
+        gut_rect = Graphene.Rect.alloc()
+        gut_rect.init(2.0, lane_y, left_gutter - 4.0, lane_h)
+        snapshot.append_color(self._rgba(0.07, 0.08, 0.12, 1.0), gut_rect)
+
+        # Y-axis scale labels in left gutter
+        full_scale_val = 1.0 / max(0.1, self.amp_zoom)
+        axis_col = self._rgba(0.62, 0.68, 0.78, 0.95)
+        self._draw_text(
+            snapshot,
+            f"+{full_scale_val:.2g}",
+            6.0,
+            body_y + 1.0,
+            "Monospace 7.5",
+            axis_col,
+        )
+        self._draw_text(
+            snapshot,
+            " 0.0",
+            6.0,
+            mid_y - 6.0,
+            "Monospace 7.5",
+            axis_col,
+        )
+        self._draw_text(
+            snapshot,
+            f"-{full_scale_val:.2g}",
+            6.0,
+            body_y + body_h - 13.0,
+            "Monospace 7.5",
+            axis_col,
+        )
+
+        # Horizontal & vertical grid lines inside body
+        grid_pb = Gsk.PathBuilder.new()
+        for frac in (0.25, 0.75):
+            gy = body_y + body_h * frac
+            grid_pb.move_to(lane_x, gy)
+            grid_pb.line_to(lane_x + lane_w, gy)
+        n_vgrid = 6
+        for gi_idx in range(1, n_vgrid):
+            gx = lane_x + (gi_idx / float(n_vgrid)) * lane_w
+            grid_pb.move_to(gx, body_y)
+            grid_pb.line_to(gx, body_y + body_h)
+        snapshot.append_stroke(
+            grid_pb.to_path(),
+            Gsk.Stroke.new(1.0),
+            self._rgba(0.14, 0.17, 0.23, 0.85),
+        )
+
+        # Zero line
         zpb = Gsk.PathBuilder.new()
-        zpb.move_to(0.0, mid_in_y)
-        zpb.line_to(w, mid_in_y)
-        zpb.move_to(0.0, mid_out_y)
-        zpb.line_to(w, mid_out_y)
-        snapshot.append_stroke(zpb.to_path(), Gsk.Stroke.new(1.0), zero_col)
+        zpb.move_to(lane_x, mid_y)
+        zpb.line_to(lane_x + lane_w, mid_y)
+        snapshot.append_stroke(
+            zpb.to_path(),
+            Gsk.Stroke.new(1.1),
+            self._rgba(0.24, 0.30, 0.40, 1.0),
+        )
 
-        # Draw Input Waveform (Cyan)
-        if self.in_samples:
-            in_col = Gdk.RGBA()
-            in_col.red, in_col.green, in_col.blue, in_col.alpha = (0.28, 0.78, 0.96, 0.95)
-            self._draw_trace(snapshot, self.in_samples, w, mid_in_y, amp, in_col)
+        # Header labels (Left: Stream Title & Format; Right: Peak/RMS/Frames)
+        self._draw_text(
+            snapshot,
+            title_badge,
+            lane_x + 8.0,
+            lane_y + 2.0,
+            "Sans Bold 8.5",
+            accent_color,
+        )
+        m_layout = self.create_pango_layout(metrics_badge)
+        m_layout.set_font_description(Pango.FontDescription.from_string("Monospace 8"))
+        mw, _ = m_layout.get_pixel_size()
+        if lane_w - mw - 10.0 > 240.0:
+            snapshot.save()
+            pt = Graphene.Point.alloc()
+            pt.init(lane_x + lane_w - mw - 8.0, lane_y + 2.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(m_layout, self._rgba(0.84, 0.90, 0.96, 0.95))
+            snapshot.restore()
 
-        # Draw Output Waveform (Emerald Green)
-        if self.out_samples:
-            out_col = Gdk.RGBA()
-            out_col.red, out_col.green, out_col.blue, out_col.alpha = (0.24, 0.92, 0.58, 0.95)
-            self._draw_trace(snapshot, self.out_samples, w, mid_out_y, amp, out_col)
+        # Clip & Draw Waveform Trace inside body rect
+        clip_rect = Graphene.Rect.alloc()
+        clip_rect.init(lane_x, body_y, lane_w, body_h)
+        snapshot.push_clip(clip_rect)
 
-        # Overlay labels
-        txt_col = Gdk.RGBA()
-        txt_col.red, txt_col.green, txt_col.blue, txt_col.alpha = (0.85, 0.90, 0.96, 1.0)
-        layout = self.create_pango_layout(self.summary_label)
-        layout.set_font_description(Pango.FontDescription.from_string("Sans Bold 8"))
+        if samples and start_idx < len(samples):
+            slice_end = min(len(samples), start_idx + vis_count)
+            view_slice = samples[start_idx:slice_end]
+            n_pts = len(view_slice)
+            if n_pts >= 2:
+                # Decimate if zoomed way out so rendering stays 60fps
+                max_draw_pts = max(400, int(lane_w * 1.5))
+                step = max(1, n_pts // max_draw_pts)
+                pb = Gsk.PathBuilder.new()
+                fill_pb = Gsk.PathBuilder.new()
+                denom = float(max(1, vis_count - 1))
+
+                first_x = lane_x
+                last_x = lane_x
+                for idx in range(0, n_pts, step):
+                    x = lane_x + (idx / denom) * lane_w
+                    scaled = max(-1.15, min(1.15, view_slice[idx] * self.amp_zoom))
+                    y = mid_y - scaled * amp_px
+                    if idx == 0:
+                        first_x = x
+                        pb.move_to(x, y)
+                        fill_pb.move_to(x, mid_y)
+                        fill_pb.line_to(x, y)
+                    else:
+                        pb.line_to(x, y)
+                        fill_pb.line_to(x, y)
+                    last_x = x
+
+                fill_pb.line_to(last_x, mid_y)
+                fill_pb.line_to(first_x, mid_y)
+                fill_pb.close()
+                snapshot.append_fill(fill_pb.to_path(), Gsk.FillRule.WINDING, fill_color)
+                snapshot.append_stroke(pb.to_path(), Gsk.Stroke.new(1.65), trace_color)
+
+                # When zoomed in closely (<= 120 samples), draw discrete sample markers
+                if vis_count <= 120:
+                    dot_pb = Gsk.PathBuilder.new()
+                    for idx in range(n_pts):
+                        x = lane_x + (idx / denom) * lane_w
+                        scaled = max(-1.15, min(1.15, view_slice[idx] * self.amp_zoom))
+                        y = mid_y - scaled * amp_px
+                        c_pt = Graphene.Point.alloc()
+                        c_pt.init(x, y)
+                        dot_pb.add_circle(c_pt, 2.4)
+                    snapshot.append_fill(dot_pb.to_path(), Gsk.FillRule.WINDING, accent_color)
+        else:
+            self._draw_text(
+                snapshot,
+                self.summary_label,
+                lane_x + 14.0,
+                mid_y - 7.0,
+                "Sans Italic 8.5",
+                self._rgba(0.55, 0.62, 0.72, 0.85),
+            )
+
+        snapshot.pop()
+
+        # Lane border
+        b_pb = Gsk.PathBuilder.new()
+        b_pb.add_rect(lane_rect)
+        snapshot.append_stroke(
+            b_pb.to_path(),
+            Gsk.Stroke.new(1.0),
+            self._rgba(0.20, 0.25, 0.34, 1.0),
+        )
+
+    def _draw_time_ruler(
+        self,
+        snapshot: Gtk.Snapshot,
+        plot_x: float,
+        ruler_y: float,
+        plot_w: float,
+        ruler_h: float,
+        start_idx: int,
+        vis_count: int,
+        total_count: int,
+    ) -> None:
+        r_rect = Graphene.Rect.alloc()
+        r_rect.init(plot_x, ruler_y, plot_w, ruler_h)
+        snapshot.append_color(self._rgba(0.07, 0.08, 0.12, 1.0), r_rect)
+
+        self._draw_text(
+            snapshot,
+            "TIME / SMP",
+            4.0,
+            ruler_y + 3.0,
+            "Sans Bold 7",
+            self._rgba(0.55, 0.62, 0.72, 0.9),
+        )
+
+        n_ticks = 6
+        rate = float(max(1, self.sample_rate))
+        tick_col = self._rgba(0.72, 0.78, 0.88, 0.95)
+        for ti in range(n_ticks + 1):
+            frac = ti / float(n_ticks)
+            smp_idx = start_idx + int(round(frac * (vis_count - 1)))
+            t_ms = (smp_idx / rate) * 1000.0
+            lbl = f"{t_ms:.2f}ms (#{smp_idx})"
+            tx = plot_x + frac * plot_w
+            if ti == n_ticks:
+                tx -= 78.0
+            elif ti > 0:
+                tx -= 34.0
+            self._draw_text(snapshot, lbl, max(plot_x + 2.0, tx), ruler_y + 2.0, "Monospace 7.5", tick_col)
+
+        # Mini horizontal viewport scrollbar along bottom 3px of ruler
+        if total_count > 0:
+            sb_y = ruler_y + ruler_h - 3.5
+            track_rect = Graphene.Rect.alloc()
+            track_rect.init(plot_x, sb_y, plot_w, 3.0)
+            snapshot.append_color(self._rgba(0.14, 0.17, 0.24, 1.0), track_rect)
+
+            thumb_x = plot_x + (start_idx / float(total_count)) * plot_w
+            thumb_w = max(12.0, min(plot_w, (vis_count / float(total_count)) * plot_w))
+            if thumb_x + thumb_w > plot_x + plot_w:
+                thumb_x = plot_x + plot_w - thumb_w
+            thumb_rect = Graphene.Rect.alloc()
+            thumb_rect.init(thumb_x, sb_y, thumb_w, 3.0)
+            snapshot.append_color(self._rgba(0.35, 0.68, 0.95, 0.85), thumb_rect)
+
+    def _draw_hover_crosshair(
+        self,
+        snapshot: Gtk.Snapshot,
+        hx: float,
+        plot_x: float,
+        plot_w: float,
+        top_y: float,
+        bot_y: float,
+        start_idx: int,
+        vis_count: int,
+    ) -> None:
+        rel = max(0.0, min(1.0, (hx - plot_x) / max(1.0, plot_w)))
+        smp_idx = start_idx + int(round(rel * max(1, vis_count - 1)))
+        t_ms = (smp_idx / float(max(1, self.sample_rate))) * 1000.0
+
+        in_val = self.in_samples[smp_idx] if smp_idx < len(self.in_samples) else 0.0
+        out_val = self.out_samples[smp_idx] if smp_idx < len(self.out_samples) else 0.0
+        in_db = 20.0 * math.log10(abs(in_val)) if abs(in_val) > 1e-9 else -120.0
+        out_db = 20.0 * math.log10(abs(out_val)) if abs(out_val) > 1e-9 else -120.0
+
+        # Vertical cursor line
+        cpb = Gsk.PathBuilder.new()
+        cpb.move_to(hx, top_y)
+        cpb.line_to(hx, bot_y)
+        snapshot.append_stroke(
+            cpb.to_path(),
+            Gsk.Stroke.new(1.0),
+            self._rgba(1.0, 0.86, 0.36, 0.85),
+        )
+
+        # Floating readout pill
+        info_txt = (
+            f"Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
+            f"IN: {in_val:+.4f} ({in_db:+.1f} dBFS)  |  "
+            f"OUT: {out_val:+.4f} ({out_db:+.1f} dBFS)"
+        )
+        layout = self.create_pango_layout(info_txt)
+        layout.set_font_description(Pango.FontDescription.from_string("Monospace Bold 8"))
+        tw, th = layout.get_pixel_size()
+
+        bx = min(plot_x + plot_w - tw - 14.0, max(plot_x + 6.0, hx + 10.0))
+        by = top_y + 20.0
+        bg_rect = Graphene.Rect.alloc()
+        bg_rect.init(bx - 5.0, by - 2.0, float(tw + 10), float(th + 4))
+        snapshot.append_color(self._rgba(0.05, 0.06, 0.09, 0.92), bg_rect)
+
+        b_pb = Gsk.PathBuilder.new()
+        b_pb.add_rect(bg_rect)
+        snapshot.append_stroke(b_pb.to_path(), Gsk.Stroke.new(1.0), self._rgba(1.0, 0.86, 0.36, 0.8))
+
         snapshot.save()
         pt = Graphene.Point.alloc()
-        pt.init(10.0, 4.0)
+        pt.init(bx, by)
         snapshot.translate(pt)
-        snapshot.append_layout(layout, txt_col)
+        snapshot.append_layout(layout, self._rgba(0.98, 0.95, 0.82, 1.0))
         snapshot.restore()
 
-    @staticmethod
-    def _draw_trace(
-        snapshot: Gtk.Snapshot,
-        samples: List[float],
-        w: float,
-        center_y: float,
-        amp: float,
-        color: Gdk.RGBA,
-    ) -> None:
-        # Plot first ~600 samples so individual sine/chirp cycles are clearly visible
-        view_n = min(len(samples), 600)
-        if view_n < 2:
-            return
-        pb = Gsk.PathBuilder.new()
-        for i in range(view_n):
-            x = (i / float(view_n - 1)) * w
-            y = center_y - max(-1.0, min(1.0, samples[i])) * amp
-            if i == 0:
-                pb.move_to(x, y)
-            else:
-                pb.line_to(x, y)
-        snapshot.append_stroke(pb.to_path(), Gsk.Stroke.new(1.6), color)

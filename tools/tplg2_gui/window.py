@@ -14,9 +14,15 @@ from typing import Dict, List, Optional
 
 import gi
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gdk, Gio, GLib, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
 
-from .compiler import CompileResult, TopologyCompiler
+from .compiler import (
+    CompileDiagnostic,
+    CompileResult,
+    TopologyCompiler,
+    classify_log_line,
+    parse_compile_diagnostics,
+)
 from .graph_canvas import TopologyGraphCanvas
 from .layout import _compute_node_geometry, layout_graph
 from .left_panes import LeftNavigationPanel
@@ -59,8 +65,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.last_telemetry: Optional[TestbenchTelemetry] = None
         self._discovered_kcontrols: List[KcontrolTelemetryItem] = []
         self._pending_kctl_overrides: Dict[str, List[int]] = {}
+        self._log_line_diagnostics: Dict[int, CompileDiagnostic] = {}
+        self._last_compile_diagnostics: List[CompileDiagnostic] = []
+        self._last_conf_path: str = ""
         self._last_allocated_width: int = 0
         self._last_allocated_height: int = 0
+        self._rt_timer_id: Optional[int] = None
+        self._rt_poll_busy: bool = False
 
         self._build_header_bar()
         self._build_main_3panel_layout()
@@ -182,6 +193,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.fmt_combo = Gtk.DropDown.new_from_strings(["S32_LE", "S24_LE", "S16_LE"])
         self.fmt_combo.set_selected(0)
         self.fmt_combo.set_tooltip_text("Testbench PCM Sample Format (-b)")
+        self.fmt_combo.connect("notify::selected", lambda *_a: self._update_waveform_stream_labels())
         header.pack_end(self.fmt_combo)
 
         # Signal selector
@@ -197,6 +209,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         )
         self.sig_combo.set_selected(0)
         self.sig_combo.set_tooltip_text("Test audio signal to run through the pipeline")
+        self.sig_combo.connect("notify::selected", lambda *_a: self._update_waveform_stream_labels())
         header.pack_end(self.sig_combo)
 
     def _build_main_3panel_layout(self) -> None:
@@ -207,14 +220,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.hpaned_outer.set_resize_end_child(True)
         self.hpaned_outer.set_position(390)
 
-        # Inner horizontal paned: [Middle Graph Panel (50%)] | [Right Attribute Inspector (25%)]
+        # Inner horizontal paned: [Middle Graph + Waveforms Panel (50%)] | [Right Notebook (25%)]
         self.hpaned_inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         self.hpaned_inner.set_wide_handle(True)
         self.hpaned_inner.set_resize_start_child(True)
         self.hpaned_inner.set_resize_end_child(False)
         self.hpaned_inner.set_position(780)
 
-        # 1. Left Hand Panel (Object View & File View notebook) wrapped in high-level panel border
+        # 1. Left Hand Panel (Object View, File View & Compile notebook) wrapped in high-level panel border
         self.left_panel = LeftNavigationPanel(
             on_item_selected=self._on_left_pane_item_selected,
             on_add_module_requested=self._on_add_module_requested,
@@ -228,14 +241,19 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         left_panel_frame.set_margin_bottom(4)
         left_panel_frame.set_child(self.left_panel)
 
-        # 2. Middle Horizontal Panel (Graph Canvas + Bottom Testbench/Compiler Drawer)
+        # 2. Middle Horizontal Panel:
+        #    Vertical Paned: Top = Graph Canvas, Bottom = Real-Time / Zoomable Waveforms Pane + Status Bar
+        center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        center_box.set_vexpand(True)
+        center_box.set_hexpand(True)
+
         self.center_vpaned = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
         self.center_vpaned.set_wide_handle(True)
         self.center_vpaned.set_vexpand(True)
         self.center_vpaned.set_hexpand(True)
         self.center_vpaned.set_resize_start_child(True)
         self.center_vpaned.set_resize_end_child(False)
-        self.center_vpaned.set_position(640)
+        self.center_vpaned.set_position(580)
 
         self.canvas = TopologyGraphCanvas(
             on_selection_changed=self._on_canvas_selection_changed,
@@ -244,37 +262,159 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         )
         canvas_frame = Gtk.Frame()
         canvas_frame.add_css_class("sub-panel-frame")
+        canvas_frame.set_vexpand(True)
+        canvas_frame.set_hexpand(True)
         canvas_frame.set_child(self.canvas)
         self.center_vpaned.set_start_child(canvas_frame)
 
-        # Bottom drawer: Waveform comparison + SOFR Telemetry / Remote Control / Console Log
-        bottom_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        bottom_box.set_margin_start(4)
-        bottom_box.set_margin_end(4)
-        bottom_box.set_margin_top(4)
-        bottom_box.set_margin_bottom(4)
+        # Bottom Waveforms Pane (below the Main Graph Pane)
+        wf_pane_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        wf_pane_box.set_margin_start(4)
+        wf_pane_box.set_margin_end(4)
+        wf_pane_box.set_margin_top(3)
+        wf_pane_box.set_margin_bottom(3)
 
-        self.status_lbl = Gtk.Label(label="Ready.")
-        self.status_lbl.set_xalign(0.0)
-        bottom_box.append(self.status_lbl)
+        wf_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.wf_status_lbl = Gtk.Label(label="Waveforms [IDLE]", xalign=0.0)
+        self.wf_status_lbl.add_css_class("heading")
+        self.wf_status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.wf_status_lbl.set_hexpand(True)
+        wf_toolbar.append(self.wf_status_lbl)
 
-        # Split bottom drawer horizontally: [WaveformSnapshotWidget] | [Notebook: SOFR Telemetry / Control / Log]
-        bottom_hpaned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
-        bottom_hpaned.set_wide_handle(True)
-        bottom_hpaned.set_vexpand(True)
-        bottom_hpaned.set_position(360)
+        self.rt_waveform_btn = Gtk.ToggleButton(label="⚡ Real-Time")
+        self.rt_waveform_btn.set_tooltip_text(
+            "Stream live Input & Output PCM waveforms in real time from sof-testbench4 (-W)"
+        )
+        self.rt_waveform_btn.connect("toggled", self._on_rt_waveform_toggled)
+        wf_toolbar.append(self.rt_waveform_btn)
+
+        self.wf_trigger_btn = Gtk.ToggleButton(label="🎯 Trigger")
+        self.wf_trigger_btn.set_active(True)
+        self.wf_trigger_btn.set_tooltip_text(
+            "Lock real-time waveform to rising zero-crossing (uncheck for free-running scroll)"
+        )
+        self.wf_trigger_btn.connect("toggled", self._on_wf_trigger_toggled)
+        wf_toolbar.append(self.wf_trigger_btn)
+
+        self.wf_zoom_lbl = Gtk.Label(label="Time: 1× (12.50 ms / 600 smp)  |  Amp: 1×")
+        self.wf_zoom_lbl.add_css_class("monospace")
+        wf_toolbar.append(self.wf_zoom_lbl)
+
+        btn_zout = Gtk.Button(label="🔍−")
+        btn_zout.set_tooltip_text("Zoom Out time axis (or Mouse Wheel Down on waveform)")
+        btn_zout.connect("clicked", lambda _b: self.waveform_widget.zoom_out_time())
+        wf_toolbar.append(btn_zout)
+
+        btn_zin = Gtk.Button(label="🔍+")
+        btn_zin.set_tooltip_text("Zoom In time axis (or Mouse Wheel Up on waveform)")
+        btn_zin.connect("clicked", lambda _b: self.waveform_widget.zoom_in_time())
+        wf_toolbar.append(btn_zin)
+
+        btn_zfit = Gtk.Button(label="1:1 Fit")
+        btn_zfit.set_tooltip_text("Reset time & amplitude zoom and pan (or Double-Click waveform)")
+        btn_zfit.connect("clicked", lambda _b: self.waveform_widget.reset_zoom())
+        wf_toolbar.append(btn_zfit)
+
+        btn_aout = Gtk.Button(label="Amp −")
+        btn_aout.set_tooltip_text("Decrease vertical amplitude magnification (Ctrl + Wheel Down)")
+        btn_aout.connect("clicked", lambda _b: self.waveform_widget.zoom_out_amp())
+        wf_toolbar.append(btn_aout)
+
+        btn_ain = Gtk.Button(label="Amp +")
+        btn_ain.set_tooltip_text("Increase vertical amplitude magnification (Ctrl + Wheel Up)")
+        btn_ain.connect("clicked", lambda _b: self.waveform_widget.zoom_in_amp())
+        wf_toolbar.append(btn_ain)
+
+        wf_pane_box.append(wf_toolbar)
+
+        self.waveform_widget = WaveformSnapshotWidget(on_zoom_changed=self._on_waveform_zoom_changed)
+        self.waveform_widget.set_size_request(-1, 185)
+        wf_pane_box.append(self.waveform_widget)
 
         wf_frame = Gtk.Frame()
         wf_frame.add_css_class("sub-panel-frame")
-        self.waveform_widget = WaveformSnapshotWidget()
-        wf_frame.set_child(self.waveform_widget)
-        bottom_hpaned.set_start_child(wf_frame)
+        wf_frame.set_child(wf_pane_box)
+        self.center_vpaned.set_end_child(wf_frame)
 
-        self.bottom_notebook = Gtk.Notebook()
-        self.bottom_notebook.set_vexpand(True)
-        self.bottom_notebook.set_hexpand(True)
+        center_box.append(self.center_vpaned)
 
-        # Tab 1: SOFR Telemetry View
+        self.status_lbl = Gtk.Label(label="Ready.")
+        self.status_lbl.set_xalign(0.0)
+        self.status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.status_lbl.set_margin_start(6)
+        self.status_lbl.set_margin_end(6)
+        self.status_lbl.set_margin_top(2)
+        self.status_lbl.set_margin_bottom(4)
+        center_box.append(self.status_lbl)
+
+        center_panel_frame = Gtk.Frame()
+        center_panel_frame.add_css_class("high-level-panel")
+        center_panel_frame.set_margin_start(2)
+        center_panel_frame.set_margin_end(2)
+        center_panel_frame.set_margin_top(4)
+        center_panel_frame.set_margin_bottom(4)
+        center_panel_frame.set_child(center_box)
+
+        # Compile Pane (attached as a page on the Left Panel's Object View / File View notebook)
+        compile_pane_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        compile_pane_box.set_margin_start(4)
+        compile_pane_box.set_margin_end(4)
+        compile_pane_box.set_margin_top(4)
+        compile_pane_box.set_margin_bottom(4)
+
+        compile_hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.compile_pane_status_lbl = Gtk.Label(
+            label="alsatplg Compiler Output (Dbl-Click error/warning)",
+            xalign=0.0,
+        )
+        self.compile_pane_status_lbl.set_hexpand(True)
+        self.compile_pane_status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.compile_pane_status_lbl.add_css_class("heading")
+        compile_hdr.append(self.compile_pane_status_lbl)
+
+        clear_log_btn = Gtk.Button(label="Clear")
+        clear_log_btn.set_tooltip_text("Clear compile & protocol log")
+        clear_log_btn.connect("clicked", self._on_clear_compile_log_clicked)
+        compile_hdr.append(clear_log_btn)
+        compile_pane_box.append(compile_hdr)
+
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_vexpand(True)
+        log_scroll.set_hexpand(True)
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_tooltip_text(
+            "Double-click any red error or yellow warning line to focus the failing part in the Main Graph Viewer and Attribute Editor"
+        )
+        self._init_log_text_tags()
+
+        log_click = Gtk.GestureClick.new()
+        log_click.set_button(1)
+        log_click.connect("pressed", self._on_log_view_pressed)
+        self.log_view.add_controller(log_click)
+
+        log_scroll.set_child(self.log_view)
+        compile_pane_box.append(log_scroll)
+        self.left_panel.attach_compile_pane(compile_pane_box)
+
+        # 3. Right Hand Panel Notebook:
+        #    Page 0 = Attributes (RightAttributeInspector)
+        #    Page 1 = SOFR Telemetry (Full-height live DSP telemetry report)
+        #    Page 2 = Remote Control (DSP Control, Kcontrols, Remote Shell)
+        self.right_notebook = Gtk.Notebook()
+        self.right_notebook.set_vexpand(True)
+        self.right_notebook.set_hexpand(True)
+
+        # Right Notebook Tab 1: Attributes
+        self.right_inspector = RightAttributeInspector(
+            on_attribute_edited=self._on_node_attribute_edited,
+            on_before_attribute_edit=self._on_before_attribute_edit,
+        )
+        self.right_notebook.append_page(self.right_inspector, Gtk.Label(label="Attributes"))
+
+        # Right Notebook Tab 2: SOFR Telemetry
         telem_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         telem_box.set_margin_start(4)
         telem_box.set_margin_end(4)
@@ -285,6 +425,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             label="SOFR Telemetry: Run Testbench to query DSP cores, KCPS, SRAM banks, heap, DAPM & kcontrols."
         )
         self.telem_summary_lbl.set_xalign(0.0)
+        self.telem_summary_lbl.set_wrap(True)
         self.telem_summary_lbl.add_css_class("heading")
         telem_box.append(self.telem_summary_lbl)
 
@@ -297,134 +438,116 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.telem_view.set_wrap_mode(Gtk.WrapMode.NONE)
         telem_scroll.set_child(self.telem_view)
         telem_box.append(telem_scroll)
-        self.bottom_notebook.append_page(telem_box, Gtk.Label(label="SOFR Telemetry"))
 
-        # Tab 2: Remote Control & Kcontrols (SOFR Protocol)
-        ctl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.right_notebook.append_page(telem_box, Gtk.Label(label="SOFR Telemetry"))
+
+        # Right Notebook Tab 3: Remote Control & Kcontrols (SOFR Protocol)
+        ctl_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         ctl_box.set_margin_start(6)
         ctl_box.set_margin_end(6)
         ctl_box.set_margin_top(6)
         ctl_box.set_margin_bottom(6)
 
-        # Row 1: DSP Power, Execution, Tone & Telemetry Poll Controls
-        exec_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        exec_row.append(Gtk.Label(label="DSP Control:"))
+        # Section 1: DSP Power, Execution, Tone & Telemetry Poll Controls (2 compact rows)
+        dsp_hdr = Gtk.Label(label="DSP Power, Tone & Execution Control", xalign=0.0)
+        dsp_hdr.add_css_class("heading")
+        ctl_box.append(dsp_hdr)
 
+        exec_row1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         btn_wake = Gtk.Button(label="▶ Resume (D0)")
+        btn_wake.set_hexpand(True)
         btn_wake.set_tooltip_text("SOF_NET_OP_PM_CTL: SOF_PM_OP_WAKE_HOLD")
         btn_wake.connect("clicked", lambda _b: self._on_remote_pm_ctl(SOF_PM_OP_WAKE_HOLD))
-        exec_row.append(btn_wake)
+        exec_row1.append(btn_wake)
 
         btn_pause = Gtk.Button(label="⏸ Pause (D3)")
+        btn_pause.set_hexpand(True)
         btn_pause.set_tooltip_text("SOF_NET_OP_PM_CTL: SOF_PM_OP_RELEASE_HOLD")
         btn_pause.connect("clicked", lambda _b: self._on_remote_pm_ctl(SOF_PM_OP_RELEASE_HOLD))
-        exec_row.append(btn_pause)
+        exec_row1.append(btn_pause)
 
         btn_step = Gtk.Button(label="⏭ Step 10 Ticks")
+        btn_step.set_hexpand(True)
         btn_step.set_tooltip_text("SOF_NET_OP_SHELL_EXEC: step 10")
         btn_step.connect("clicked", lambda _b: self._on_remote_shell_preset("step 10"))
-        exec_row.append(btn_step)
+        exec_row1.append(btn_step)
+        ctl_box.append(exec_row1)
 
+        exec_row2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.remote_tone_btn = Gtk.ToggleButton(label="🎵 1kHz Tone")
+        self.remote_tone_btn.set_hexpand(True)
         self.remote_tone_btn.set_tooltip_text("SOF_NET_OP_PCM_CTL: START_TONE / STOP_TONE")
         self.remote_tone_btn.connect("toggled", self._on_remote_tone_toggled)
-        exec_row.append(self.remote_tone_btn)
+        exec_row2.append(self.remote_tone_btn)
 
         btn_poll = Gtk.Button(label="🔄 Refresh Telemetry")
+        btn_poll.set_hexpand(True)
         btn_poll.set_tooltip_text("Poll SOF_NET_OP_TELEM_SNAPSHOT & SOF_PCM_OP_CAPTURE_BUFFER")
         btn_poll.connect("clicked", self._on_refresh_telemetry_clicked)
-        exec_row.append(btn_poll)
+        exec_row2.append(btn_poll)
 
         btn_stop_srv = Gtk.Button(label="⏹ Stop Server")
+        btn_stop_srv.set_hexpand(True)
         btn_stop_srv.set_tooltip_text("Send SOF_NET_OP_SHELL_EXEC 'quit' to stop live testbench server")
         btn_stop_srv.connect("clicked", self._on_stop_live_server_clicked)
-        exec_row.append(btn_stop_srv)
-        ctl_box.append(exec_row)
+        exec_row2.append(btn_stop_srv)
+        ctl_box.append(exec_row2)
 
-        # Row 2: Kcontrol Configuration (SOF_NET_OP_KCTL_LIST / SOF_NET_OP_KCTL_SET)
-        kctl_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        kctl_row.append(Gtk.Label(label="Kcontrol:"))
+        # Section 2: Kcontrol Configuration (SOF_NET_OP_KCTL_LIST / SOF_NET_OP_KCTL_SET)
+        kctl_hdr = Gtk.Label(label="Kcontrol Configuration (OP_KCTL_LIST / SET)", xalign=0.0)
+        kctl_hdr.add_css_class("heading")
+        ctl_box.append(kctl_hdr)
+
         self.kctl_combo = Gtk.DropDown.new_from_strings(["(Run testbench to list kcontrols)"])
         self.kctl_combo.set_hexpand(True)
         self.kctl_combo.connect("notify::selected", self._on_kctl_combo_selected)
-        kctl_row.append(self.kctl_combo)
+        ctl_box.append(self.kctl_combo)
 
-        kctl_row.append(Gtk.Label(label="Values:"))
+        kctl_val_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        kctl_val_row.append(Gtk.Label(label="Values:"))
         self.kctl_val_entry = Gtk.Entry()
         self.kctl_val_entry.set_placeholder_text("e.g. 28,28")
-        self.kctl_val_entry.set_width_chars(12)
-        kctl_row.append(self.kctl_val_entry)
+        self.kctl_val_entry.set_hexpand(True)
+        kctl_val_row.append(self.kctl_val_entry)
 
-        btn_kctl_set = Gtk.Button(label="Apply Kcontrol (OP_KCTL_SET)")
+        btn_kctl_set = Gtk.Button(label="Apply Kcontrol")
         btn_kctl_set.connect("clicked", self._on_apply_kcontrol_clicked)
-        kctl_row.append(btn_kctl_set)
-        ctl_box.append(kctl_row)
+        kctl_val_row.append(btn_kctl_set)
+        ctl_box.append(kctl_val_row)
 
-        # Row 3: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
+        # Section 3: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
+        sh_hdr = Gtk.Label(label="Remote Testbench Shell (OP_SHELL_EXEC)", xalign=0.0)
+        sh_hdr.add_css_class("heading")
+        ctl_box.append(sh_hdr)
+
         sh_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        sh_row.append(Gtk.Label(label="Shell:"))
         self.remote_shell_entry = Gtk.Entry()
-        self.remote_shell_entry.set_placeholder_text(
-            "Enter testbench shell command (info, pipelines, controls, stats, kernel cycles, kernel threads…)"
-        )
+        self.remote_shell_entry.set_placeholder_text("info, pipelines, controls, stats, kernel cycles…")
         self.remote_shell_entry.set_hexpand(True)
         self.remote_shell_entry.connect("activate", lambda _e: self._on_run_remote_shell_clicked(None))
         sh_row.append(self.remote_shell_entry)
 
-        btn_sh_run = Gtk.Button(label="Send (OP_SHELL_EXEC)")
+        btn_sh_run = Gtk.Button(label="Send")
         btn_sh_run.connect("clicked", self._on_run_remote_shell_clicked)
         sh_row.append(btn_sh_run)
+        ctl_box.append(sh_row)
 
+        sh_presets_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         for sh_cmd in ("info", "pipelines", "stats", "kernel cycles", "kernel threads"):
             b_pre = Gtk.Button(label=sh_cmd)
             b_pre.connect("clicked", lambda _b, c=sh_cmd: self._on_remote_shell_preset(c))
-            sh_row.append(b_pre)
-        ctl_box.append(sh_row)
+            sh_presets_row.append(b_pre)
+        ctl_box.append(sh_presets_row)
 
-        self.bottom_notebook.append_page(ctl_box, Gtk.Label(label="Remote Control & Kcontrols"))
+        self.right_notebook.append_page(ctl_box, Gtk.Label(label="Remote Control"))
 
-        # Tab 3: Console & Protocol Log
-        log_scroll = Gtk.ScrolledWindow()
-        log_scroll.set_vexpand(True)
-        log_scroll.set_hexpand(True)
-        self.log_view = Gtk.TextView()
-        self.log_view.set_editable(False)
-        self.log_view.set_monospace(True)
-        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        log_scroll.set_child(self.log_view)
-        self.bottom_notebook.append_page(log_scroll, Gtk.Label(label="Console & Protocol Log"))
-
-        nb_frame = Gtk.Frame()
-        nb_frame.add_css_class("sub-panel-frame")
-        nb_frame.set_child(self.bottom_notebook)
-        bottom_hpaned.set_end_child(nb_frame)
-
-        bottom_box.append(bottom_hpaned)
-        bottom_drawer_frame = Gtk.Frame()
-        bottom_drawer_frame.add_css_class("sub-panel-frame")
-        bottom_drawer_frame.set_child(bottom_box)
-        self.center_vpaned.set_end_child(bottom_drawer_frame)
-
-        center_panel_frame = Gtk.Frame()
-        center_panel_frame.add_css_class("high-level-panel")
-        center_panel_frame.set_margin_start(2)
-        center_panel_frame.set_margin_end(2)
-        center_panel_frame.set_margin_top(4)
-        center_panel_frame.set_margin_bottom(4)
-        center_panel_frame.set_child(self.center_vpaned)
-
-        # 3. Right Hand Panel (Tree View of Attributes of Selected Graph Node)
-        self.right_inspector = RightAttributeInspector(
-            on_attribute_edited=self._on_node_attribute_edited,
-            on_before_attribute_edit=self._on_before_attribute_edit,
-        )
         right_panel_frame = Gtk.Frame()
         right_panel_frame.add_css_class("high-level-panel")
         right_panel_frame.set_margin_start(2)
         right_panel_frame.set_margin_end(4)
         right_panel_frame.set_margin_top(4)
         right_panel_frame.set_margin_bottom(4)
-        right_panel_frame.set_child(self.right_inspector)
+        right_panel_frame.set_child(self.right_notebook)
 
         self.hpaned_inner.set_start_child(center_panel_frame)
         self.hpaned_inner.set_end_child(right_panel_frame)
@@ -446,17 +569,17 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self._last_allocated_height = total_h
             target_left = int(total_w * 0.25)
             target_center = int(total_w * 0.50)
-            target_vpos = int(total_h * 0.72)
+            target_center_vpos = int(total_h * 0.68)
             self.hpaned_outer.set_position(target_left)
             self.hpaned_inner.set_position(target_center)
-            self.center_vpaned.set_position(target_vpos)
-            GLib.idle_add(self._sync_inner_paned_position, target_left, target_center, target_vpos)
+            self.center_vpaned.set_position(target_center_vpos)
+            GLib.idle_add(self._sync_inner_paned_position, target_left, target_center, target_center_vpos)
         return GLib.SOURCE_CONTINUE
 
-    def _sync_inner_paned_position(self, target_left: int, target_center: int, target_vpos: int) -> bool:
+    def _sync_inner_paned_position(self, target_left: int, target_center: int, target_center_vpos: int) -> bool:
         self.hpaned_outer.set_position(target_left)
         self.hpaned_inner.set_position(target_center)
-        self.center_vpaned.set_position(target_vpos)
+        self.center_vpaned.set_position(target_center_vpos)
         self.canvas.queue_draw()
         return False
 
@@ -521,11 +644,157 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             # Auto-populate pipeline IDs for testbench
             _, _, tb_pipes = generate_compilable_conf(vm, self.workspace.root_dir)
             self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
+            self._update_waveform_stream_labels()
             self.status_lbl.set_text(
                 f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
             )
         except Exception as exc:
             self.append_log(f"Error building graph for {primary_id}: {exc}")
+
+    def _update_waveform_stream_labels(self) -> None:
+        """Update Input and Output waveform lane labels from active TestbenchIO or pipeline endpoints."""
+        sig_names = [
+            "Sine 997 Hz",
+            "Chirp 100-12kHz",
+            "Multitone",
+            "White Noise",
+            "ALSA Front_Center.wav",
+            "SOFR Remote 1kHz Tone",
+        ]
+        sig_idx = self.sig_combo.get_selected()
+        sig_label = sig_names[sig_idx] if 0 <= sig_idx < len(sig_names) else "Sine 997 Hz"
+        fmt_idx = self.fmt_combo.get_selected()
+        bits = {0: 32, 1: 24, 2: 16}.get(fmt_idx, 32)
+
+        in_lbl = "INPUT PCM: Source (Host/DAI)"
+        out_lbl = "OUTPUT PCM: Sink (DAI/Host)"
+        vm = self.canvas.vm
+        if vm:
+            enabled_sources = [
+                n for n in vm.nodes.values()
+                if n.class_category == "TestbenchIO"
+                and n.class_name == "testbench-source"
+                and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+            ]
+            enabled_sinks = [
+                n for n in vm.nodes.values()
+                if n.class_category == "TestbenchIO"
+                and n.class_name == "testbench-sink"
+                and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+            ]
+            if enabled_sources:
+                snode = enabled_sources[0]
+                target_p = snode.config.get_scalar("target_pipelines", "")
+                p_badge = f" (Pipes: {target_p})" if target_p else ""
+                in_lbl = f"INPUT PCM: {snode.title} ({snode.subtitle}){p_badge}"
+            else:
+                host_in = [
+                    n for n in vm.nodes.values()
+                    if n.class_category not in ("Control", "TestbenchIO") and not n.in_ports
+                ]
+                if host_in:
+                    in_lbl = f"INPUT PCM: {host_in[0].id} (Pipe {host_in[0].pipeline_id or 1})"
+
+            if enabled_sinks:
+                knode = enabled_sinks[0]
+                out_lbl = f"OUTPUT PCM: {knode.title} ({knode.subtitle})"
+            else:
+                dai_out = [
+                    n for n in vm.nodes.values()
+                    if n.class_category not in ("Control", "TestbenchIO") and not n.out_ports
+                ]
+                if dai_out:
+                    out_lbl = f"OUTPUT PCM: {dai_out[0].id} (Pipe {dai_out[0].pipeline_id or 2})"
+
+        self.waveform_widget.set_stream_labels(
+            in_label=in_lbl,
+            out_label=out_lbl,
+            signal_label=sig_label,
+            rate=48000,
+            channels=2,
+            bits=bits,
+        )
+
+    def _on_waveform_zoom_changed(self) -> None:
+        self.wf_zoom_lbl.set_text(self.waveform_widget.get_zoom_summary_text())
+
+    def _on_wf_trigger_toggled(self, btn: Gtk.ToggleButton) -> None:
+        self.waveform_widget.trigger_lock = btn.get_active()
+        self.waveform_widget.queue_draw()
+
+    def _on_rt_waveform_toggled(self, btn: Gtk.ToggleButton) -> None:
+        active = btn.get_active()
+        self.waveform_widget.is_realtime = active
+        if active:
+            self.keep_alive_btn.set_active(True)
+            if self.tb_runner and self.tb_runner.live_client and self.tb_runner.live_proc:
+                # Ensure DSP is in D0 active state for real-time streaming
+                self.tb_runner.live_client.pm_control(SOF_PM_OP_WAKE_HOLD)
+                self._start_realtime_waveform_timer()
+            else:
+                self.wf_status_lbl.set_text("Waveforms [Starting Real-Time Testbench…]")
+                self._on_run_testbench_clicked(self.run_tb_btn)
+        else:
+            self._stop_realtime_waveform_timer()
+            if self.waveform_widget.out_samples:
+                self.wf_status_lbl.set_text("Waveforms [SNAPSHOT]")
+            else:
+                self.wf_status_lbl.set_text("Waveforms [IDLE]")
+            self.waveform_widget.queue_draw()
+
+    def _start_realtime_waveform_timer(self) -> None:
+        self._stop_realtime_waveform_timer()
+        self.waveform_widget.is_realtime = True
+        self._rt_timer_id = GLib.timeout_add(95, self._on_realtime_waveform_tick)
+
+    def _stop_realtime_waveform_timer(self) -> None:
+        if self._rt_timer_id is not None:
+            GLib.source_remove(self._rt_timer_id)
+            self._rt_timer_id = None
+        self._rt_poll_busy = False
+
+    def _on_realtime_waveform_tick(self) -> bool:
+        if not self.rt_waveform_btn.get_active():
+            self._rt_timer_id = None
+            return False
+        if not self.tb_runner or not self.tb_runner.live_client:
+            self._rt_timer_id = None
+            return False
+        if self._rt_poll_busy:
+            return True
+
+        self._rt_poll_busy = True
+
+        def poll_worker() -> None:
+            res_tuple = self.tb_runner.poll_live_waveforms(window_frames=3600) if self.tb_runner else None
+            GLib.idle_add(self._apply_realtime_waveform_poll, res_tuple)
+
+        threading.Thread(target=poll_worker, daemon=True).start()
+        return True
+
+    def _apply_realtime_waveform_poll(
+        self,
+        res_tuple: Optional[tuple],
+    ) -> bool:
+        self._rt_poll_busy = False
+        if not res_tuple:
+            if self.rt_waveform_btn.get_active():
+                self.wf_status_lbl.set_text("Waveforms [Disconnected]")
+            return False
+        in_slice, out_slice, frames_played, dsp_active, tone_running = res_tuple
+        state_str = "● LIVE D0" if dsp_active else "⏸ PAUSED D3"
+        tone_str = " | 🎵 1kHz Tone" if tone_running else ""
+        self.wf_status_lbl.set_text(
+            f"Waveforms [{state_str} — {frames_played} frames{tone_str}]"
+        )
+        self.waveform_widget.set_waveforms(
+            in_slice,
+            out_slice,
+            is_realtime=True,
+            frames_played=frames_played,
+            dsp_active=dsp_active,
+        )
+        return False
 
     def _on_add_module_requested(self, module_name: str) -> None:
         nid = self.canvas.add_module_instance(module_name)
@@ -566,17 +835,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
                 node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
             _compute_node_geometry(node)
+        self._update_waveform_stream_labels()
         self.canvas.queue_draw()
         self.status_lbl.set_text(f"Updated attribute '{key}' = '{new_val}'")
 
     def _on_undo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.undo_description
         if self.canvas.undo():
+            self._update_waveform_stream_labels()
             self.status_lbl.set_text(f"Undid: {desc}")
 
     def _on_redo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.redo_description
         if self.canvas.redo():
+            self._update_waveform_stream_labels()
             self.status_lbl.set_text(f"Redid: {desc}")
 
     def _update_undo_redo_buttons(self) -> None:
@@ -594,6 +866,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_graph_modified(self) -> None:
         if self.canvas.vm:
+            self._update_waveform_stream_labels()
+            if self.workspace:
+                _, _, tb_pipes = generate_compilable_conf(self.canvas.vm, self.workspace.root_dir)
+                if tb_pipes:
+                    self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
             self.status_lbl.set_text(
                 f"Graph modified: {len(self.canvas.vm.nodes)} nodes, {len(self.canvas.vm.edges)} routes"
             )
@@ -604,9 +881,17 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_export_conf_clicked(self, _btn: Gtk.Button) -> None:
         if not self.canvas.vm or not self.compiler:
             return
+        self.left_panel.show_compile_pane()
         res = self.compiler.compile_graph(self.canvas.vm)
-        self.append_log(f"Exported compilable .conf to: {res.conf_path}")
+        self.append_log(f"Exported compilable .conf to: {res.conf_path}", diagnostics=res.diagnostics)
         self.status_lbl.set_text(f"Exported: {res.conf_path}")
+
+    def _on_clear_compile_log_clicked(self, _btn: Gtk.Button) -> None:
+        buf = self.log_view.get_buffer()
+        buf.set_text("")
+        self._log_line_diagnostics.clear()
+        self.left_panel.set_compile_tab_title("Compile")
+        self.compile_pane_status_lbl.set_text("alsatplg Compiler Output (Dbl-Click error/warning)")
 
     def _on_open_dir_clicked(self, _btn: Gtk.Button) -> None:
         dialog = Gtk.FileDialog.new()
@@ -631,6 +916,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.canvas.vm or not self.compiler:
             return
         vm = self.canvas.vm
+        self.left_panel.set_compile_tab_title("Compile ⏳")
+        self.left_panel.show_compile_pane()
+        self.compile_pane_status_lbl.set_text(f"Compiling {vm.title} …")
         self.status_lbl.set_text(f"Compiling {vm.title} with alsatplg -p …")
         self.compile_btn.set_sensitive(False)
 
@@ -644,6 +932,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.canvas.vm or not self.compiler or not self.tb_runner:
             return
         vm = self.canvas.vm
+        self.left_panel.set_compile_tab_title("Compile ⏳")
+        self.left_panel.show_compile_pane()
+        self.compile_pane_status_lbl.set_text(f"Compiling {vm.title} for Testbench …")
         self.status_lbl.set_text(f"Compiling & running {vm.title} in sof-testbench4 …")
         self.compile_btn.set_sensitive(False)
         self.run_tb_btn.set_sensitive(False)
@@ -672,22 +963,46 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_compile_finished(self, res: CompileResult, run_tb_after: bool) -> bool:
         self.compile_btn.set_sensitive(True)
+        self._last_conf_path = res.conf_path
+        self._last_compile_diagnostics = list(res.diagnostics)
+        self.canvas.clear_diagnostic_highlights()
+        self.left_panel.show_compile_pane()
+
         self.append_log(f"$ {res.command}")
         if res.stdout.strip():
-            self.append_log(res.stdout.strip())
+            self.append_log(res.stdout.strip(), diagnostics=res.diagnostics)
         if res.stderr.strip():
-            self.append_log(res.stderr.strip())
+            self.append_log(res.stderr.strip(), diagnostics=res.diagnostics)
+
+        err_cnt = sum(1 for d in res.diagnostics if d.severity == "error")
+        warn_cnt = sum(1 for d in res.diagnostics if d.severity == "warning")
 
         if not res.success:
             self.run_tb_btn.set_sensitive(True)
-            self.status_lbl.set_text(f"Compilation FAILED for {os.path.basename(res.conf_path)}")
-            self.append_log("[ERROR] alsatplg compilation failed.")
+            self.left_panel.set_compile_tab_title(f"Compile ❌ ({max(1, err_cnt)})")
+            self.compile_pane_status_lbl.set_text(
+                f"FAILED ({max(1, err_cnt)} err, {warn_cnt} warn) — Dbl-Click line below"
+            )
+            self.status_lbl.set_text(
+                f"Compilation FAILED for {os.path.basename(res.conf_path)} — double-click error line in Compile pane to inspect"
+            )
+            self.append_log(
+                "[ERROR] alsatplg compilation failed. Double-click any error/warning line above to bring up the failing part in the Graph Viewer & Attribute Editor.",
+                diagnostics=res.diagnostics,
+            )
             return False
 
         self.last_compiled_tplg = res.tplg_path
+        if warn_cnt > 0:
+            self.left_panel.set_compile_tab_title(f"Compile ⚠ ({warn_cnt})")
+        else:
+            self.left_panel.set_compile_tab_title("Compile ✔")
+        self.compile_pane_status_lbl.set_text(
+            f"Compiled OK: {os.path.basename(res.tplg_path)} ({res.size_bytes} B)"
+        )
         msg = f"Compiled OK: {res.tplg_path} ({res.size_bytes} bytes)"
         self.status_lbl.set_text(msg)
-        self.append_log(msg)
+        self.append_log(msg, diagnostics=res.diagnostics)
 
         if not run_tb_after:
             self.run_tb_btn.set_sensitive(True)
@@ -711,7 +1026,21 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         pipe_txt = self.pipes_entry.get_text().strip()
         pipes = [int(x.strip()) for x in pipe_txt.split(",") if x.strip().isdigit()] or res.pipeline_ids
         kctl_overrides = self._collect_kcontrol_overrides()
-        keep_alive = self.keep_alive_btn.get_active()
+        keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
+        self._stop_realtime_waveform_timer()
+        self._update_waveform_stream_labels()
+        self.wf_status_lbl.set_text("Waveforms [● Running Testbench…]")
+
+        def on_live_progress(in_s: List[float], out_s: List[float], frames_cnt: int) -> None:
+            GLib.idle_add(
+                self.waveform_widget.set_waveforms,
+                in_s,
+                out_s,
+                f"Processing live… ({frames_cnt} frames)",
+                True,
+                frames_cnt,
+                True,
+            )
 
         def tb_worker() -> None:
             assert self.tb_runner is not None
@@ -726,6 +1055,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 wav_source=wav_src,
                 kcontrol_overrides=kctl_overrides,
                 keep_alive=keep_alive,
+                on_live_waveform=on_live_progress,
             )
             GLib.idle_add(self._on_testbench_finished, tb_res)
 
@@ -734,6 +1064,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_testbench_finished(self, tb_res: TestbenchRunResult) -> bool:
         self.run_tb_btn.set_sensitive(True)
+        self._update_waveform_stream_labels()
         self.append_log(f"$ {tb_res.command}")
         if tb_res.telemetry and tb_res.telemetry.protocol_log:
             for pline in tb_res.telemetry.protocol_log:
@@ -747,10 +1078,29 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         self.append_log(tb_res.summary_text)
         self.status_lbl.set_text(tb_res.summary_text)
-        self.waveform_widget.set_waveforms(tb_res.in_samples, tb_res.out_samples, tb_res.summary_text)
+        live_active = bool(
+            self.rt_waveform_btn.get_active()
+            and self.tb_runner
+            and self.tb_runner.live_client
+            and self.tb_runner.live_proc
+        )
+        self.waveform_widget.set_waveforms(
+            tb_res.in_samples,
+            tb_res.out_samples,
+            tb_res.summary_text,
+            is_realtime=live_active,
+        )
+        if live_active:
+            self.wf_status_lbl.set_text("Waveforms [● LIVE D0]")
+            self._start_realtime_waveform_timer()
+        else:
+            self.wf_status_lbl.set_text(
+                "Waveforms [SNAPSHOT]" if tb_res.out_samples else "Waveforms [FAILED]"
+            )
 
         if tb_res.telemetry:
             self._apply_telemetry_to_ui(tb_res.telemetry)
+        self.right_notebook.set_current_page(1)
 
         if tb_res.success and tb_res.out_wav_path and os.path.isfile(tb_res.out_wav_path):
             self.last_output_wav = tb_res.out_wav_path
@@ -864,9 +1214,15 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                     self.waveform_widget.set_waveforms(self.waveform_widget.in_samples, out_norm)
 
     def _on_stop_live_server_clicked(self, _btn: Gtk.Button) -> None:
+        self._stop_realtime_waveform_timer()
+        if self.rt_waveform_btn.get_active():
+            self.rt_waveform_btn.set_active(False)
         if self.tb_runner:
             self.tb_runner.stop_live_session()
             self.keep_alive_btn.set_active(False)
+            self.wf_status_lbl.set_text(
+                "Waveforms [SNAPSHOT]" if self.waveform_widget.out_samples else "Waveforms [IDLE]"
+            )
             self.status_lbl.set_text("Stopped live SOFR testbench server.")
             self.append_log("[SOFR] Live testbench server stopped.")
 
@@ -880,9 +1236,151 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         else:
             self.status_lbl.set_text(f"Output WAV ready at: {self.last_output_wav}")
 
-    def append_log(self, text: str) -> None:
+    def _init_log_text_tags(self) -> None:
         buf = self.log_view.get_buffer()
-        end_iter = buf.get_end_iter()
-        buf.insert(end_iter, text + "\n")
+        tag_table = buf.get_tag_table()
+        if tag_table.lookup("log_error") is not None:
+            return
+        buf.create_tag(
+            "log_error",
+            foreground="#ff6b6b",
+            background="#3b1d24",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "log_warning",
+            foreground="#ffd166",
+            background="#382f1b",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "log_command",
+            foreground="#7ec8ff",
+        )
+        buf.create_tag(
+            "log_success",
+            foreground="#5cd68d",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "log_clickable",
+            underline=Pango.Underline.SINGLE,
+        )
+
+    def append_log(
+        self,
+        text: str,
+        diagnostics: Optional[List[CompileDiagnostic]] = None,
+    ) -> None:
+        buf = self.log_view.get_buffer()
+        diag_pool = diagnostics if diagnostics is not None else self._last_compile_diagnostics
+
+        for raw_ln in text.splitlines():
+            end_iter = buf.get_end_iter()
+            line_idx = end_iter.get_line()
+            s = raw_ln.strip()
+
+            matched_diag: Optional[CompileDiagnostic] = None
+            if diag_pool and s:
+                matched_diag = next(
+                    (d for d in diag_pool if d.raw_line == s or (d.message and d.message in s)),
+                    None,
+                )
+                if matched_diag is None and s.startswith("[ERROR]") and diag_pool:
+                    matched_diag = diag_pool[0]
+
+            sev = matched_diag.severity if matched_diag else classify_log_line(raw_ln)
+            tags: List[str] = []
+            if sev == "error":
+                tags = ["log_error", "log_clickable"]
+            elif sev == "warning":
+                tags = ["log_warning", "log_clickable"]
+            elif s.startswith("$ ") or s.startswith("[SOFR] $"):
+                tags = ["log_command"]
+            elif s.startswith("Compiled OK:") or "[PASS]" in s:
+                tags = ["log_success"]
+
+            if matched_diag is not None:
+                self._log_line_diagnostics[line_idx] = matched_diag
+            elif sev in ("error", "warning") and s:
+                # Parse on the fly if no pre-parsed diagnostic was supplied
+                on_fly = parse_compile_diagnostics(
+                    "",
+                    raw_ln,
+                    self._last_conf_path,
+                    vm=self.canvas.vm,
+                    topology2_root=self.workspace.root_dir if self.workspace else None,
+                )
+                if on_fly:
+                    self._log_line_diagnostics[line_idx] = on_fly[0]
+
+            start_offset = end_iter.get_offset()
+            buf.insert(end_iter, raw_ln + "\n")
+            if tags:
+                s_it = buf.get_iter_at_offset(start_offset)
+                e_it = buf.get_iter_at_offset(start_offset + len(raw_ln))
+                for tname in tags:
+                    buf.apply_tag_by_name(tname, s_it, e_it)
+
         mark = buf.create_mark(None, buf.get_end_iter(), False)
         self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+
+    def _on_log_view_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        n_press: int,
+        x: float,
+        y: float,
+    ) -> None:
+        """Handle double-click on an error or warning line in the Console Log."""
+        if n_press != 2:
+            return
+        bx, by = self.log_view.window_to_buffer_coords(Gtk.TextWindowType.WIDGET, int(x), int(y))
+        ok, it = self.log_view.get_iter_at_location(bx, by)
+        if not ok:
+            return
+        line_idx = it.get_line()
+        diag = self._log_line_diagnostics.get(line_idx)
+        if diag is None:
+            buf = self.log_view.get_buffer()
+            ok_s, s_it = buf.get_iter_at_line(line_idx)
+            if not ok_s:
+                return
+            e_it = s_it.copy()
+            if not e_it.ends_line():
+                e_it.forward_to_line_end()
+            line_text = buf.get_text(s_it, e_it, False).strip()
+            if not line_text:
+                return
+            parsed = parse_compile_diagnostics(
+                "",
+                line_text,
+                self._last_conf_path,
+                vm=self.canvas.vm,
+                topology2_root=self.workspace.root_dir if self.workspace else None,
+            )
+            if not parsed:
+                return
+            diag = parsed[0]
+            self._log_line_diagnostics[line_idx] = diag
+
+        self._activate_compile_diagnostic(diag)
+
+    def _activate_compile_diagnostic(self, diag: CompileDiagnostic) -> None:
+        """Bring up the failing part in the Main Graph Viewer and Right Attribute Editor."""
+        if not self.canvas.vm:
+            return
+        self.right_notebook.set_current_page(0)
+        self.canvas.focus_diagnostic(diag)
+        attr_key = diag.symbol_or_attr or diag.target_id
+        self.right_inspector.highlight_attribute(
+            attr_key,
+            severity=diag.severity,
+            message=diag.message,
+            target_kind=diag.target_kind,
+        )
+        loc_info = f" (line {diag.line_no})" if diag.line_no else ""
+        target_desc = f"{diag.target_kind}:{diag.target_id or attr_key or 'topology'}"
+        self.status_lbl.set_text(
+            f"Focused {diag.severity.upper()}{loc_info} [{target_desc}] → {diag.message}"
+        )
