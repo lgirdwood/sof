@@ -892,6 +892,8 @@ static int file_process(struct processing_module *mod,
 		frames = MIN(frames, cd->max_frames);
 		samples = cd->file_func(cd, NULL, source, frames);
 		audio_stream_consume(source, audio_stream_sample_bytes(source) * samples);
+		if (samples > 0 && cd->fs.wfh)
+			fflush(cd->fs.wfh);
 		break;
 	default:
 		/* TODO: duplex mode */
@@ -978,6 +980,21 @@ static int file_reset(struct processing_module *mod)
 
 	tb_debug_print("file_reset()\n");
 	cd->copies_timeout_count = 0;
+	cd->fs.reached_eof = false;
+	cd->fs.write_failed = false;
+	cd->fs.copy_timeout = false;
+	cd->fs.n = 0;
+	cd->fs.copy_count = 0;
+	cd->fs.cycles_count = 0;
+	cd->fs.tone_phase = 0.0;
+	if (cd->fs.mode == FILE_READ && cd->fs.fn) {
+		if (cd->fs.rfh)
+			fclose(cd->fs.rfh);
+		cd->fs.rfh = fopen(cd->fs.fn, "r");
+	} else if (cd->fs.mode == FILE_WRITE && cd->fs.fn) {
+		if (cd->fs.wfh)
+			fflush(cd->fs.wfh);
+	}
 	return 0;
 }
 

@@ -43,7 +43,9 @@
 #include "testbench/topology_ipc4.h"
 #include "testbench/trace.h"
 #include "testbench/file.h"
+#include "testbench/file_ipc4.h"
 #include "testbench/utils.h"
+#include "../../src/audio/copier/copier.h"
 
 /* IPC4 BaseFW Large Config Parameter IDs */
 #define TB_IPC4_FW_CONFIG			0
@@ -1505,6 +1507,13 @@ static size_t handle_remote_io_cfg(struct testbench_prm *tp, const char *args_st
 		tp->channels_in = 2;
 	if (!tp->channels_out)
 		tp->channels_out = tp->channels_in;
+	tp->input_file_index = 0;
+	tp->output_file_index = 0;
+	pthread_mutex_lock(&g_pcm_ring_lock);
+	g_pcm_ring_write_idx = 0;
+	g_pcm_ring_avail = 0;
+	g_pcm_frames_processed = 0;
+	pthread_mutex_unlock(&g_pcm_ring_lock);
 	tb_configure_audio_params(tp);
 
 	off += snprintf(out_buf + off, out_cap - off,
@@ -1513,6 +1522,96 @@ static size_t handle_remote_io_cfg(struct testbench_prm *tp, const char *args_st
 			tp->fs_in, tp->fs_out, tp->channels_in, tp->channels_out,
 			tp->bits_in ? tp->bits_in : "S32_LE");
 	return off;
+}
+
+static bool remote_is_any_file_at_eof(struct testbench_prm *tp)
+{
+	int i;
+
+	if (!tp)
+		return true;
+	for (i = 0; i < tp->input_file_num && i < TB_MAX_INPUT_FILE_NUM; i++) {
+		if (!tp->fr[i].state)
+			continue;
+		if (tp->fr[i].state->reached_eof || tp->fr[i].state->copy_timeout)
+			return true;
+	}
+	for (i = 0; i < tp->output_file_num && i < TB_MAX_OUTPUT_FILE_NUM; i++) {
+		if (!tp->fw[i].state)
+			continue;
+		if (tp->fw[i].state->reached_eof || tp->fw[i].state->copy_timeout ||
+		    tp->fw[i].state->write_failed)
+			return true;
+	}
+	return false;
+}
+
+static size_t handle_remote_run_ipc(struct testbench_prm *tp, const char *args_str,
+				    char *out_buf, size_t off, size_t out_cap)
+{
+	struct tb_heap_usage_record heap_records[TB_NUM_WIDGETS_SUPPORTED];
+	struct timespec td0 = {0}, td1 = {0}, t0 = {0}, t1 = {0};
+	long long delta_t = 0;
+	int heap_records_count = 0;
+	int max_ticks = 20000;
+	int ticks_run = 0;
+	int i;
+
+	if (!tp)
+		return off + snprintf(out_buf + off, out_cap - off,
+				      "error: testbench not initialized\n");
+	if (args_str && *args_str) {
+		int v = atoi(args_str);
+
+		if (v > 0)
+			max_ticks = v;
+	}
+
+	off += snprintf(out_buf + off, out_cap - off,
+			"==========================================================\n"
+			"		           Test Start 0\n"
+			"==========================================================\n");
+
+	host_telem_reset();
+	tb_gettime(&td0);
+	while (ticks_run < max_ticks) {
+		uint64_t c0, c1, delta_ns;
+
+		tb_gettime(&t0);
+		tb_getcycles(&c0);
+		if (sof_get() && sof_get()->ipc &&
+		    !list_is_empty(&sof_get()->ipc->comp_list))
+			schedule_ll_run_tasks();
+		tb_getcycles(&c1);
+		tb_gettime(&t1);
+		tp->total_cycles += c1 - c0;
+		delta_ns = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL +
+			   (uint64_t)(t1.tv_nsec - t0.tv_nsec);
+		g_in_remote_rpc = true;
+		tb_remote_tick_end(tp, c1 - c0, delta_ns);
+		g_in_remote_rpc = false;
+		ticks_run++;
+
+		if (remote_is_any_file_at_eof(tp)) {
+			schedule_ll_run_tasks();
+			break;
+		}
+	}
+	tb_gettime(&td1);
+
+	for (i = 0; i < tp->output_file_num && i < TB_MAX_OUTPUT_FILE_NUM; i++) {
+		if (tp->fw[i].state && tp->fw[i].state->wfh)
+			fflush(tp->fw[i].state->wfh);
+	}
+
+	delta_t = (td1.tv_sec - td0.tv_sec) * 1000000LL;
+	delta_t += (td1.tv_nsec - td0.tv_nsec) / 1000LL;
+
+	memset(heap_records, 0, sizeof(heap_records));
+	tb_collect_heap_usage(tp, heap_records, &heap_records_count);
+
+	return format_remote_test_summary(tp, delta_t, heap_records, heap_records_count,
+					  out_buf, off, out_cap);
 }
 
 static size_t handle_remote_run_test(struct testbench_prm *tp, const char *args_str,
@@ -2166,6 +2265,8 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 		remote_unload_active_topology(g_tp);
 		off += snprintf(out_buf + off, out_cap - off,
 				"tplg-unload -> OK (all pipelines and topology freed)\n");
+	} else if (strncmp(cmd, "run-ipc", 7) == 0) {
+		off = handle_remote_run_ipc(g_tp, cmd + 7, out_buf, off, out_cap);
 	} else if (strncmp(cmd, "run-test", 8) == 0) {
 		off = handle_remote_run_test(g_tp, cmd + 8, out_buf, off, out_cap);
 	} else if (strncmp(cmd, "tplg-load ", 10) == 0) {
@@ -4645,6 +4746,11 @@ static void *tb_client_worker_fn(void *arg)
 				uint32_t *mbox = (uint32_t *)sof_get()->ipc->comp_data;
 				uint32_t msg_tgt = (ireq->primary >> 30) & 0x1;
 				uint32_t msg_type = (ireq->primary >> 24) & 0x1F;
+				uint32_t mod_id = ireq->primary & 0xFFFFU;
+				uint32_t inst_id = (ireq->primary >> 16) & 0xFFU;
+				uint32_t ppl_id = (ireq->extension >> 16) & 0xFFU;
+				int file_slot_idx = -1;
+				uint32_t file_mode = 0;
 
 				/* Enable target core automatically on CREATE_PIPELINE / MOD_INIT */
 				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG &&
@@ -4655,7 +4761,7 @@ static void *tb_client_worker_fn(void *arg)
 						cpu_enable_core(core);
 				} else if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_MODULE_MSG &&
 					   msg_type == SOF_IPC4_MOD_INIT_INSTANCE) {
-					uint32_t core = (ireq->extension >> 12) & 0xF;
+					uint32_t core = (ireq->extension >> 24) & 0xF;
 
 					if (core < CONFIG_CORE_COUNT)
 						cpu_enable_core(core);
@@ -4668,7 +4774,113 @@ static void *tb_client_worker_fn(void *arg)
 				    ireq->tx_size + 8 <= SOF_IPC_MSG_MAX_SIZE) {
 					memcpy(&mbox[2], req_buf + sizeof(*ireq), ireq->tx_size);
 				}
+
+				/* Resolve file path pointer for testbench file modules (0x9a..0x9d) */
+				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_MODULE_MSG &&
+				    msg_type == SOF_IPC4_MOD_INIT_INSTANCE &&
+				    (mod_id == TB_FILE_OUT_AIF_MODULE_ID ||
+				     mod_id == TB_FILE_IN_AIF_MODULE_ID ||
+				     mod_id == TB_FILE_OUT_DAI_MODULE_ID ||
+				     mod_id == TB_FILE_IN_DAI_MODULE_ID) &&
+				    ireq->tx_size >= sizeof(struct ipc4_file_module_cfg) && g_tp) {
+					struct ipc4_file_module_cfg *fcfg =
+						(struct ipc4_file_module_cfg *)&mbox[2];
+					uintptr_t raw_fn = (uintptr_t)fcfg->config.fn;
+
+					file_mode = fcfg->config.mode;
+					if (file_mode == FILE_READ) {
+						file_slot_idx = (raw_fn > 0 &&
+								 raw_fn <= (uintptr_t)g_tp->input_file_num) ?
+								(int)(raw_fn - 1) : g_tp->input_file_index;
+						if (file_slot_idx < 0 ||
+						    file_slot_idx >= g_tp->input_file_num)
+							file_slot_idx = 0;
+						if (file_slot_idx < g_tp->input_file_num &&
+						    g_tp->input_file[file_slot_idx])
+							fcfg->config.fn = g_tp->input_file[file_slot_idx];
+						else
+							fcfg->config.fn = "/tmp/sof_tb_srv_in.raw";
+					} else {
+						file_slot_idx = (raw_fn > 0 &&
+								 raw_fn <= (uintptr_t)g_tp->output_file_num) ?
+								(int)(raw_fn - 1) : g_tp->output_file_index;
+						if (file_slot_idx < 0 ||
+						    file_slot_idx >= g_tp->output_file_num)
+							file_slot_idx = 0;
+						if (file_slot_idx < g_tp->output_file_num &&
+						    g_tp->output_file[file_slot_idx])
+							fcfg->config.fn = g_tp->output_file[file_slot_idx];
+						else
+							fcfg->config.fn = "/tmp/sof_tb_srv_out0.raw";
+					}
+				}
+
 				ipc_cmd((struct ipc_cmd_hdr *)mbox);
+
+				/* Track active file component state for IPC-created file modules */
+				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_MODULE_MSG &&
+				    msg_type == SOF_IPC4_MOD_INIT_INSTANCE &&
+				    file_slot_idx >= 0 && (mbox[0] & 0x00FFFFFFU) == 0 && g_tp) {
+					struct ipc_comp_dev *ficd =
+						ipc_get_comp_by_id(sof_get()->ipc,
+								   IPC4_COMP_ID(mod_id, inst_id));
+					struct file_state *fstate = NULL;
+
+					if (ficd && ficd->cd && comp_mod(ficd->cd)) {
+						struct copier_data *ccd =
+							module_get_private_data(comp_mod(ficd->cd));
+						if (ccd && get_file_comp_data(ccd))
+							fstate = &get_file_comp_data(ccd)->fs;
+					}
+					if (file_mode == FILE_READ &&
+					    file_slot_idx < TB_MAX_INPUT_FILE_NUM) {
+						g_tp->fr[file_slot_idx].id =
+							IPC4_COMP_ID(mod_id, inst_id);
+						g_tp->fr[file_slot_idx].instance_id = inst_id;
+						g_tp->fr[file_slot_idx].pipeline_id = ppl_id;
+						g_tp->fr[file_slot_idx].state = fstate;
+						if (file_slot_idx >= g_tp->input_file_index)
+							g_tp->input_file_index = file_slot_idx + 1;
+					} else if (file_mode == FILE_WRITE &&
+						   file_slot_idx < TB_MAX_OUTPUT_FILE_NUM) {
+						g_tp->fw[file_slot_idx].id =
+							IPC4_COMP_ID(mod_id, inst_id);
+						g_tp->fw[file_slot_idx].instance_id = inst_id;
+						g_tp->fw[file_slot_idx].pipeline_id = ppl_id;
+						g_tp->fw[file_slot_idx].state = fstate;
+						if (file_slot_idx >= g_tp->output_file_index)
+							g_tp->output_file_index = file_slot_idx + 1;
+					}
+				}
+
+				/* Clean up file component tracking when a pipeline is deleted */
+				if (msg_tgt == SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG &&
+				    msg_type == SOF_IPC4_GLB_DELETE_PIPELINE && g_tp) {
+					int fi;
+
+					for (fi = 0; fi < TB_MAX_INPUT_FILE_NUM; fi++) {
+						if (g_tp->fr[fi].id >= 0 &&
+						    (g_tp->fr[fi].pipeline_id == (int)inst_id ||
+						     !ipc_get_comp_by_id(sof_get()->ipc,
+									 g_tp->fr[fi].id))) {
+							g_tp->fr[fi].id = -1;
+							g_tp->fr[fi].state = NULL;
+						}
+					}
+					for (fi = 0; fi < TB_MAX_OUTPUT_FILE_NUM; fi++) {
+						if (g_tp->fw[fi].id >= 0 &&
+						    (g_tp->fw[fi].pipeline_id == (int)inst_id ||
+						     !ipc_get_comp_by_id(sof_get()->ipc,
+									 g_tp->fw[fi].id))) {
+							g_tp->fw[fi].id = -1;
+							g_tp->fw[fi].state = NULL;
+						}
+					}
+					if (list_is_empty(&sof_get()->ipc->comp_list)) {
+						g_tp->input_file_index = 0;
+						g_tp->output_file_index = 0;
+					}
+				}
 
 				/* If SET_PIPELINE_STATE was sent, run one LL scheduler tick so
 				 * the compound pipeline trigger task completes immediately.

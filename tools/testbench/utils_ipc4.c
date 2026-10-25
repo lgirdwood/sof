@@ -858,31 +858,60 @@ void tb_collect_heap_usage(struct testbench_prm *tp, struct tb_heap_usage_record
 	size_t hwm;
 	int count = 0;
 
-	list_for_item(item, &tp->widget_list) {
-		struct tplg_comp_info *info = container_of(item, struct tplg_comp_info, item);
-		uint32_t comp_id = IPC4_COMP_ID(info->module_id, info->instance_id);
-		struct comp_dev *dev = ipc4_get_comp_dev(comp_id);
+	if (tp && tp->widget_list.next && !list_is_empty(&tp->widget_list)) {
+		list_for_item(item, &tp->widget_list) {
+			struct tplg_comp_info *info = container_of(item, struct tplg_comp_info, item);
+			uint32_t comp_id = IPC4_COMP_ID(info->module_id, info->instance_id);
+			struct comp_dev *dev = ipc4_get_comp_dev(comp_id);
 
-		if (!dev || !dev->mod)
-			continue;
+			if (!dev || !dev->mod)
+				continue;
 
-		/* In testbench environment, skip AIF/DAI because they are not real components. */
-		if (info->type == SND_SOC_TPLG_DAPM_AIF_IN ||
-		    info->type == SND_SOC_TPLG_DAPM_AIF_OUT ||
-		    info->type == SND_SOC_TPLG_DAPM_DAI_IN ||
-		    info->type == SND_SOC_TPLG_DAPM_DAI_OUT)
-			continue;
+			/* In testbench environment, skip AIF/DAI because they are not real components. */
+			if (info->type == SND_SOC_TPLG_DAPM_AIF_IN ||
+			    info->type == SND_SOC_TPLG_DAPM_AIF_OUT ||
+			    info->type == SND_SOC_TPLG_DAPM_DAI_IN ||
+			    info->type == SND_SOC_TPLG_DAPM_DAI_OUT)
+				continue;
 
-		if (count >= TB_NUM_WIDGETS_SUPPORTED) {
-			fprintf(stderr, "Error: Too many components for heap records, max %d.\n",
-				TB_NUM_WIDGETS_SUPPORTED);
-			break;
+			if (count >= TB_NUM_WIDGETS_SUPPORTED) {
+				fprintf(stderr, "Error: Too many components for heap records, max %d.\n",
+					TB_NUM_WIDGETS_SUPPORTED);
+				break;
+			}
+
+			module_adapter_heap_usage(dev->mod, &hwm);
+			records[count].module_name = info->name;
+			records[count].heap_max = hwm;
+			count++;
 		}
+	} else if (sof_get() && sof_get()->ipc && sof_get()->ipc->comp_list.next) {
+		list_for_item(item, &sof_get()->ipc->comp_list) {
+			struct ipc_comp_dev *icd = container_of(item, struct ipc_comp_dev, list);
+			uint32_t mid;
 
-		module_adapter_heap_usage(dev->mod, &hwm);
-		records[count].module_name = info->name;
-		records[count].heap_max = hwm;
-		count++;
+			if (icd->type != COMP_TYPE_COMPONENT || !icd->cd || !icd->cd->mod)
+				continue;
+			mid = IPC4_MOD_ID(icd->id);
+			if (mid == TB_FILE_OUT_AIF_MODULE_ID ||
+			    mid == TB_FILE_IN_AIF_MODULE_ID ||
+			    mid == TB_FILE_OUT_DAI_MODULE_ID ||
+			    mid == TB_FILE_IN_DAI_MODULE_ID)
+				continue;
+			if (count >= TB_NUM_WIDGETS_SUPPORTED)
+				break;
+			module_adapter_heap_usage(icd->cd->mod, &hwm);
+			records[count].module_name =
+				(mid == TB_COPIER_MODULE_ID)  ? "module-copier" :
+				(mid == TB_MIXIN_MODULE_ID)   ? "mixin" :
+				(mid == TB_MIXOUT_MODULE_ID)  ? "mixout" :
+				(mid == TB_PGA_MODULE_ID)     ? "gain" :
+				(mid == TB_SRC_MODULE_ID)     ? "src" :
+				(mid == TB_ASRC_MODULE_ID)    ? "asrc" :
+				(mid == TB_PROCESS_MODULE_ID) ? "process" : "module";
+			records[count].heap_max = hwm;
+			count++;
+		}
 	}
 
 	*count_out = count;
