@@ -6,11 +6,12 @@
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 import os
 import shutil
 import subprocess
 import threading
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -26,10 +27,14 @@ from .compiler import (
 from .graph_canvas import TopologyGraphCanvas
 from .layout import _compute_node_geometry, layout_graph
 from .left_panes import LeftNavigationPanel
-from .model import ConfigNode, GraphViewModel
+from .model import ConfigNode, GraphNode, GraphViewModel
 from .parser import Topology2Workspace
 from .right_inspector import RightAttributeInspector
-from .serializer import generate_compilable_conf
+from .serializer import (
+    generate_compilable_conf,
+    get_editable_conf_text_for_vm,
+    serialize_graph_for_save,
+)
 from .testbench import (
     KcontrolTelemetryItem,
     SOF_PCM_OP_CAPTURE_BUFFER,
@@ -42,6 +47,25 @@ from .testbench import (
     TestbenchTelemetry,
     WaveformSnapshotWidget,
 )
+from .text_editor import TopologyTextEditor
+
+
+@dataclass
+class GraphTabPage:
+    """State for an open file tab in the Main Graph Notebook (holding both Graph Canvas and Text Editor)."""
+
+    tab_key: str
+    pane_kind: str
+    primary_id: str
+    secondary_id: Optional[str]
+    canvas: TopologyGraphCanvas
+    text_editor: TopologyTextEditor
+    view_stack: Gtk.Stack
+    mode_switch_btn: Gtk.ToggleButton
+    tab_box: Gtk.Box
+    title_lbl: Gtk.Label
+    is_untitled: bool = False
+    text_needs_refresh_from_graph: bool = True
 
 
 class Topology2MainWindow(Gtk.ApplicationWindow):
@@ -72,6 +96,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self._last_allocated_height: int = 0
         self._rt_timer_id: Optional[int] = None
         self._rt_poll_busy: bool = False
+        self.graph_tabs: List[GraphTabPage] = []
+        self._new_file_counter: int = 0
+        self._fallback_canvas = TopologyGraphCanvas(
+            on_selection_changed=self._on_canvas_selection_changed,
+            on_graph_modified=self._on_graph_modified,
+            on_history_changed=self._update_undo_redo_buttons,
+            on_kcontrol_changed=self._on_canvas_kcontrol_changed,
+        )
 
         self._build_header_bar()
         self._build_main_3panel_layout()
@@ -80,6 +112,27 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         default_dir = initial_dir or "/home/lrg/work/sof-arl/sof-arl/tools/topology/topology2"
         if os.path.isdir(default_dir):
             self.load_topology2_directory(default_dir)
+
+    @property
+    def canvas(self) -> TopologyGraphCanvas:
+        """Return the active tab's TopologyGraphCanvas (or fallback canvas before any tab is opened)."""
+        active_tab = self.get_active_tab()
+        if active_tab is not None:
+            return active_tab.canvas
+        return self._fallback_canvas
+
+    def get_active_tab(self) -> Optional[GraphTabPage]:
+        """Return the currently selected GraphTabPage in the Main Graph Notebook."""
+        if not self.graph_tabs:
+            return None
+        if hasattr(self, "graph_notebook") and self.graph_notebook is not None:
+            page_num = self.graph_notebook.get_current_page()
+            if page_num >= 0:
+                page_widget = self.graph_notebook.get_nth_page(page_num)
+                for tab in self.graph_tabs:
+                    if tab.view_stack is page_widget or tab.canvas is page_widget:
+                        return tab
+        return self.graph_tabs[-1]
 
     def _on_window_key_pressed(
         self,
@@ -96,62 +149,230 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             return True
 
         focus = self.get_focus()
-        if not isinstance(focus, Gtk.Editable):
-            ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
-            if ctrl_held and keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+
+        # File / Tab / Mode shortcuts that work even when focus is inside TextView
+        if ctrl_held and not isinstance(focus, Gtk.Editable):
+            if keyval in (Gdk.KEY_t, Gdk.KEY_T) and not shift_held:
+                self.toggle_active_tab_text_mode()
+                return True
+            if keyval in (Gdk.KEY_s, Gdk.KEY_S):
                 if shift_held:
-                    self._on_redo_clicked(None)
+                    self.action_save_as()
                 else:
-                    self._on_undo_clicked(None)
+                    self.action_save()
                 return True
-            if ctrl_held and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
-                self._on_redo_clicked(None)
+            if keyval in (Gdk.KEY_o, Gdk.KEY_O):
+                if shift_held:
+                    self._on_open_dir_clicked(None)
+                else:
+                    self.action_open_file()
                 return True
+            if keyval in (Gdk.KEY_w, Gdk.KEY_W) and not shift_held:
+                self.close_current_tab()
+                return True
+            if keyval in (Gdk.KEY_e, Gdk.KEY_E) and not shift_held:
+                self.action_export_pdf()
+                return True
+            if keyval in (Gdk.KEY_n, Gdk.KEY_N) and not shift_held:
+                self.action_new_monolithic_topology()
+                return True
+            if shift_held and keyval in (Gdk.KEY_m, Gdk.KEY_M):
+                self.action_new_module()
+                return True
+            if shift_held and keyval in (Gdk.KEY_p, Gdk.KEY_P):
+                self.action_new_feature_topology()
+                return True
+            if shift_held and keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                self.action_new_function_topology()
+                return True
+
+        # Canvas-specific editing & view shortcuts (do not intercept when typing in Entry or TextView)
+        if not isinstance(focus, (Gtk.Editable, Gtk.TextView)):
+            if ctrl_held:
+                if keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+                    if shift_held:
+                        self._on_redo_clicked(None)
+                    else:
+                        self._on_undo_clicked(None)
+                    return True
+                if keyval in (Gdk.KEY_y, Gdk.KEY_Y):
+                    self._on_redo_clicked(None)
+                    return True
+                if keyval in (Gdk.KEY_a, Gdk.KEY_A) and not shift_held:
+                    self.action_select_all()
+                    return True
+                if keyval in (Gdk.KEY_c, Gdk.KEY_C) and not shift_held:
+                    self.action_copy()
+                    return True
+                if keyval in (Gdk.KEY_x, Gdk.KEY_X) and not shift_held:
+                    self.action_cut()
+                    return True
+                if keyval in (Gdk.KEY_v, Gdk.KEY_V) and not shift_held:
+                    self.action_paste()
+                    return True
+            else:
+                if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
+                    self.action_delete_selected()
+                    return True
+                if keyval in (Gdk.KEY_f, Gdk.KEY_F):
+                    self.canvas.fit_to_view()
+                    return True
+                if keyval in (Gdk.KEY_l, Gdk.KEY_L):
+                    self._on_relayout_clicked(None)
+                    return True
         return False
+
+    def _register_win_action(self, name: str, callback: Callable[[], None]) -> Gio.SimpleAction:
+        act = Gio.SimpleAction.new(name, None)
+        act.connect("activate", lambda _a, _p: callback())
+        self.add_action(act)
+        return act
+
+    def _build_menubar(self) -> Gtk.PopoverMenuBar:
+        """Create the main application Gtk.PopoverMenuBar with File, Edit, and View menus."""
+        # Register window Gio.SimpleActions
+        self._register_win_action("new_module", lambda: self.action_new_module())
+        self._register_win_action("new_feature_topology", lambda: self.action_new_feature_topology())
+        self._register_win_action("new_function_topology", lambda: self.action_new_function_topology())
+        self._register_win_action("new_monolithic_topology", lambda: self.action_new_monolithic_topology())
+        self._register_win_action("open_file", self.action_open_file)
+        self._register_win_action("open_dir", lambda: self._on_open_dir_clicked(None))
+        self._register_win_action("save", lambda: self.action_save())
+        self._register_win_action("save_as", self.action_save_as)
+        self._register_win_action("export_conf", lambda: self._on_export_conf_clicked(None))
+        self._register_win_action("export_pdf", self.action_export_pdf)
+        self._register_win_action("close_tab", lambda: self.close_current_tab())
+
+        self.undo_action = self._register_win_action("undo", lambda: self._on_undo_clicked(None))
+        self.undo_action.set_enabled(False)
+        self.redo_action = self._register_win_action("redo", lambda: self._on_redo_clicked(None))
+        self.redo_action.set_enabled(False)
+
+        self._register_win_action("select_all", lambda: self.action_select_all())
+        self._register_win_action("cut", lambda: self.action_cut())
+        self._register_win_action("copy", lambda: self.action_copy())
+        self._register_win_action("paste", lambda: self.action_paste())
+        self._register_win_action("delete_selected", self.action_delete_selected)
+
+        self._register_win_action("fit_graph", lambda: self.canvas.fit_to_view())
+        self._register_win_action("auto_layout", lambda: self._on_relayout_clicked(None))
+        self._register_win_action("toggle_text_mode", lambda: self.toggle_active_tab_text_mode())
+        self._register_win_action("zoom_in", lambda: self.canvas.zoom_in())
+        self._register_win_action("zoom_out", lambda: self.canvas.zoom_out())
+        self._register_win_action("reset_zoom", lambda: self.canvas.reset_zoom_1to1())
+        self._register_win_action(
+            "toggle_fullscreen",
+            lambda: self.unfullscreen() if self.is_fullscreen() else self.fullscreen(),
+        )
+
+        app = self.get_application()
+        if app is not None:
+            accels = {
+                "win.new_module": ["<Control><Shift>m"],
+                "win.new_feature_topology": ["<Control><Shift>p"],
+                "win.new_function_topology": ["<Control><Shift>f"],
+                "win.new_monolithic_topology": ["<Control>n"],
+                "win.open_file": ["<Control>o"],
+                "win.open_dir": ["<Control><Shift>o"],
+                "win.save": ["<Control>s"],
+                "win.save_as": ["<Control><Shift>s"],
+                "win.export_pdf": ["<Control>e"],
+                "win.close_tab": ["<Control>w"],
+                "win.toggle_text_mode": ["<Control>t"],
+                "win.zoom_in": ["<Control>plus", "<Control>equal"],
+                "win.zoom_out": ["<Control>minus"],
+                "win.reset_zoom": ["<Control>0"],
+                "win.toggle_fullscreen": ["F11"],
+            }
+            for act_name, keys in accels.items():
+                app.set_accels_for_action(act_name, keys)
+
+        menubar_model = Gio.Menu.new()
+
+        # 1. File Menu
+        file_menu = Gio.Menu.new()
+
+        new_submenu = Gio.Menu.new()
+        new_submenu.append("Module (Class.Widget)", "win.new_module")
+        new_submenu.append("Feature Topology (Class.Pipeline)", "win.new_feature_topology")
+        new_submenu.append("Function Topology (Multi-Pipeline)", "win.new_function_topology")
+        new_submenu.append("Monolithic Topology (sof-*.conf)", "win.new_monolithic_topology")
+
+        file_new_sec = Gio.Menu.new()
+        file_new_sec.append_submenu("New", new_submenu)
+        file_new_sec.append("Open Topology File…", "win.open_file")
+        file_new_sec.append("Open Topology2 Directory…", "win.open_dir")
+        file_menu.append_section(None, file_new_sec)
+
+        file_save_sec = Gio.Menu.new()
+        file_save_sec.append("Save", "win.save")
+        file_save_sec.append("Save As…", "win.save_as")
+        file_save_sec.append("Export Compilable .conf", "win.export_conf")
+        file_save_sec.append("Export to PDF…", "win.export_pdf")
+        file_menu.append_section(None, file_save_sec)
+
+        file_close_sec = Gio.Menu.new()
+        file_close_sec.append("Close Tab", "win.close_tab")
+        file_menu.append_section(None, file_close_sec)
+
+        menubar_model.append_submenu("File", file_menu)
+
+        # 2. Edit Menu (Undo, Redo, Select All, Cut, Copy, Paste, Delete)
+        edit_menu = Gio.Menu.new()
+
+        edit_hist_sec = Gio.Menu.new()
+        edit_hist_sec.append("Undo", "win.undo")
+        edit_hist_sec.append("Redo", "win.redo")
+        edit_menu.append_section(None, edit_hist_sec)
+
+        edit_clip_sec = Gio.Menu.new()
+        edit_clip_sec.append("Select All", "win.select_all")
+        edit_clip_sec.append("Cut", "win.cut")
+        edit_clip_sec.append("Copy", "win.copy")
+        edit_clip_sec.append("Paste", "win.paste")
+        edit_menu.append_section(None, edit_clip_sec)
+
+        edit_del_sec = Gio.Menu.new()
+        edit_del_sec.append("Delete", "win.delete_selected")
+        edit_menu.append_section(None, edit_del_sec)
+
+        menubar_model.append_submenu("Edit", edit_menu)
+
+        # 3. View Menu (Fit Graph, Auto-Layout, Toggle Text/Graph, Zoom In/Out/Reset, Fullscreen)
+        view_menu = Gio.Menu.new()
+
+        view_layout_sec = Gio.Menu.new()
+        view_layout_sec.append("Fit Graph", "win.fit_graph")
+        view_layout_sec.append("Auto-Layout", "win.auto_layout")
+        view_layout_sec.append("Toggle Text / Graph View", "win.toggle_text_mode")
+        view_menu.append_section(None, view_layout_sec)
+
+        view_zoom_sec = Gio.Menu.new()
+        view_zoom_sec.append("Zoom In", "win.zoom_in")
+        view_zoom_sec.append("Zoom Out", "win.zoom_out")
+        view_zoom_sec.append("Reset Zoom (1:1)", "win.reset_zoom")
+        view_menu.append_section(None, view_zoom_sec)
+
+        view_win_sec = Gio.Menu.new()
+        view_win_sec.append("Toggle Fullscreen", "win.toggle_fullscreen")
+        view_menu.append_section(None, view_win_sec)
+
+        menubar_model.append_submenu("View", view_menu)
+
+        self.menubar_model = menubar_model
+        menubar = Gtk.PopoverMenuBar.new_from_model(menubar_model)
+        return menubar
 
     def _build_header_bar(self) -> None:
         header = Gtk.HeaderBar()
         header.set_show_title_buttons(True)
         self.set_titlebar(header)
 
-        # Left header controls: Open Topology2 Dir + Undo/Redo + Graph Layout actions
-        open_btn = Gtk.Button(label="Open Topology2 Dir…")
-        open_btn.set_tooltip_text("Open a tools/topology/topology2 directory")
-        open_btn.connect("clicked", self._on_open_dir_clicked)
-        header.pack_start(open_btn)
-
-        self.undo_btn = Gtk.Button(label="↶ Undo")
-        self.undo_btn.set_sensitive(False)
-        self.undo_btn.set_tooltip_text("Undo last change (Shortcut: Ctrl+Z)")
-        self.undo_btn.connect("clicked", self._on_undo_clicked)
-        header.pack_start(self.undo_btn)
-
-        self.redo_btn = Gtk.Button(label="↷ Redo")
-        self.redo_btn.set_sensitive(False)
-        self.redo_btn.set_tooltip_text("Redo last undone change (Shortcut: Ctrl+Y / Ctrl+Shift+Z)")
-        self.redo_btn.connect("clicked", self._on_redo_clicked)
-        header.pack_start(self.redo_btn)
-
-        fit_btn = Gtk.Button(label="Fit Graph")
-        fit_btn.set_tooltip_text("Fit graph to canvas (Shortcut: F)")
-        fit_btn.connect("clicked", lambda _b: self.canvas.fit_to_view())
-        header.pack_start(fit_btn)
-
-        relayout_btn = Gtk.Button(label="Auto-Layout")
-        relayout_btn.set_tooltip_text("Re-run Sugiyama DAG auto-layout (Shortcut: L)")
-        relayout_btn.connect("clicked", self._on_relayout_clicked)
-        header.pack_start(relayout_btn)
-
-        del_btn = Gtk.Button(label="Delete Node/Route")
-        del_btn.set_tooltip_text("Delete selected node or route edge (Shortcut: Del)")
-        del_btn.connect("clicked", lambda _b: self.canvas.delete_selected())
-        header.pack_start(del_btn)
-
-        export_btn = Gtk.Button(label="Export .conf")
-        export_btn.set_tooltip_text("Save current edited topology/pipeline to build directory")
-        export_btn.connect("clicked", self._on_export_conf_clicked)
-        header.pack_start(export_btn)
+        # Left side: Unified Menubar (File, Edit, View)
+        self.menubar = self._build_menubar()
+        header.pack_start(self.menubar)
 
         # Right header controls: Testbench Audio Config + Compile + Run in Testbench
         self.play_out_btn = Gtk.Button(label="Play Out WAV")
@@ -242,7 +463,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         left_panel_frame.set_child(self.left_panel)
 
         # 2. Middle Horizontal Panel:
-        #    Vertical Paned: Top = Graph Canvas, Bottom = Real-Time / Zoomable Waveforms Pane + Status Bar
+        #    Vertical Paned: Top = Multi-Tab Graph Notebook, Bottom = Real-Time / Zoomable Waveforms Pane + Status Bar
         center_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         center_box.set_vexpand(True)
         center_box.set_hexpand(True)
@@ -255,16 +476,18 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.center_vpaned.set_resize_end_child(False)
         self.center_vpaned.set_position(580)
 
-        self.canvas = TopologyGraphCanvas(
-            on_selection_changed=self._on_canvas_selection_changed,
-            on_graph_modified=self._on_graph_modified,
-            on_history_changed=self._update_undo_redo_buttons,
-        )
+        self.graph_notebook = Gtk.Notebook()
+        self.graph_notebook.set_scrollable(True)
+        self.graph_notebook.set_vexpand(True)
+        self.graph_notebook.set_hexpand(True)
+        self.graph_notebook.set_show_border(False)
+        self.graph_notebook.connect("switch-page", self._on_graph_notebook_switch_page)
+
         canvas_frame = Gtk.Frame()
         canvas_frame.add_css_class("sub-panel-frame")
         canvas_frame.set_vexpand(True)
         canvas_frame.set_hexpand(True)
-        canvas_frame.set_child(self.canvas)
+        canvas_frame.set_child(self.graph_notebook)
         self.center_vpaned.set_start_child(canvas_frame)
 
         # Bottom Waveforms Pane (below the Main Graph Pane)
@@ -493,29 +716,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         exec_row2.append(btn_stop_srv)
         ctl_box.append(exec_row2)
 
-        # Section 2: Kcontrol Configuration (SOF_NET_OP_KCTL_LIST / SOF_NET_OP_KCTL_SET)
-        kctl_hdr = Gtk.Label(label="Kcontrol Configuration (OP_KCTL_LIST / SET)", xalign=0.0)
-        kctl_hdr.add_css_class("heading")
-        ctl_box.append(kctl_hdr)
-
-        self.kctl_combo = Gtk.DropDown.new_from_strings(["(Run testbench to list kcontrols)"])
-        self.kctl_combo.set_hexpand(True)
-        self.kctl_combo.connect("notify::selected", self._on_kctl_combo_selected)
-        ctl_box.append(self.kctl_combo)
-
-        kctl_val_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        kctl_val_row.append(Gtk.Label(label="Values:"))
-        self.kctl_val_entry = Gtk.Entry()
-        self.kctl_val_entry.set_placeholder_text("e.g. 28,28")
-        self.kctl_val_entry.set_hexpand(True)
-        kctl_val_row.append(self.kctl_val_entry)
-
-        btn_kctl_set = Gtk.Button(label="Apply Kcontrol")
-        btn_kctl_set.connect("clicked", self._on_apply_kcontrol_clicked)
-        kctl_val_row.append(btn_kctl_set)
-        ctl_box.append(kctl_val_row)
-
-        # Section 3: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
+        # Section 2: Remote Shell Command Execution (SOF_NET_OP_SHELL_EXEC)
         sh_hdr = Gtk.Label(label="Remote Testbench Shell (OP_SHELL_EXEC)", xalign=0.0)
         sh_hdr.add_css_class("heading")
         ctl_box.append(sh_hdr)
@@ -614,6 +815,316 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             first_p = sorted(ws.pipeline_classes.keys())[0]
             self._on_left_pane_item_selected("pipeline", first_p, None)
 
+    @staticmethod
+    def _format_tab_title(vm: Optional[GraphViewModel], fallback: str = "Untitled.conf") -> str:
+        if vm is None:
+            return fallback
+        icon_map = {
+            "module": "🧩",
+            "pipeline": "⛓",
+            "function_topology": "🔀",
+            "topology": "🎛",
+            "base_class": "📦",
+        }
+        icon = icon_map.get(vm.view_kind, "📄")
+        base = os.path.basename(vm.source_file) if vm.source_file else vm.title
+        # Include variant suffix if viewing a specific topology variant
+        if vm.view_kind == "topology" and "[" in vm.title and "]" in vm.title:
+            var_part = vm.title[vm.title.find("["):]
+            base = f"{base} {var_part}"
+        dirty_mark = " •" if vm.dirty else ""
+        return f"{icon} {base}{dirty_mark}"
+
+    def _update_active_tab_header(self) -> None:
+        tab = self.get_active_tab()
+        if tab is None:
+            return
+        vm = tab.canvas.vm
+        tab.title_lbl.set_text(self._format_tab_title(vm, tab.primary_id))
+        if vm is not None:
+            tip = f"{vm.title}\nFile: {vm.source_file or '(Unsaved)'}"
+            tab.tab_box.set_tooltip_text(tip)
+
+    def _open_or_switch_graph_tab(
+        self,
+        tab_key: str,
+        pane_kind: str,
+        primary_id: str,
+        secondary_id: Optional[str],
+        vm: GraphViewModel,
+        is_untitled: bool = False,
+    ) -> GraphTabPage:
+        """Switch to an already-open tab if matching tab_key exists, or create and select a new tab."""
+        for existing in self.graph_tabs:
+            if existing.tab_key == tab_key:
+                pnum = self.graph_notebook.page_num(existing.view_stack)
+                if pnum >= 0:
+                    self.graph_notebook.set_current_page(pnum)
+                self._sync_ui_to_active_tab()
+                return existing
+
+        new_canvas = TopologyGraphCanvas(
+            on_selection_changed=self._on_canvas_selection_changed,
+            on_graph_modified=self._on_graph_modified,
+            on_history_changed=self._update_undo_redo_buttons,
+            on_kcontrol_changed=self._on_canvas_kcontrol_changed,
+        )
+        new_canvas.set_graph(vm, self.workspace)
+
+        new_text_editor = TopologyTextEditor()
+
+        view_stack = Gtk.Stack()
+        view_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        view_stack.set_transition_duration(120)
+        view_stack.set_hexpand(True)
+        view_stack.set_vexpand(True)
+        view_stack.add_named(new_canvas, "graph")
+        view_stack.add_named(new_text_editor, "text")
+        view_stack.set_visible_child_name("graph")
+
+        tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title_lbl = Gtk.Label(label=self._format_tab_title(vm, primary_id))
+        tab_box.append(title_lbl)
+
+        mode_switch_btn = Gtk.ToggleButton(label="</> Text")
+        mode_switch_btn.add_css_class("flat")
+        mode_switch_btn.add_css_class("caption")
+        mode_switch_btn.set_tooltip_text(
+            "Switch between Visual Graph Diagram and Colorized Topology2 (.conf) Text Editor (Ctrl+T)"
+        )
+        tab_box.append(mode_switch_btn)
+
+        close_btn = Gtk.Button(label="✕")
+        close_btn.add_css_class("flat")
+        close_btn.set_tooltip_text("Close tab (Shortcut: Ctrl+W)")
+        tab_box.append(close_btn)
+
+        tab_page = GraphTabPage(
+            tab_key=tab_key,
+            pane_kind=pane_kind,
+            primary_id=primary_id,
+            secondary_id=secondary_id,
+            canvas=new_canvas,
+            text_editor=new_text_editor,
+            view_stack=view_stack,
+            tab_box=tab_box,
+            title_lbl=title_lbl,
+            mode_switch_btn=mode_switch_btn,
+            is_untitled=is_untitled,
+            text_needs_refresh_from_graph=True,
+        )
+        tab_box.set_tooltip_text(f"{vm.title}\nFile: {vm.source_file or '(Unsaved)'}")
+        new_text_editor.on_text_committed = lambda txt, tp=tab_page: self._on_tab_text_committed(tp, txt)
+        mode_switch_btn.connect("toggled", self._on_tab_mode_switch_toggled, tab_page)
+        close_btn.connect("clicked", lambda _b, tp=tab_page: self._close_graph_tab(tp))
+
+        pnum = self.graph_notebook.append_page(view_stack, tab_box)
+        self.graph_notebook.set_tab_reorderable(view_stack, True)
+        self.graph_tabs.append(tab_page)
+        self.graph_notebook.set_current_page(pnum)
+        self._sync_ui_to_active_tab()
+        return tab_page
+
+    def _refresh_tab_text_from_graph(self, tab_page: GraphTabPage) -> None:
+        """Populate tab_page.text_editor from its current GraphViewModel."""
+        vm = tab_page.canvas.vm
+        if vm is None:
+            return
+        root_dir = self.workspace.root_dir if self.workspace else None
+        conf_text = get_editable_conf_text_for_vm(vm, root_dir)
+        header = f"Topology2 (.conf) Text Editor — {vm.title}"
+        if vm.source_file:
+            header += f"  [{os.path.basename(vm.source_file)}]"
+        tab_page.text_editor.set_text(conf_text, header_title=header)
+        tab_page.text_needs_refresh_from_graph = False
+
+    def _on_tab_mode_switch_toggled(
+        self,
+        btn: Gtk.ToggleButton,
+        tab_page: GraphTabPage,
+    ) -> None:
+        """Switch a Main View notebook tab between Visual Graph ('graph') and Text Editor ('text')."""
+        pnum = self.graph_notebook.page_num(tab_page.view_stack)
+        if pnum >= 0 and self.graph_notebook.get_current_page() != pnum:
+            self.graph_notebook.set_current_page(pnum)
+
+        if btn.get_active():
+            btn.set_label("🕸 Graph")
+            btn.set_tooltip_text("Switch back to Visual Graph Diagram (Ctrl+T)")
+            if tab_page.text_needs_refresh_from_graph or not tab_page.text_editor.get_text().strip():
+                self._refresh_tab_text_from_graph(tab_page)
+            tab_page.view_stack.set_visible_child_name("text")
+            tab_page.text_editor.text_view.grab_focus()
+            vm = tab_page.canvas.vm
+            self.status_lbl.set_text(
+                f"Text Editor mode: {vm.title if vm else tab_page.primary_id} "
+                f"(Edit .conf text directly — changes sync to diagram)"
+            )
+        else:
+            btn.set_label("</> Text")
+            btn.set_tooltip_text(
+                "Switch between Visual Graph Diagram and Colorized Topology2 (.conf) Text Editor (Ctrl+T)"
+            )
+            if tab_page.text_editor.is_modified_in_text:
+                tab_page.text_editor.commit_to_diagram()
+            tab_page.view_stack.set_visible_child_name("graph")
+            self._sync_ui_to_tab(tab_page)
+
+    def toggle_active_tab_text_mode(self) -> bool:
+        """Toggle the active tab between Visual Graph and Topology2 Text Editor."""
+        active = self.get_active_tab()
+        if active is None:
+            return False
+        active.mode_switch_btn.set_active(not active.mode_switch_btn.get_active())
+        return active.mode_switch_btn.get_active()
+
+    def _on_tab_text_committed(
+        self,
+        tab_page: GraphTabPage,
+        new_text: str,
+    ) -> Tuple[bool, str]:
+        """Parse edited .conf text from TopologyTextEditor and update tab_page's diagram."""
+        ws = self._ensure_workspace()
+        old_vm = tab_page.canvas.vm
+        source_file = old_vm.source_file if old_vm else ""
+        fallback_kind = old_vm.view_kind if old_vm else tab_page.pane_kind
+        fallback_title = old_vm.title if old_vm else tab_page.primary_id
+
+        target_variant = None
+        if tab_page.pane_kind == "topology" and tab_page.secondary_id and source_file:
+            for entry in ws.machine_topologies:
+                if os.path.abspath(entry.conf_path) == os.path.abspath(source_file):
+                    target_variant = next(
+                        (v for v in entry.variants if v.output_name == tab_page.secondary_id),
+                        None,
+                    )
+                    break
+
+        try:
+            new_vm = ws.build_graph_from_conf_text(
+                new_text,
+                source_file=source_file,
+                fallback_view_kind=fallback_kind,
+                fallback_title=fallback_title,
+                target_variant=target_variant,
+            )
+            layout_graph(new_vm)
+        except Exception as exc:
+            return False, str(exc)
+
+        # Record undo snapshot on canvas before replacing view model
+        if old_vm is not None:
+            tab_page.canvas.record_undo_snapshot("Edit Topology Text")
+            # Preserve existing node coordinates when node & edge topology structure is unchanged
+            if (
+                set(old_vm.nodes.keys()) == set(new_vm.nodes.keys())
+                and len(old_vm.edges) == len(new_vm.edges)
+            ):
+                for nid, new_node in new_vm.nodes.items():
+                    old_node = old_vm.nodes.get(nid)
+                    if old_node is not None:
+                        new_node.x = old_node.x
+                        new_node.y = old_node.y
+                for cid, new_cont in new_vm.containers.items():
+                    old_cont = old_vm.containers.get(cid)
+                    if old_cont is not None:
+                        new_cont.x = old_cont.x
+                        new_cont.y = old_cont.y
+                        new_cont.width = old_cont.width
+                        new_cont.height = old_cont.height
+
+        new_vm.dirty = True
+        tab_page.canvas.vm = new_vm
+        if tab_page.canvas.selected_node_id and tab_page.canvas.selected_node_id not in new_vm.nodes:
+            tab_page.canvas.selected_node_id = None
+        if tab_page.canvas.selected_node_ids:
+            tab_page.canvas.selected_node_ids = {
+                nid for nid in tab_page.canvas.selected_node_ids if nid in new_vm.nodes
+            }
+        tab_page.text_needs_refresh_from_graph = False
+        tab_page.canvas.queue_draw()
+        self._sync_ui_to_tab(tab_page)
+        return True, f"{len(new_vm.nodes)} nodes, {len(new_vm.edges)} routes"
+
+    def _close_graph_tab(self, tab_page: GraphTabPage) -> bool:
+        """Close the specified GraphTabPage in the Main Graph Notebook."""
+        pnum = self.graph_notebook.page_num(tab_page.view_stack)
+        if tab_page in self.graph_tabs:
+            self.graph_tabs.remove(tab_page)
+        if pnum >= 0:
+            self.graph_notebook.remove_page(pnum)
+        if not self.graph_tabs:
+            self.right_inspector.set_node_config(None, None, "")
+            self._update_undo_redo_buttons()
+            self.status_lbl.set_text(
+                "Closed tab. Use File ▸ New or select an item in the left panel to open a graph."
+            )
+        else:
+            self._sync_ui_to_active_tab()
+        return True
+
+    def close_current_tab(self) -> bool:
+        """Close the currently active graph tab."""
+        active = self.get_active_tab()
+        if active is None:
+            return False
+        return self._close_graph_tab(active)
+
+    def _on_graph_notebook_switch_page(
+        self,
+        _notebook: Gtk.Notebook,
+        page_widget: Gtk.Widget,
+        _page_num: int,
+    ) -> None:
+        for tab in self.graph_tabs:
+            if tab.view_stack is page_widget or tab.canvas is page_widget:
+                self._sync_ui_to_tab(tab)
+                break
+
+    def _sync_ui_to_active_tab(self) -> None:
+        active = self.get_active_tab()
+        if active is not None:
+            self._sync_ui_to_tab(active)
+
+    def _sync_ui_to_tab(self, tab: GraphTabPage) -> None:
+        vm = tab.canvas.vm
+        self._update_undo_redo_buttons()
+        self._update_active_tab_header()
+        if vm is None:
+            self.right_inspector.set_node_config(None, None, "")
+            return
+        # Restore right attribute inspector to the tab's selected node/container or root config
+        sel_nid = tab.canvas.selected_node_id
+        sel_cid = tab.canvas.selected_container_id
+        if sel_nid and sel_nid in vm.nodes:
+            node = vm.nodes[sel_nid]
+            self.right_inspector.set_node_config(
+                f"{node.title} ({node.class_name})",
+                node.config,
+                node.subtitle,
+            )
+        elif sel_cid is not None:
+            cont = vm.containers.get(sel_cid)
+            if cont and cont.config:
+                self.right_inspector.set_node_config(
+                    f"Pipeline {cont.pipeline_id} ({cont.class_name})",
+                    cont.config,
+                    f"Class.Pipeline.{cont.class_name} [{cont.direction}]",
+                )
+            else:
+                self.right_inspector.set_node_config(vm.title, vm.root_config, vm.source_file)
+        else:
+            self.right_inspector.set_node_config(vm.title, vm.root_config, vm.source_file)
+
+        if self.workspace:
+            _, _, tb_pipes = generate_compilable_conf(vm, self.workspace.root_dir)
+            if tb_pipes:
+                self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
+        self._update_waveform_stream_labels()
+        self.status_lbl.set_text(
+            f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
+        )
+
     def _on_left_pane_item_selected(
         self,
         pane_kind: str,
@@ -623,6 +1134,16 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.workspace:
             return
         try:
+            tab_key = f"{pane_kind}:{primary_id}:{secondary_id or ''}"
+            # If already open in a tab, switch to it directly without rebuilding
+            for existing in self.graph_tabs:
+                if existing.tab_key == tab_key:
+                    pnum = self.graph_notebook.page_num(existing.view_stack)
+                    if pnum >= 0:
+                        self.graph_notebook.set_current_page(pnum)
+                    self._sync_ui_to_tab(existing)
+                    return
+
             if pane_kind == "base_class":
                 vm = self.workspace.build_graph_for_base_class(primary_id)
             elif pane_kind == "module":
@@ -640,16 +1161,342 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             else:
                 return
 
-            self.canvas.set_graph(vm, self.workspace)
-            # Auto-populate pipeline IDs for testbench
-            _, _, tb_pipes = generate_compilable_conf(vm, self.workspace.root_dir)
-            self.pipes_entry.set_text(",".join(str(p) for p in tb_pipes))
-            self._update_waveform_stream_labels()
-            self.status_lbl.set_text(
-                f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
+            self._open_or_switch_graph_tab(
+                tab_key=tab_key,
+                pane_kind=pane_kind,
+                primary_id=primary_id,
+                secondary_id=secondary_id,
+                vm=vm,
+                is_untitled=False,
             )
         except Exception as exc:
             self.append_log(f"Error building graph for {primary_id}: {exc}")
+
+    # -------------------------------------------------------------------------
+    # File Menu Actions (New 4 Types, Open File, Save, Save As) & Edit Actions
+    # -------------------------------------------------------------------------
+
+    def _ensure_workspace(self) -> Topology2Workspace:
+        if self.workspace is None:
+            default_dir = "/home/lrg/work/sof-arl/sof-arl/tools/topology/topology2"
+            ws = Topology2Workspace(default_dir if os.path.isdir(default_dir) else os.getcwd())
+            if os.path.isdir(default_dir):
+                ws.scan_all()
+            self.workspace = ws
+        return self.workspace
+
+    def action_new_module(self, name: Optional[str] = None) -> GraphTabPage:
+        """Create a new Module (Class.Widget) graph tab."""
+        ws = self._ensure_workspace()
+        self._new_file_counter += 1
+        mod_name = name or f"custom_module_{self._new_file_counter}"
+        vm = ws.create_new_module_graph(mod_name)
+        tab_key = f"new:module:{self._new_file_counter}:{mod_name}"
+        tab = self._open_or_switch_graph_tab(
+            tab_key=tab_key,
+            pane_kind="module",
+            primary_id=mod_name,
+            secondary_id=None,
+            vm=vm,
+            is_untitled=True,
+        )
+        self.status_lbl.set_text(f"Created new Module tab: {vm.title}")
+        return tab
+
+    def action_new_feature_topology(self, name: Optional[str] = None) -> GraphTabPage:
+        """Create a new Feature Topology (Class.Pipeline) graph tab."""
+        ws = self._ensure_workspace()
+        self._new_file_counter += 1
+        pipe_name = name or f"feature-pipeline-{self._new_file_counter}"
+        vm = ws.create_new_feature_topology_graph(pipe_name)
+        tab_key = f"new:pipeline:{self._new_file_counter}:{pipe_name}"
+        tab = self._open_or_switch_graph_tab(
+            tab_key=tab_key,
+            pane_kind="pipeline",
+            primary_id=pipe_name,
+            secondary_id=None,
+            vm=vm,
+            is_untitled=True,
+        )
+        self.status_lbl.set_text(f"Created new Feature Topology (Pipeline) tab: {vm.title}")
+        return tab
+
+    def action_new_function_topology(self, name: Optional[str] = None) -> GraphTabPage:
+        """Create a new Function Topology (Multi-Pipeline FE -> BE sub-graph) tab."""
+        ws = self._ensure_workspace()
+        self._new_file_counter += 1
+        fn_name = name or f"function-topology-{self._new_file_counter}"
+        vm = ws.create_new_function_topology_graph(fn_name)
+        tab_key = f"new:function_topology:{self._new_file_counter}:{fn_name}"
+        tab = self._open_or_switch_graph_tab(
+            tab_key=tab_key,
+            pane_kind="function_topology",
+            primary_id=fn_name,
+            secondary_id=None,
+            vm=vm,
+            is_untitled=True,
+        )
+        self.status_lbl.set_text(f"Created new Function Topology tab: {vm.title}")
+        return tab
+
+    def action_new_monolithic_topology(self, name: Optional[str] = None) -> GraphTabPage:
+        """Create a new Monolithic Topology (sof-*.conf) graph tab."""
+        ws = self._ensure_workspace()
+        self._new_file_counter += 1
+        topo_name = name or f"sof-custom-{self._new_file_counter}"
+        vm = ws.create_new_monolithic_topology_graph(topo_name)
+        tab_key = f"new:topology:{self._new_file_counter}:{topo_name}"
+        tab = self._open_or_switch_graph_tab(
+            tab_key=tab_key,
+            pane_kind="topology",
+            primary_id=topo_name,
+            secondary_id=None,
+            vm=vm,
+            is_untitled=True,
+        )
+        self.status_lbl.set_text(f"Created new Monolithic Topology tab: {vm.title}")
+        return tab
+
+    def action_open_file(self) -> None:
+        """Open a Gtk.FileDialog to open an existing .conf file in a new graph tab."""
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Open SOF Topology2 .conf File")
+        if self.workspace and os.path.isdir(self.workspace.root_dir):
+            dialog.set_initial_folder(Gio.File.new_for_path(self.workspace.root_dir))
+        conf_filter = Gtk.FileFilter()
+        conf_filter.set_name("ALSA Topology2 Config (*.conf)")
+        conf_filter.add_pattern("*.conf")
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("All Files (*)")
+        all_filter.add_pattern("*")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(conf_filter)
+        filters.append(all_filter)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(conf_filter)
+        dialog.open(self, None, self._on_conf_file_selected)
+
+    def _on_conf_file_selected(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            gfile = dialog.open_finish(result)
+            if gfile:
+                path = gfile.get_path()
+                if path:
+                    self.open_conf_file_in_tab(path)
+        except Exception:
+            pass
+
+    def open_conf_file_in_tab(self, path: str) -> Optional[GraphTabPage]:
+        """Parse and open an arbitrary .conf file into a new or existing graph tab."""
+        ws = self._ensure_workspace()
+        abs_path = os.path.abspath(path)
+        if not os.path.isfile(abs_path):
+            self.status_lbl.set_text(f"File not found: {abs_path}")
+            return None
+        try:
+            vm = ws.build_graph_for_arbitrary_conf_file(abs_path)
+            tab_key = f"file:{abs_path}"
+            tab = self._open_or_switch_graph_tab(
+                tab_key=tab_key,
+                pane_kind=vm.view_kind,
+                primary_id=abs_path,
+                secondary_id=None,
+                vm=vm,
+                is_untitled=False,
+            )
+            self.status_lbl.set_text(f"Opened file: {abs_path}")
+            return tab
+        except Exception as exc:
+            self.append_log(f"Error opening {abs_path}: {exc}")
+            self.status_lbl.set_text(f"Error opening {os.path.basename(abs_path)}: {exc}")
+            return None
+
+    def save_active_tab_to_path(self, target_path: str) -> bool:
+        """Serialize and save the active graph tab's view model (or active text buffer) to target_path."""
+        active = self.get_active_tab()
+        if active is None or active.canvas.vm is None:
+            return False
+        # If the user is currently in Text Editor mode or has unapplied text edits, commit to diagram first
+        in_text_mode = active.view_stack.get_visible_child_name() == "text"
+        if in_text_mode or active.text_editor.is_modified_in_text:
+            active.text_editor.commit_to_diagram()
+        vm = active.canvas.vm
+        abs_path = os.path.abspath(target_path)
+        try:
+            parent_dir = os.path.dirname(abs_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            root_dir = self.workspace.root_dir if self.workspace else None
+            if in_text_mode and not active.text_needs_refresh_from_graph and active.text_editor.get_text().strip():
+                content = active.text_editor.get_text()
+                if not content.endswith("\n"):
+                    content += "\n"
+            else:
+                content = serialize_graph_for_save(vm, root_dir)
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            vm.source_file = abs_path
+            vm.dirty = False
+            active.is_untitled = False
+            active.primary_id = abs_path
+            active.tab_key = f"file:{abs_path}"
+            self._update_active_tab_header()
+            self.append_log(f"Saved {vm.title} to {abs_path} ({len(content)} bytes)")
+            self.status_lbl.set_text(f"Saved: {abs_path}")
+            return True
+        except Exception as exc:
+            self.append_log(f"Error saving to {abs_path}: {exc}")
+            self.status_lbl.set_text(f"Save failed: {exc}")
+            return False
+
+    def action_save(self) -> bool:
+        """Save the active graph tab in-place, or prompt Save As if untitled."""
+        active = self.get_active_tab()
+        if active is None or active.canvas.vm is None:
+            return False
+        vm = active.canvas.vm
+        if active.is_untitled or not vm.source_file:
+            self.action_save_as()
+            return False
+        return self.save_active_tab_to_path(vm.source_file)
+
+    def action_save_as(self) -> None:
+        """Prompt user with Gtk.FileDialog to save the active graph tab to a chosen .conf path."""
+        active = self.get_active_tab()
+        if active is None or active.canvas.vm is None:
+            return
+        vm = active.canvas.vm
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title(f"Save {vm.title} As…")
+
+        default_name = os.path.basename(vm.source_file) if vm.source_file else "custom-topology.conf"
+        dialog.set_initial_name(default_name)
+
+        initial_dir = os.path.dirname(vm.source_file) if vm.source_file else ""
+        if (not initial_dir or not os.path.isdir(initial_dir)) and self.workspace:
+            initial_dir = self.workspace.root_dir
+        if initial_dir and os.path.isdir(initial_dir):
+            dialog.set_initial_folder(Gio.File.new_for_path(initial_dir))
+
+        dialog.save(self, None, self._on_save_as_finished)
+
+    def _on_save_as_finished(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            gfile = dialog.save_finish(result)
+            if gfile:
+                path = gfile.get_path()
+                if path:
+                    if not path.endswith(".conf"):
+                        path += ".conf"
+                    self.save_active_tab_to_path(path)
+        except Exception:
+            pass
+
+    def export_active_tab_to_pdf(self, target_path: str) -> bool:
+        """Render and save the active graph tab to a vector PDF file."""
+        active = self.get_active_tab()
+        if active is None or active.canvas.vm is None:
+            return False
+        if active.text_editor.is_modified_in_text:
+            active.text_editor.commit_to_diagram()
+        abs_path = os.path.abspath(target_path)
+        try:
+            ok = active.canvas.export_to_pdf(abs_path)
+            if ok:
+                size_kb = os.path.getsize(abs_path) / 1024.0
+                self.append_log(f"Exported PDF diagram to {abs_path} ({size_kb:.1f} KB)")
+                self.status_lbl.set_text(f"Exported PDF: {abs_path} ({size_kb:.1f} KB)")
+                return True
+            self.status_lbl.set_text(f"PDF export failed for {abs_path}")
+            return False
+        except Exception as exc:
+            self.append_log(f"Error exporting PDF to {abs_path}: {exc}")
+            self.status_lbl.set_text(f"PDF export error: {exc}")
+            return False
+
+    def action_export_pdf(self) -> None:
+        """Prompt user with Gtk.FileDialog to export the active graph tab to a PDF file."""
+        active = self.get_active_tab()
+        if active is None or active.canvas.vm is None:
+            return
+        vm = active.canvas.vm
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title(f"Export {vm.title} to PDF…")
+
+        base_stem = (
+            os.path.splitext(os.path.basename(vm.source_file))[0]
+            if vm.source_file
+            else vm.title.replace("Class.Widget.", "").replace("Class.Pipeline.", "").replace(" ", "_")
+        )
+        dialog.set_initial_name(f"{base_stem}.pdf")
+
+        pdf_filter = Gtk.FileFilter()
+        pdf_filter.set_name("PDF Document (*.pdf)")
+        pdf_filter.add_pattern("*.pdf")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(pdf_filter)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(pdf_filter)
+
+        initial_dir = os.path.dirname(vm.source_file) if vm.source_file else ""
+        if (not initial_dir or not os.path.isdir(initial_dir)) and self.workspace:
+            initial_dir = self.workspace.root_dir
+        if initial_dir and os.path.isdir(initial_dir):
+            dialog.set_initial_folder(Gio.File.new_for_path(initial_dir))
+
+        dialog.save(self, None, self._on_export_pdf_finished)
+
+    def _on_export_pdf_finished(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            gfile = dialog.save_finish(result)
+            if gfile:
+                path = gfile.get_path()
+                if path:
+                    if not path.lower().endswith(".pdf"):
+                        path += ".pdf"
+                    self.export_active_tab_to_pdf(path)
+        except Exception:
+            pass
+
+    def action_select_all(self) -> int:
+        """Select all nodes and containers on the active graph tab."""
+        cnt = self.canvas.select_all()
+        self.status_lbl.set_text(f"Selected all ({cnt} items)")
+        return cnt
+
+    def action_copy(self) -> int:
+        """Copy selected nodes/containers on the active graph tab to clipboard."""
+        cnt = self.canvas.copy_selected()
+        if cnt > 0:
+            self.status_lbl.set_text(f"Copied {cnt} item(s) to clipboard")
+        else:
+            self.status_lbl.set_text("Nothing selected to copy")
+        return cnt
+
+    def action_cut(self) -> int:
+        """Cut selected nodes/containers on the active graph tab to clipboard."""
+        cnt = self.canvas.cut_selected()
+        if cnt > 0:
+            self._update_active_tab_header()
+            self.status_lbl.set_text(f"Cut {cnt} item(s) to clipboard")
+        else:
+            self.status_lbl.set_text("Nothing selected to cut")
+        return cnt
+
+    def action_paste(self) -> int:
+        """Paste clipboard nodes/containers into the active graph tab."""
+        cnt = self.canvas.paste_clipboard()
+        if cnt > 0:
+            self._update_active_tab_header()
+            self.status_lbl.set_text(f"Pasted {cnt} node(s) from clipboard")
+        else:
+            self.status_lbl.set_text("Clipboard is empty")
+        return cnt
+
+    def action_delete_selected(self) -> None:
+        """Delete selected nodes, containers, or route edge on the active graph tab."""
+        self.canvas.delete_selected()
+        self._update_active_tab_header()
 
     def _update_waveform_stream_labels(self) -> None:
         """Update Input and Output waveform lane labels from active TestbenchIO or pipeline endpoints."""
@@ -817,6 +1664,15 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _on_before_attribute_edit(self, desc: str) -> None:
         self.canvas.record_undo_snapshot(desc)
 
+    def _mark_active_tab_graph_modified_visually(self) -> None:
+        """Mark the active tab so its Text Editor refreshes from the updated GraphViewModel."""
+        active = self.get_active_tab()
+        if active is None:
+            return
+        active.text_needs_refresh_from_graph = True
+        if active.view_stack.get_visible_child_name() == "text":
+            self._refresh_tab_text_from_graph(active)
+
     def _on_node_attribute_edited(self, config: ConfigNode, key: str, new_val: str) -> None:
         if not self.canvas.vm:
             return
@@ -835,38 +1691,40 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 node.in_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "in")
                 node.out_fmt_badge = Topology2Workspace.summarize_pin_audio_format(node.config, "out")
             _compute_node_geometry(node)
+        self._mark_active_tab_graph_modified_visually()
         self._update_waveform_stream_labels()
+        self._update_active_tab_header()
         self.canvas.queue_draw()
         self.status_lbl.set_text(f"Updated attribute '{key}' = '{new_val}'")
 
     def _on_undo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.undo_description
         if self.canvas.undo():
+            self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
+            self._update_active_tab_header()
             self.status_lbl.set_text(f"Undid: {desc}")
 
     def _on_redo_clicked(self, _btn: Optional[Gtk.Button]) -> None:
         desc = self.canvas.history.redo_description
         if self.canvas.redo():
+            self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
+            self._update_active_tab_header()
             self.status_lbl.set_text(f"Redid: {desc}")
 
     def _update_undo_redo_buttons(self) -> None:
         h = self.canvas.history
-        self.undo_btn.set_sensitive(h.can_undo)
-        self.redo_btn.set_sensitive(h.can_redo)
-        if h.can_undo:
-            self.undo_btn.set_tooltip_text(f"Undo: {h.undo_description} (Ctrl+Z)")
-        else:
-            self.undo_btn.set_tooltip_text("Undo last change (Shortcut: Ctrl+Z)")
-        if h.can_redo:
-            self.redo_btn.set_tooltip_text(f"Redo: {h.redo_description} (Ctrl+Y / Ctrl+Shift+Z)")
-        else:
-            self.redo_btn.set_tooltip_text("Redo last undone change (Shortcut: Ctrl+Y / Ctrl+Shift+Z)")
+        if hasattr(self, "undo_action") and self.undo_action is not None:
+            self.undo_action.set_enabled(h.can_undo)
+        if hasattr(self, "redo_action") and self.redo_action is not None:
+            self.redo_action.set_enabled(h.can_redo)
 
     def _on_graph_modified(self) -> None:
         if self.canvas.vm:
+            self._mark_active_tab_graph_modified_visually()
             self._update_waveform_stream_labels()
+            self._update_active_tab_header()
             if self.workspace:
                 _, _, tb_pipes = generate_compilable_conf(self.canvas.vm, self.workspace.root_dir)
                 if tb_pipes:
@@ -879,6 +1737,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.canvas.relayout_graph()
 
     def _on_export_conf_clicked(self, _btn: Gtk.Button) -> None:
+        active = self.get_active_tab()
+        if active and active.text_editor.is_modified_in_text:
+            active.text_editor.commit_to_diagram()
         if not self.canvas.vm or not self.compiler:
             return
         self.left_panel.show_compile_pane()
@@ -913,6 +1774,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     # -------------------------------------------------------------------------
 
     def _on_compile_clicked(self, _btn: Gtk.Button) -> None:
+        active = self.get_active_tab()
+        if active and active.text_editor.is_modified_in_text:
+            active.text_editor.commit_to_diagram()
         if not self.canvas.vm or not self.compiler:
             return
         vm = self.canvas.vm
@@ -929,6 +1793,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_run_testbench_clicked(self, _btn: Gtk.Button) -> None:
+        active = self.get_active_tab()
+        if active and active.text_editor.is_modified_in_text:
+            active.text_editor.commit_to_diagram()
         if not self.canvas.vm or not self.compiler or not self.tb_runner:
             return
         vm = self.canvas.vm
@@ -1121,50 +1988,80 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         tbuf.set_text(telem.format_report())
 
         self._discovered_kcontrols = list(telem.kcontrols)
-        if self._discovered_kcontrols:
-            labels = [
-                f"[{k.numid}] {k.name} = {','.join(str(v) for v in k.values)}"
-                for k in self._discovered_kcontrols
-            ]
-            self.kctl_combo.set_model(Gtk.StringList.new(labels))
-            self.kctl_combo.set_selected(0)
-            self._on_kctl_combo_selected(self.kctl_combo, None)
+        # Sync live telemetry kcontrol values onto matching graph Control nodes
+        if self.canvas.vm and self._discovered_kcontrols:
+            for kc in self._discovered_kcontrols:
+                if not kc.values:
+                    continue
+                for gnode in self.canvas.vm.nodes.values():
+                    if gnode.class_category == "Control":
+                        gname = str(gnode.config.get_scalar("name", "")).strip('"')
+                        if gname and (gname == kc.name or gname in kc.name or kc.name in gname):
+                            gnode.config.set_scalar("value", str(kc.values[0]), origin="instance")
+            self.canvas.queue_draw()
+
+    # -------------------------------------------------------------------------
+    # Main Graph Canvas Kcontrol Live Server Synchronization
+    # -------------------------------------------------------------------------
+
+    def _on_canvas_kcontrol_changed(self, node: GraphNode) -> None:
+        """Called when the user interacts with a Control widget directly on the Main Graph Canvas."""
+        if self.canvas.selected_node_id == node.id:
+            self.right_inspector.set_node_config(
+                f"{node.title} ({node.class_name})",
+                node.config,
+                node.subtitle,
+            )
+        self._sync_kcontrol_node_to_live_server(node)
+
+    def _sync_kcontrol_node_to_live_server(self, node: GraphNode) -> None:
+        """Send live SOFR OP_KCTL_SET or queue kcontrol override when a Control node changes."""
+        kname = str(node.config.get_scalar("name", "")).strip('"') or node.title
+        if node.category == "control_bytes":
+            bfile = str(node.config.get_scalar("included_param_file", "")).strip('"')
+            self.status_lbl.set_text(f"Updated bytes control '{kname}' → {bfile}")
+            return
+
+        if node.category == "control_enum":
+            cur_opt, opts = self.canvas._get_kcontrol_enum_state(node)
+            ival = opts.index(cur_opt) if cur_opt in opts else 0
         else:
-            self.kctl_combo.set_model(Gtk.StringList.new(["(No kcontrols in active topology)"]))
+            val_raw = str(node.config.get_scalar("value", "0")).strip('"')
+            try:
+                ival = int(float(val_raw.split(",")[0].strip()))
+            except ValueError:
+                ival = 0
 
-    # -------------------------------------------------------------------------
-    # Interactive SOFR Network Protocol Controls
-    # -------------------------------------------------------------------------
+        # Volume controls typically have 2 stereo channels; switches/enums have 1-2 channels
+        vals = [ival, ival] if node.category in ("control_mixer", "control_switch") else [ival]
+        self._pending_kctl_overrides[kname] = vals
 
-    def _on_kctl_combo_selected(self, combo: Gtk.DropDown, _pspec: object) -> None:
-        idx = combo.get_selected()
-        if 0 <= idx < len(self._discovered_kcontrols):
-            kc = self._discovered_kcontrols[idx]
-            self.kctl_val_entry.set_text(",".join(str(v) for v in kc.values))
+        matched_kc: Optional[KcontrolTelemetryItem] = None
+        for kc in self._discovered_kcontrols:
+            if kc.name == kname or kname in kc.name or kc.name in kname:
+                matched_kc = kc
+                ch_cnt = max(1, getattr(kc, "count", len(kc.values) or 1))
+                kc.values = [ival] * ch_cnt
+                break
 
-    def _on_apply_kcontrol_clicked(self, _btn: Gtk.Button) -> None:
-        idx = self.kctl_combo.get_selected()
-        if not (0 <= idx < len(self._discovered_kcontrols)):
-            return
-        kc = self._discovered_kcontrols[idx]
-        raw = self.kctl_val_entry.get_text().strip()
-        vals = [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
-        if not vals:
-            return
-        self._pending_kctl_overrides[kc.name] = vals
         if self.tb_runner and self.tb_runner.live_client:
+            numid = matched_kc.numid if matched_kc else 0
+            target_name = matched_kc.name if matched_kc else kname
+            ch_cnt = max(1, getattr(matched_kc, "count", len(vals))) if matched_kc else len(vals)
+            send_vals = [ival] * ch_cnt
+            self._pending_kctl_overrides[target_name] = send_vals
             st, _ = self.tb_runner.live_client.set_kcontrol(
-                numid=kc.numid,
-                name=kc.name,
-                values=vals,
+                numid=numid,
+                name=target_name,
+                values=send_vals,
             )
             self.append_log(
-                f"[SOFR] Live OP_KCTL_SET numid={kc.numid} '{kc.name}' = {vals} -> status={st}"
+                f"[SOFR] Live OP_KCTL_SET numid={numid} '{target_name}' = {send_vals} -> status={st}"
             )
-            self._on_refresh_telemetry_clicked(None)
+            self.status_lbl.set_text(f"Live Kcontrol '{target_name}' = {send_vals} (status={st})")
         else:
             self.status_lbl.set_text(
-                f"Queued kcontrol override '{kc.name}' = {vals} for next Testbench run (or enable Keep Server -W)."
+                f"Updated Kcontrol '{kname}' = {vals} (queued for next Testbench run)"
             )
 
     def _on_remote_pm_ctl(self, op: int) -> None:

@@ -97,10 +97,13 @@ class LeftNavigationPanel(Gtk.Box):
 
         self.obj_mod_list = Gtk.ListBox()
         self.obj_mod_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.obj_mod_list.set_activate_on_single_click(False)
         self.obj_mod_list.connect("row-selected", self._on_obj_module_row_selected)
+        self.obj_mod_list.connect("row-activated", self._on_obj_row_activated)
         mod_click = Gtk.GestureClick.new()
+        mod_click.set_button(1)
         mod_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        mod_click.connect("pressed", lambda *_a: self._hide_hover_zoom_box())
+        mod_click.connect("pressed", self._on_obj_list_pressed, self.obj_mod_list)
         self.obj_mod_list.add_controller(mod_click)
         mod_motion = Gtk.EventControllerMotion.new()
         mod_motion.connect("motion", self._on_obj_list_motion, self.obj_mod_list)
@@ -135,10 +138,13 @@ class LeftNavigationPanel(Gtk.Box):
 
         self.obj_pipe_list = Gtk.ListBox()
         self.obj_pipe_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.obj_pipe_list.set_activate_on_single_click(False)
         self.obj_pipe_list.connect("row-selected", self._on_obj_pipeline_row_selected)
+        self.obj_pipe_list.connect("row-activated", self._on_obj_row_activated)
         pipe_click = Gtk.GestureClick.new()
+        pipe_click.set_button(1)
         pipe_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-        pipe_click.connect("pressed", lambda *_a: self._hide_hover_zoom_box())
+        pipe_click.connect("pressed", self._on_obj_list_pressed, self.obj_pipe_list)
         self.obj_pipe_list.add_controller(pipe_click)
         pipe_motion = Gtk.EventControllerMotion.new()
         pipe_motion.connect("motion", self._on_obj_list_motion, self.obj_pipe_list)
@@ -606,6 +612,30 @@ class LeftNavigationPanel(Gtk.Box):
         finally:
             self._updating_selection = False
 
+    def _on_obj_row_activated(self, _listbox: Gtk.ListBox, row: Optional[Gtk.ListBoxRow]) -> None:
+        """Open a double-clicked or activated Object View module/pipeline in a Main Graph Notebook tab."""
+        if row is None:
+            return
+        item_kind = getattr(row, "_item_kind", None)
+        item_id = getattr(row, "_item_id", None)
+        if item_kind and item_id:
+            self.on_item_selected(str(item_kind), str(item_id), None)
+
+    def _on_obj_list_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        n_press: int,
+        _x: float,
+        y: float,
+        listbox: Gtk.ListBox,
+    ) -> None:
+        self._hide_hover_zoom_box()
+        if n_press == 2:
+            row = listbox.get_row_at_y(int(y)) or listbox.get_selected_row()
+            if row is not None:
+                listbox.select_row(row)
+                self._on_obj_row_activated(listbox, row)
+
     def _on_tree_selection_changed(self, selection: Gtk.TreeSelection, active_pane_kind: str) -> None:
         if self._updating_selection:
             return
@@ -827,7 +857,7 @@ class LeftNavigationPanel(Gtk.Box):
         card.append(zoom_preview)
 
         hint_lbl = Gtk.Label(
-            label="Drag and drop onto the Main View to instantiate",
+            label="Double-click to open in a new tab  •  Drag and drop onto the Main View to instantiate",
             xalign=0.5,
         )
         hint_lbl.add_css_class("zoom-info-hint")

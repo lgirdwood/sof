@@ -10,10 +10,17 @@ from .model import GraphEdge, GraphNode, GraphViewModel, PipelineContainer
 
 NODE_WIDTH = 200.0
 NODE_BASE_HEIGHT = 86.0
-CONTROL_WIDTH = 34.0
-CONTROL_MIN_HEIGHT = 86.0
-CTRL_TOP_GAP = 16.0
-CTRL_H_GAP = 7.0
+CONTROL_WIDTH = 118.0
+CONTROL_MIN_HEIGHT = 42.0
+CTRL_VOL_WIDTH = 56.0
+CTRL_VOL_HEIGHT = 92.0
+CTRL_COMPACT_WIDTH = 118.0
+CTRL_COMPACT_HEIGHT = 42.0
+CTRL_TOP_GAP = 22.0
+CTRL_H_GAP = 6.0
+CTRL_V_GAP = 6.0
+CTRL_GROUP_PAD = 6.0
+CTRL_GROUP_HDR = 15.0
 TB_IO_WIDTH = 224.0
 TB_IO_HEIGHT = 98.0
 TB_IO_GAP = 48.0
@@ -172,9 +179,13 @@ def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
         return
 
     if node.class_category == "Control":
-        node.width = CONTROL_WIDTH
-        node.height = max(CONTROL_MIN_HEIGHT, min(175.0, len(node.title) * 6.0 + 30.0))
-        # Vertical kcontrol nodes connect from their top-center port up to the bottom of the parent widget
+        if node.category == "control_mixer":
+            node.width = CTRL_VOL_WIDTH
+            node.height = CTRL_VOL_HEIGHT
+        else:
+            node.width = CTRL_COMPACT_WIDTH
+            node.height = CTRL_COMPACT_HEIGHT
+        # Graphical kcontrol cards connect from their top-center port up to the bottom of the parent widget
         for port in node.out_ports:
             port.rel_x = node.width / 2.0
             port.rel_y = 0.0
@@ -307,19 +318,64 @@ def _layout_flat_dag(
         dag_edges = vm.edges
     layers = _compute_dag_layers(ordered_ids, dag_edges)
 
+    def _measure_and_place_module_controls(
+        ctrls: List[str],
+        origin_x: float = 0.0,
+        origin_y: float = 0.0,
+        apply_pos: bool = False,
+    ) -> Tuple[float, float]:
+        """Arrange a module's kcontrols compactly:
+        - Vertical volume faders (control_mixer, 56x92) placed on the left
+        - Shrunk Switch / Enum / Bytes controls (118x42) stacked up to 2 per column on the right
+        Returns (inner_width, inner_height) of the control cluster.
+        """
+        if not ctrls:
+            return (0.0, 0.0)
+        vol_ids = [cid for cid in ctrls if vm.nodes[cid].category == "control_mixer"]
+        compact_ids = [cid for cid in ctrls if vm.nodes[cid].category != "control_mixer"]
+
+        cx = origin_x
+        max_h = 0.0
+
+        for cid in vol_ids:
+            cnode = vm.nodes[cid]
+            if apply_pos:
+                cnode.x = cx
+                cnode.y = origin_y
+            cx += cnode.width + CTRL_H_GAP
+            max_h = max(max_h, cnode.height)
+
+        # Stack compact controls (switch, enum, bytes) in columns of 2
+        for col_start in range(0, len(compact_ids), 2):
+            col_slice = compact_ids[col_start : col_start + 2]
+            col_w = max(vm.nodes[cid].width for cid in col_slice)
+            cy = origin_y
+            for idx, cid in enumerate(col_slice):
+                cnode = vm.nodes[cid]
+                if apply_pos:
+                    cnode.x = cx
+                    cnode.y = cy
+                cy += cnode.height + (CTRL_V_GAP if idx < len(col_slice) - 1 else 0.0)
+            max_h = max(max_h, cy - origin_y)
+            cx += col_w + CTRL_H_GAP
+
+        total_inner_w = max(0.0, cx - origin_x - CTRL_H_GAP)
+        return (total_inner_w, max_h)
+
     def group_width(nid: str) -> float:
         w = vm.nodes[nid].width
         ctrls = ctrl_by_parent.get(nid, [])
         if ctrls:
-            row_w = sum(vm.nodes[cid].width for cid in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
-            w = max(w, row_w)
+            inner_w, _ = _measure_and_place_module_controls(ctrls, apply_pos=False)
+            w = max(w, inner_w + 2.0 * CTRL_GROUP_PAD)
         return w
 
     def group_height(nid: str) -> float:
         h = vm.nodes[nid].height
         ctrls = ctrl_by_parent.get(nid, [])
         if ctrls:
-            h += CTRL_TOP_GAP + max(vm.nodes[cid].height for cid in ctrls)
+            _, inner_h = _measure_and_place_module_controls(ctrls, apply_pos=False)
+            h += CTRL_TOP_GAP + inner_h + CTRL_GROUP_PAD
         return h
 
     max_col_h = 0.0
@@ -339,17 +395,13 @@ def _layout_flat_dag(
             gw = group_width(nid)
             node.x = cur_x + (gw - node.width) / 2.0
             node.y = cur_y
-            # Place attached vertical kcontrol nodes side-by-side directly beneath the parent widget node
+            # Place attached kcontrol nodes in a compact module group directly beneath the parent widget node
             ctrls = ctrl_by_parent.get(nid, [])
             if ctrls:
-                row_w = sum(vm.nodes[cid].width for cid in ctrls) + max(0, len(ctrls) - 1) * CTRL_H_GAP
-                ctrl_x = node.x + (node.width - row_w) / 2.0
+                inner_w, _ = _measure_and_place_module_controls(ctrls, apply_pos=False)
+                ctrl_x = node.x + (node.width - inner_w) / 2.0
                 ctrl_y = node.y + node.height + CTRL_TOP_GAP
-                for cid in ctrls:
-                    cnode = vm.nodes[cid]
-                    cnode.x = ctrl_x
-                    cnode.y = ctrl_y
-                    ctrl_x += cnode.width + CTRL_H_GAP
+                _measure_and_place_module_controls(ctrls, origin_x=ctrl_x, origin_y=ctrl_y, apply_pos=True)
             cur_y += group_height(nid) + V_GAP
         cur_x += col_w + H_GAP
 
@@ -514,10 +566,10 @@ def update_container_bounds_from_nodes(vm: GraphViewModel) -> None:
         members = by_pipe.get(pid, [])
         if not members:
             continue
-        min_x = min(n.x for n in members)
-        min_y = min(n.y for n in members)
-        max_x = max(n.x + n.width for n in members)
-        max_y = max(n.y + n.height for n in members)
+        min_x = min(n.x - (CTRL_GROUP_PAD if n.class_category == "Control" else 0.0) for n in members)
+        min_y = min(n.y - (CTRL_GROUP_HDR if n.class_category == "Control" else 0.0) for n in members)
+        max_x = max(n.x + n.width + (CTRL_GROUP_PAD if n.class_category == "Control" else 0.0) for n in members)
+        max_y = max(n.y + n.height + (CTRL_GROUP_PAD if n.class_category == "Control" else 0.0) for n in members)
         cont.x = min_x - CONTAINER_PAD_X
         cont.y = min_y - CONTAINER_PAD_TOP
         cont.width = (max_x - min_x) + 2 * CONTAINER_PAD_X

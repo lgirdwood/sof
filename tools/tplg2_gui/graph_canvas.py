@@ -15,6 +15,8 @@ from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango
 
 from .layout import (
     CONTAINER_GAP_X,
+    CTRL_GROUP_HDR,
+    CTRL_GROUP_PAD,
     CTRL_H_GAP,
     CTRL_TOP_GAP,
     H_GAP,
@@ -124,12 +126,17 @@ class TopologyGraphCanvas(Gtk.Widget):
 
     __gtype_name__ = "TopologyGraphCanvas"
     _active_drag_payload: Optional[str] = None
+    _clipboard_nodes: List[GraphNode] = []
+    _clipboard_containers: List[PipelineContainer] = []
+    _clipboard_edges: List[GraphEdge] = []
+    _clipboard_paste_count: int = 0
 
     def __init__(
         self,
         on_selection_changed: Optional[Callable[[Optional[str], Optional[ConfigNode], str], None]] = None,
         on_graph_modified: Optional[Callable[[], None]] = None,
         on_history_changed: Optional[Callable[[], None]] = None,
+        on_kcontrol_changed: Optional[Callable[[GraphNode], None]] = None,
     ):
         super().__init__()
         self.set_hexpand(True)
@@ -139,6 +146,7 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         self.on_selection_changed = on_selection_changed
         self.on_graph_modified = on_graph_modified
+        self.on_kcontrol_changed = on_kcontrol_changed
         self.history = UndoRedoManager(on_history_changed=on_history_changed)
         self._suppress_auto_history: bool = False
         self._pending_drag_history_entry: Optional[GraphHistoryEntry] = None
@@ -686,6 +694,9 @@ class TopologyGraphCanvas(Gtk.Widget):
             ex, ey = self._wire_cursor_world
             self._snapshot_bezier_wire(snapshot, sx, sy, ex, ey, WIRE_DRAG_COLOR, width=2.6, dashed=True)
 
+        # 6b. Draw Grouped Module Kcontrol Containers & Color-Coordinated Connectors
+        self._snapshot_module_kcontrol_groups(snapshot, wx0, wy0, wx1, wy1)
+
         # 7. Draw Graph Nodes
         for nid, node in self.vm.nodes.items():
             if node.x + node.width < wx0 or node.x > wx1 or node.y + node.height < wy0 or node.y > wy1:
@@ -1183,52 +1194,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             snapshot.pop()
 
         if node.class_category == "Control":
-            # Compact vertical kcontrol node rendered beneath its parent widget
-            snapshot.push_rounded_clip(rrect)
-            snapshot.append_color(body_col, rect)
-
-            hdr_rect = Graphene.Rect.alloc()
-            hdr_rect.init(node.x, node.y, node.width, 18.0)
-            snapshot.append_color(header_col, hdr_rect)
-
-            # Short control type tag in top cap
-            tag_map = {
-                "control_mixer": "VOL",
-                "control_switch": "SW",
-                "control_bytes": "BYT",
-                "control_enum": "ENM",
-            }
-            tag_txt = tag_map.get(node.category, "CTL")
-            tag_layout = self._get_pango_layout(tag_txt, size_pt=6, bold=True)
-            _, tag_ext = tag_layout.get_pixel_extents()
-            snapshot.save()
-            pt = Graphene.Point.alloc()
-            pt.init(node.x + max(2.0, (node.width - float(tag_ext.width)) / 2.0), node.y + 3.0)
-            snapshot.translate(pt)
-            snapshot.append_layout(tag_layout, TEXT_WHITE)
-            snapshot.restore()
-
-            # 90-degree rotated vertical label inside the control pill
-            v_layout = self._get_pango_layout(node.title, size_pt=7, bold=True)
-            _, v_ext = v_layout.get_pixel_extents()
-            lh = float(v_ext.height) if v_ext.height > 0 else 11.0
-            snapshot.save()
-            pt.init(node.x + (node.width + lh) / 2.0, node.y + 22.0)
-            snapshot.translate(pt)
-            snapshot.rotate(90.0)
-            snapshot.append_layout(v_layout, TEXT_WHITE)
-            snapshot.restore()
-
-            snapshot.pop()
-
-            bcol = NODE_BORDER_SELECTED if is_selected else header_col
-            bw = 2.0 if is_selected else 1.1
-            snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
-
-            for port in node.out_ports:
-                px = node.x + port.rel_x
-                py = node.y + port.rel_y
-                self._snapshot_port_circle(snapshot, px, py, header_col, radius=3.6)
+            self._snapshot_kcontrol_node(snapshot, node, rect, rrect, is_selected, header_col, body_col)
             return
 
         if node.class_category == "TestbenchIO":
@@ -1343,6 +1309,379 @@ class TopologyGraphCanvas(Gtk.Widget):
             py = node.y + port.rel_y
             is_hov = self.hovered_port == (node.id, port.id, "out")
             self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_OUT_COLOR, radius=6.5 if is_hov else 5.0)
+
+    @staticmethod
+    def _get_kcontrol_short_name(node: GraphNode) -> str:
+        raw_name = str(node.config.get_scalar("name", "")).strip().strip('"')
+        if raw_name:
+            # Strip common verbose prefixes if long so the graphical item title is crisp
+            s = raw_name
+            for pfx in ("Post Mixer Analog ", "Pre Mixer Analog ", "Analog Capture ", "Analog Playback "):
+                if s.startswith(pfx) and len(s) > len(pfx) + 4:
+                    s = s[len(pfx):]
+                    break
+            return s if len(s) <= 22 else (s[:20] + "…")
+        return node.title if len(node.title) <= 22 else (node.title[:20] + "…")
+
+    @staticmethod
+    def _get_kcontrol_volume_state(node: GraphNode) -> Tuple[int, int]:
+        """Return (cur_val, max_val) for a volume control_mixer node."""
+        max_raw = str(node.config.get_scalar("max", "32")).strip()
+        max_v = int(max_raw) if max_raw.isdigit() and int(max_raw) > 0 else 32
+        val_raw = str(node.config.get_scalar("value", "") or node.config.get_scalar("volume", "")).strip()
+        cur_v = int(round(max_v * 0.78))
+        if val_raw:
+            parts = [p.strip() for p in val_raw.split(",") if p.strip().lstrip("-").isdigit()]
+            if parts:
+                cur_v = max(0, min(max_v, int(parts[0])))
+        return (cur_v, max_v)
+
+    @staticmethod
+    def _get_kcontrol_switch_state(node: GraphNode) -> bool:
+        """Return True (ON) or False (OFF) for a switch control_switch node."""
+        val_raw = str(node.config.get_scalar("value", "1")).strip().lower()
+        if not val_raw:
+            return True
+        first = val_raw.split(",")[0].strip()
+        return first not in ("0", "false", "off", "mute", "muted")
+
+    @staticmethod
+    def _get_kcontrol_enum_state(node: GraphNode) -> Tuple[str, List[str]]:
+        """Return (selected_option_str, enum_options_list) for a control_enum node."""
+        opts_raw = str(node.config.get_scalar("enum_options", "")).strip()
+        opts = [x.strip() for x in opts_raw.split(",") if x.strip()] if opts_raw else ["0", "1"]
+        val_raw = str(node.config.get_scalar("value", "")).strip()
+        if not val_raw:
+            cur = "0" if "0" in opts else opts[0]
+        elif val_raw in opts:
+            cur = val_raw
+        elif val_raw.isdigit() and 0 <= int(val_raw) < len(opts):
+            cur = opts[int(val_raw)]
+        else:
+            cur = val_raw
+        return (cur, opts)
+
+    @staticmethod
+    def _get_kcontrol_bytes_file(node: GraphNode) -> str:
+        """Return the current parameter file path or blob label for a control_bytes node."""
+        pfile = str(node.config.get_scalar("included_param_file", "")).strip().strip('"')
+        if pfile:
+            return pfile
+        for ch in node.config.children:
+            if ch.key.startswith("Object.Base.data"):
+                return "inline_blob.bin"
+        return "Choose .conf/.bin…"
+
+    def _snapshot_module_kcontrol_groups(
+        self,
+        snapshot: Gtk.Snapshot,
+        wx0: float,
+        wy0: float,
+        wx1: float,
+        wy1: float,
+    ) -> None:
+        """Draw a color-coordinated grouped container frame and connector for each module's kcontrols."""
+        if not self.vm:
+            return
+        by_parent: Dict[str, List[GraphNode]] = {}
+        for node in self.vm.nodes.values():
+            if node.class_category == "Control" and node.parent_node_id and node.parent_node_id in self.vm.nodes:
+                by_parent.setdefault(node.parent_node_id, []).append(node)
+
+        for parent_id, ctrls in by_parent.items():
+            parent = self.vm.nodes[parent_id]
+            gx = min(c.x for c in ctrls) - CTRL_GROUP_PAD
+            gy = min(c.y for c in ctrls) - CTRL_GROUP_HDR
+            gw = (max(c.x + c.width for c in ctrls) - min(c.x for c in ctrls)) + 2.0 * CTRL_GROUP_PAD
+            gh = (max(c.y + c.height for c in ctrls) - min(c.y for c in ctrls)) + CTRL_GROUP_HDR + CTRL_GROUP_PAD
+
+            if gx + gw < wx0 or gx > wx1 or gy + gh < wy0 or gy > wy1:
+                continue
+
+            g_rect = Graphene.Rect.alloc()
+            g_rect.init(gx, gy, gw, gh)
+            g_rr = Gsk.RoundedRect()
+            g_rr.init_from_rect(g_rect, 6.0)
+
+            any_sel = (
+                parent_id == self.selected_node_id
+                or parent_id in self.selected_node_ids
+                or any(c.id == self.selected_node_id or c.id in self.selected_node_ids for c in ctrls)
+            )
+            p_hdr_col, p_body_col = CATEGORY_COLORS.get(parent.category, CATEGORY_COLORS["widget"])
+            fill_col = (
+                rgba(p_body_col.red * 1.15, p_body_col.green * 1.15, p_body_col.blue * 1.15, 0.78)
+                if any_sel
+                else rgba(p_body_col.red, p_body_col.green, p_body_col.blue, 0.58)
+            )
+            b_col = (
+                NODE_BORDER_SELECTED
+                if any_sel
+                else rgba(p_hdr_col.red, p_hdr_col.green, p_hdr_col.blue, 0.85)
+            )
+
+            snapshot.push_rounded_clip(g_rr)
+            snapshot.append_color(fill_col, g_rect)
+            hdr_strip = Graphene.Rect.alloc()
+            hdr_strip.init(gx, gy, gw, CTRL_GROUP_HDR - 1.0)
+            snapshot.append_color(
+                rgba(p_hdr_col.red, p_hdr_col.green, p_hdr_col.blue, 0.42 if any_sel else 0.28),
+                hdr_strip,
+            )
+            snapshot.pop()
+            bw = 1.6 if any_sel else 1.2
+            snapshot.append_border(g_rr, [bw, bw, bw, bw], [b_col, b_col, b_col, b_col])
+
+            # Group header caption
+            hdr_lbl = f"{parent.title} ({len(ctrls)})"
+            lyt = self._get_pango_layout(hdr_lbl, size_pt=6, bold=True)
+            snapshot.save()
+            pt = Graphene.Point.alloc()
+            pt.init(gx + 5.0, gy + 1.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(lyt, TEXT_WHITE if any_sel else rgba(0.90, 0.95, 1.0, 0.92))
+            snapshot.restore()
+
+            # Single color-coordinated dashed connector from top-center of module's kcontrol group to parent module bottom
+            x1 = gx + gw / 2.0
+            y1 = gy
+            x2 = max(parent.x + 12.0, min(parent.x + parent.width - 12.0, x1))
+            y2 = parent.y + parent.height
+            dy = max(5.0, abs(y1 - y2) * 0.45)
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(x1, y1)
+            pb.cubic_to(x1, y1 - dy, x2, y2 + dy, x2, y2)
+            stroke = Gsk.Stroke.new(2.0 if any_sel else 1.5)
+            stroke.set_dash([3.5, 2.5])
+            line_col = (
+                NODE_BORDER_SELECTED
+                if any_sel
+                else rgba(p_hdr_col.red, p_hdr_col.green, p_hdr_col.blue, 0.92)
+            )
+            snapshot.append_stroke(pb.to_path(), stroke, line_col)
+
+            arrow_pb = Gsk.PathBuilder.new()
+            arrow_pb.move_to(x2, y2)
+            arrow_pb.line_to(x2 - 3.0, y2 + 5.0)
+            arrow_pb.line_to(x2 + 3.0, y2 + 5.0)
+            arrow_pb.close()
+            snapshot.append_fill(arrow_pb.to_path(), Gsk.FillRule.WINDING, line_col)
+            self._snapshot_port_circle(snapshot, x1, y1, line_col, radius=3.2)
+
+    def _snapshot_kcontrol_node(
+        self,
+        snapshot: Gtk.Snapshot,
+        node: GraphNode,
+        rect: Graphene.Rect,
+        rrect: Gsk.RoundedRect,
+        is_selected: bool,
+        header_col: Gdk.RGBA,
+        body_col: Gdk.RGBA,
+    ) -> None:
+        """Render each Kcontrol node as a compact interactive graphical widget:
+        - control_mixer (Volume): Vertical fader track + fill bar + draggable knob + value readout
+        - control_switch (Switch): Compact ON / OFF toggle switch pill
+        - control_enum (Enum): Compact dropdown selector box with current option & arrow
+        - control_bytes (Bytes): Compact file selector button showing active parameter file
+        """
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(body_col, rect)
+
+        hdr_h = 15.0
+        hdr_rect = Graphene.Rect.alloc()
+        hdr_rect.init(node.x, node.y, node.width, hdr_h)
+        snapshot.append_color(header_col, hdr_rect)
+
+        tag_map = {
+            "control_mixer": "VOL",
+            "control_switch": "SW",
+            "control_bytes": "BYTES",
+            "control_enum": "ENUM",
+        }
+        tag_txt = tag_map.get(node.category, "CTL")
+        short_name = self._get_kcontrol_short_name(node)
+
+        pt = Graphene.Point.alloc()
+        if node.category == "control_mixer":
+            # Vertical Volume Fader Card (56 x 92)
+            disp_title = short_name[:8] if len(short_name) > 8 else short_name
+            title_layout = self._get_pango_layout(disp_title, size_pt=6, bold=True)
+            snapshot.save()
+            pt.init(node.x + 4.0, node.y + 2.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(title_layout, TEXT_WHITE)
+            snapshot.restore()
+
+            cur_v, max_v = self._get_kcontrol_volume_state(node)
+            frac = max(0.0, min(1.0, cur_v / float(max(1, max_v))))
+            track_x = node.x + 11.0
+            track_w = 8.0
+            track_y = node.y + 21.0
+            track_h = max(32.0, node.height - 37.0)
+
+            # Recessed vertical slider trough
+            t_rect = Graphene.Rect.alloc()
+            t_rect.init(track_x, track_y, track_w, track_h)
+            t_rr = Gsk.RoundedRect()
+            t_rr.init_from_rect(t_rect, 4.0)
+            snapshot.push_rounded_clip(t_rr)
+            snapshot.append_color(rgba(0.07, 0.08, 0.12, 0.96), t_rect)
+            if frac > 0.0:
+                fill_h = track_h * frac
+                f_rect = Graphene.Rect.alloc()
+                f_rect.init(track_x, track_y + track_h - fill_h, track_w, fill_h)
+                snapshot.append_color(rgba(0.68, 0.42, 0.98, 0.96), f_rect)
+            snapshot.pop()
+            t_bcol = rgba(0.42, 0.36, 0.62, 0.92)
+            snapshot.append_border(t_rr, [1.0, 1.0, 1.0, 1.0], [t_bcol, t_bcol, t_bcol, t_bcol])
+
+            # Vertical tick marks beside the fader
+            tick_pb = Gsk.PathBuilder.new()
+            for tf in (0.0, 0.25, 0.5, 0.75, 1.0):
+                ty = track_y + track_h * tf
+                tick_pb.move_to(track_x + track_w + 2.0, ty)
+                tick_pb.line_to(track_x + track_w + 5.0, ty)
+            snapshot.append_stroke(tick_pb.to_path(), Gsk.Stroke.new(1.0), rgba(0.55, 0.62, 0.76, 0.65))
+
+            # Vertical slider thumb knob (0 at bottom, max_v at top)
+            knob_x = track_x + track_w * 0.5
+            knob_y = track_y + track_h * (1.0 - frac)
+            self._snapshot_port_circle(snapshot, knob_x, knob_y, TEXT_WHITE, radius=5.4)
+            self._snapshot_port_circle(snapshot, knob_x, knob_y, header_col, radius=3.6)
+
+            # Value & max readout to the right of the vertical fader
+            val_layout = self._get_pango_layout(f"{cur_v}", size_pt=7, bold=True)
+            snapshot.save()
+            pt.init(node.x + 25.0, track_y + track_h * 0.26)
+            snapshot.translate(pt)
+            snapshot.append_layout(val_layout, TEXT_WHITE)
+            snapshot.restore()
+
+            max_layout = self._get_pango_layout(f"/{max_v}", size_pt=6, bold=False)
+            snapshot.save()
+            pt.init(node.x + 25.0, track_y + track_h * 0.52)
+            snapshot.translate(pt)
+            snapshot.append_layout(max_layout, TEXT_MUTED)
+            snapshot.restore()
+
+            foot_layout = self._get_pango_layout("VOL", size_pt=6, bold=True)
+            snapshot.save()
+            pt.init(node.x + 18.0, node.y + node.height - 13.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(foot_layout, rgba(0.86, 0.72, 1.0, 0.95))
+            snapshot.restore()
+        else:
+            # Compact Switch / Enum / Bytes Card (118 x 42)
+            disp_title = short_name[:12] + "…" if len(short_name) > 13 else short_name
+            title_layout = self._get_pango_layout(disp_title, size_pt=6, bold=True)
+            snapshot.save()
+            pt.init(node.x + 5.0, node.y + 2.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(title_layout, TEXT_WHITE)
+            snapshot.restore()
+
+            tag_layout = self._get_pango_layout(tag_txt, size_pt=5, bold=True)
+            _, tag_ext = tag_layout.get_pixel_extents()
+            snapshot.save()
+            pt.init(node.x + node.width - float(tag_ext.width) - 4.0, node.y + 2.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(tag_layout, rgba(0.92, 0.96, 1.0, 0.88))
+            snapshot.restore()
+
+            ctrl_y = node.y + 18.0
+            ctrl_h = 20.0
+
+            if node.category == "control_switch":
+                is_on = self._get_kcontrol_switch_state(node)
+                btn_rect = Graphene.Rect.alloc()
+                btn_rect.init(node.x + 6.0, ctrl_y, node.width - 12.0, ctrl_h)
+                btn_rr = Gsk.RoundedRect()
+                btn_rr.init_from_rect(btn_rect, 9.5)
+                bg_c = rgba(0.14, 0.56, 0.36, 0.95) if is_on else rgba(0.22, 0.16, 0.20, 0.95)
+                snapshot.push_rounded_clip(btn_rr)
+                snapshot.append_color(bg_c, btn_rect)
+                snapshot.pop()
+                b_c = rgba(0.32, 0.92, 0.62, 0.95) if is_on else rgba(0.65, 0.32, 0.38, 0.9)
+                snapshot.append_border(btn_rr, [1.1, 1.1, 1.1, 1.1], [b_c, b_c, b_c, b_c])
+
+                cy = ctrl_y + ctrl_h * 0.5
+                cx = (node.x + node.width - 16.0) if is_on else (node.x + 16.0)
+                self._snapshot_port_circle(
+                    snapshot,
+                    cx,
+                    cy,
+                    rgba(0.65, 1.0, 0.80, 1.0) if is_on else rgba(0.75, 0.78, 0.84, 0.9),
+                    radius=5.5,
+                )
+                sw_txt = "ON (Active)" if is_on else "OFF (Muted)"
+                sw_layout = self._get_pango_layout(sw_txt, size_pt=6, bold=True)
+                snapshot.save()
+                pt.init(node.x + (14.0 if is_on else 26.0), ctrl_y + 4.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(sw_layout, TEXT_WHITE if is_on else TEXT_MUTED)
+                snapshot.restore()
+
+            elif node.category == "control_enum":
+                cur_opt, opts = self._get_kcontrol_enum_state(node)
+                box_rect = Graphene.Rect.alloc()
+                box_rect.init(node.x + 6.0, ctrl_y, node.width - 12.0, ctrl_h)
+                box_rr = Gsk.RoundedRect()
+                box_rr.init_from_rect(box_rect, 4.5)
+                snapshot.push_rounded_clip(box_rr)
+                snapshot.append_color(rgba(0.08, 0.11, 0.15, 0.96), box_rect)
+                snapshot.pop()
+                eb_col = rgba(0.86, 0.28, 0.48, 0.95)
+                snapshot.append_border(box_rr, [1.0, 1.0, 1.0, 1.0], [eb_col, eb_col, eb_col, eb_col])
+
+                disp_opt = f"{cur_opt} ({len(opts)})" if len(cur_opt) <= 9 else cur_opt[:13]
+                opt_layout = self._get_pango_layout(disp_opt, size_pt=6, bold=True)
+                snapshot.save()
+                pt.init(node.x + 10.0, ctrl_y + 4.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(opt_layout, rgba(1.0, 0.76, 0.86, 1.0))
+                snapshot.restore()
+
+                arr_layout = self._get_pango_layout("▾", size_pt=7, bold=True)
+                snapshot.save()
+                pt.init(node.x + node.width - 16.0, ctrl_y + 3.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(arr_layout, TEXT_WHITE)
+                snapshot.restore()
+
+            else:
+                pfile = self._get_kcontrol_bytes_file(node)
+                base_f = os.path.basename(pfile) or pfile
+                if len(base_f) > 13:
+                    base_f = base_f[:12] + "…"
+                f_rect = Graphene.Rect.alloc()
+                f_rect.init(node.x + 6.0, ctrl_y, node.width - 12.0, ctrl_h)
+                f_rr = Gsk.RoundedRect()
+                f_rr.init_from_rect(f_rect, 4.5)
+                snapshot.push_rounded_clip(f_rr)
+                snapshot.append_color(rgba(0.08, 0.12, 0.16, 0.96), f_rect)
+                snapshot.pop()
+                fb_col = rgba(0.18, 0.68, 0.88, 0.95)
+                snapshot.append_border(f_rr, [1.0, 1.0, 1.0, 1.0], [fb_col, fb_col, fb_col, fb_col])
+
+                flayout = self._get_pango_layout(f"📂 {base_f}", size_pt=6, bold=True)
+                snapshot.save()
+                pt.init(node.x + 9.0, ctrl_y + 4.0)
+                snapshot.translate(pt)
+                snapshot.append_layout(flayout, rgba(0.68, 0.92, 1.0, 1.0))
+                snapshot.restore()
+
+                dots_layout = self._get_pango_layout("…", size_pt=7, bold=True)
+                snapshot.save()
+                pt.init(node.x + node.width - 15.0, ctrl_y + 2.5)
+                snapshot.translate(pt)
+                snapshot.append_layout(dots_layout, TEXT_WHITE)
+                snapshot.restore()
+
+        snapshot.pop()
+
+        bcol = NODE_BORDER_SELECTED if is_selected else header_col
+        bw = 2.0 if is_selected else 1.1
+        snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
 
     def _snapshot_testbench_io_node(
         self,
@@ -1499,6 +1838,9 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         is_sel = edge.id == self.selected_edge_id
         if u.class_category == "Control":
+            if u.parent_node_id and u.parent_node_id in self.vm.nodes and not is_sel:
+                # Grouped connector is already drawn by _snapshot_module_kcontrol_groups
+                return
             x1 = u.x + u.width / 2.0
             y1 = u.y
             x2 = max(v.x + 10.0, min(v.x + v.width - 10.0, x1))
@@ -1687,6 +2029,30 @@ class TopologyGraphCanvas(Gtk.Widget):
         if nid:
             node = self.vm.nodes[nid]
             self.select_node(nid, additive=additive)
+            if node.class_category == "Control":
+                lx = wx - node.x
+                ly = wy - node.y
+                # Interactive control area is below the header row (ly >= 15.0)
+                if ly >= 15.0 and 4.0 <= lx <= node.width - 4.0:
+                    if node.category == "control_mixer":
+                        self.record_undo_snapshot(f"Adjust {self._get_kcontrol_short_name(node)} volume")
+                        self._set_kcontrol_volume_from_local_y(node, ly, notify=True)
+                    elif node.category == "control_switch":
+                        self.record_undo_snapshot(f"Toggle {self._get_kcontrol_short_name(node)} switch")
+                        is_on = self._get_kcontrol_switch_state(node)
+                        node.config.set_scalar("value", "0" if is_on else "1", origin="instance")
+                        self.vm.dirty = True
+                        self.select_node(nid)
+                        if self.on_kcontrol_changed:
+                            self.on_kcontrol_changed(node)
+                        if self.on_graph_modified:
+                            self.on_graph_modified()
+                        self.queue_draw()
+                    elif node.category == "control_enum":
+                        self._open_kcontrol_enum_popover(node, sx, sy)
+                    elif node.category == "control_bytes":
+                        self._open_kcontrol_bytes_file_chooser(node)
+                return
             if node.class_category == "TestbenchIO":
                 lx = wx - node.x
                 ly = wy - node.y
@@ -1793,13 +2159,25 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         nid = self._hit_test_node(wx, wy)
         if nid:
+            node = self.vm.nodes[nid]
+            if node.class_category == "Control" and (wy - node.y) >= 15.0:
+                if node.category == "control_mixer":
+                    self._drag_mode = "kctl_slider"
+                    self.selected_node_id = nid
+                    self._pending_drag_history_entry = self._capture_history_entry(
+                        f"Slide {self._get_kcontrol_short_name(node)} volume"
+                    )
+                    self.set_cursor_from_name("ns-resize")
+                else:
+                    # Don't move a Control card when clicking its button/dropdown/file picker
+                    self._drag_mode = "none"
+                return
             self._drag_mode = "node"
             if nid not in self.selected_node_ids:
                 self.select_node(nid)
             else:
                 self.selected_node_id = nid
             self._pending_drag_history_entry = self._capture_history_entry(f"Move {nid}")
-            node = self.vm.nodes[nid]
             self._drag_node_initial = (node.x, node.y)
             self._drag_children_initial = {
                 cid: (cnode.x, cnode.y)
@@ -1870,6 +2248,10 @@ class TopologyGraphCanvas(Gtk.Widget):
             wy = self._drag_start_world[1] + offset_y / self.zoom
             self._wire_cursor_world = (wx, wy)
             self.queue_draw()
+        elif self._drag_mode == "kctl_slider" and self.selected_node_id in self.vm.nodes:
+            wy = self._drag_start_world[1] + offset_y / self.zoom
+            node = self.vm.nodes[self.selected_node_id]
+            self._set_kcontrol_volume_from_local_y(node, wy - node.y, notify=False)
 
     def _on_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         self._clear_drop_preview()
@@ -1894,6 +2276,16 @@ class TopologyGraphCanvas(Gtk.Widget):
                 finally:
                     self._suppress_auto_history = False
             if moved and self.on_graph_modified:
+                self.on_graph_modified()
+        elif self.vm and self._drag_mode == "kctl_slider" and self.selected_node_id in self.vm.nodes:
+            if moved and self._pending_drag_history_entry is not None:
+                self.history.push_undo_entry(self._pending_drag_history_entry)
+                self.vm.dirty = True
+            node = self.vm.nodes[self.selected_node_id]
+            self.select_node(node.id)
+            if self.on_kcontrol_changed:
+                self.on_kcontrol_changed(node)
+            if self.on_graph_modified:
                 self.on_graph_modified()
         self._pending_drag_history_entry = None
         self._drag_mode = "none"
@@ -2088,6 +2480,18 @@ class TopologyGraphCanvas(Gtk.Widget):
             return self.undo()
         if ctrl_held and keyval in (Gdk.KEY_y, Gdk.KEY_Y):
             return self.redo()
+        if ctrl_held and keyval in (Gdk.KEY_a, Gdk.KEY_A):
+            self.select_all()
+            return True
+        if ctrl_held and keyval in (Gdk.KEY_c, Gdk.KEY_C):
+            self.copy_selected()
+            return True
+        if ctrl_held and keyval in (Gdk.KEY_x, Gdk.KEY_X):
+            self.cut_selected()
+            return True
+        if ctrl_held and keyval in (Gdk.KEY_v, Gdk.KEY_V):
+            self.paste_clipboard()
+            return True
         if keyval in (Gdk.KEY_Delete, Gdk.KEY_BackSpace):
             self.delete_selected()
             return True
@@ -2202,6 +2606,352 @@ class TopologyGraphCanvas(Gtk.Widget):
             if self.on_graph_modified:
                 self.on_graph_modified()
             self.queue_draw()
+
+    @classmethod
+    def has_clipboard(cls) -> bool:
+        return bool(cls._clipboard_nodes or cls._clipboard_containers)
+
+    def select_all(self) -> int:
+        """Select all nodes and pipeline containers in the current graph."""
+        if not self.vm:
+            return 0
+        self.selected_edge_id = None
+        self.selected_node_ids = {
+            nid for nid, n in self.vm.nodes.items()
+            if n.class_category != "TestbenchIO"
+        }
+        self.selected_node_id = next(iter(self.selected_node_ids), None)
+        self.selected_container_ids = set(self.vm.containers.keys())
+        self.selected_container_id = next(iter(self.selected_container_ids), None)
+        self._notify_current_selection()
+        self.queue_draw()
+        return len(self.selected_node_ids) + len(self.selected_container_ids)
+
+    def copy_selected(self) -> int:
+        """Copy selected nodes (including attached child Kcontrols), containers, and internal routes to clipboard."""
+        if not self.vm:
+            return 0
+        sel_nids: Set[str] = set(self.selected_node_ids)
+        if self.selected_node_id and self.selected_node_id in self.vm.nodes:
+            sel_nids.add(self.selected_node_id)
+
+        sel_pids: Set[int] = set(self.selected_container_ids)
+        if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+            sel_pids.add(self.selected_container_id)
+
+        for pid in sel_pids:
+            for nid, n in self.vm.nodes.items():
+                if n.pipeline_id == pid and n.class_category != "TestbenchIO":
+                    sel_nids.add(nid)
+
+        # Include attached child Kcontrols for any selected module node
+        all_nids = set(sel_nids)
+        for cid, cn in self.vm.nodes.items():
+            if cn.parent_node_id and cn.parent_node_id in sel_nids and cn.class_category != "TestbenchIO":
+                all_nids.add(cid)
+
+        if not all_nids and not sel_pids:
+            return 0
+
+        TopologyGraphCanvas._clipboard_containers = [
+            self.vm.containers[pid].clone()
+            for pid in sorted(sel_pids)
+            if pid in self.vm.containers
+        ]
+        TopologyGraphCanvas._clipboard_nodes = [
+            self.vm.nodes[nid].clone()
+            for nid in sorted(all_nids)
+            if nid in self.vm.nodes
+        ]
+        TopologyGraphCanvas._clipboard_edges = [
+            e.clone()
+            for e in self.vm.edges
+            if e.source_node in all_nids and e.sink_node in all_nids
+        ]
+        TopologyGraphCanvas._clipboard_paste_count = 0
+        return len(TopologyGraphCanvas._clipboard_nodes) + len(TopologyGraphCanvas._clipboard_containers)
+
+    def cut_selected(self) -> int:
+        """Cut selected objects to clipboard and delete them in a single Undo step."""
+        count = self.copy_selected()
+        if count > 0:
+            self.delete_selected()
+        return count
+
+    def paste_clipboard(self) -> int:
+        """Paste objects from clipboard into the current graph with unique IDs and offset positions."""
+        if not self.vm or not self.has_clipboard():
+            return 0
+
+        self.record_undo_snapshot("Paste object(s)")
+        TopologyGraphCanvas._clipboard_paste_count += 1
+        offset = 36.0 * TopologyGraphCanvas._clipboard_paste_count
+
+        # 1. Map old pipeline_id -> new pipeline_id for any copied containers
+        pid_map: Dict[int, int] = {}
+        new_pids: Set[int] = set()
+        for c_orig in TopologyGraphCanvas._clipboard_containers:
+            used_pids = set(self.vm.containers.keys()) | {
+                n.pipeline_id for n in self.vm.nodes.values() if n.pipeline_id is not None
+            }
+            new_pid = c_orig.pipeline_id
+            if new_pid in used_pids:
+                new_pid = 1
+                while new_pid in used_pids:
+                    new_pid += 1
+            pid_map[c_orig.pipeline_id] = new_pid
+            c_new = c_orig.clone()
+            c_new.pipeline_id = new_pid
+            c_new.x += offset
+            c_new.y += offset
+            c_new.config.set_scalar("index", str(new_pid), origin="pipeline")
+            self.vm.containers[new_pid] = c_new
+            new_pids.add(new_pid)
+
+        # Target pipeline if pasting standalone nodes without containers
+        default_target_pid: Optional[int] = self.selected_container_id
+        if default_target_pid is None and self.vm.containers:
+            default_target_pid = sorted(self.vm.containers.keys())[0]
+
+        # 2. First pass: clone primary (non-child) nodes and map old_nid -> new_nid
+        nid_map: Dict[str, str] = {}
+        new_nids: Set[str] = set()
+        primary_nodes = [n for n in TopologyGraphCanvas._clipboard_nodes if not n.parent_node_id]
+        child_nodes = [n for n in TopologyGraphCanvas._clipboard_nodes if n.parent_node_id]
+
+        for n_orig in primary_nodes:
+            n_new = n_orig.clone()
+            if n_orig.pipeline_id in pid_map:
+                target_pid = pid_map[n_orig.pipeline_id]
+            elif n_orig.pipeline_id is not None and n_orig.pipeline_id in self.vm.containers:
+                target_pid = n_orig.pipeline_id
+            else:
+                target_pid = default_target_pid if default_target_pid is not None else (n_orig.pipeline_id or 1)
+
+            n_new.pipeline_id = target_pid
+            inst_num = 1
+            while f"{n_new.class_name}.{target_pid}.{inst_num}" in self.vm.nodes:
+                inst_num += 1
+            new_id = f"{n_new.class_name}.{target_pid}.{inst_num}"
+            n_new.id = new_id
+            n_new.title = new_id
+            n_new.instance_id = str(inst_num)
+            n_new.x += offset
+            n_new.y += offset
+            n_new.config.set_scalar("index", str(target_pid), origin="instance")
+            n_new.config.set_scalar("instance", str(inst_num), origin="instance")
+            self.vm.nodes[new_id] = n_new
+            nid_map[n_orig.id] = new_id
+            new_nids.add(new_id)
+
+        # 3. Second pass: clone child Kcontrol nodes attached to copied parents (or standalone copied controls)
+        for c_orig in child_nodes:
+            c_new = c_orig.clone()
+            new_parent_id = nid_map.get(c_orig.parent_node_id or "", c_orig.parent_node_id)
+            c_new.parent_node_id = new_parent_id
+            parent_node = self.vm.nodes.get(new_parent_id or "")
+            if parent_node:
+                c_new.pipeline_id = parent_node.pipeline_id
+            suffix = c_orig.id.split(".ctl.")[-1] if ".ctl." in c_orig.id else c_orig.instance_id
+            base_cid = f"{new_parent_id}.ctl.{suffix}" if new_parent_id else f"{c_orig.id}_copy"
+            new_cid = base_cid
+            k = 2
+            while new_cid in self.vm.nodes:
+                new_cid = f"{base_cid}_{k}"
+                k += 1
+            c_new.id = new_cid
+            c_new.x += offset
+            c_new.y += offset
+            self.vm.nodes[new_cid] = c_new
+            nid_map[c_orig.id] = new_cid
+            new_nids.add(new_cid)
+
+        # 4. Reconstruct internal routes between pasted nodes
+        for idx, e_orig in enumerate(TopologyGraphCanvas._clipboard_edges):
+            u_new = nid_map.get(e_orig.source_node)
+            v_new = nid_map.get(e_orig.sink_node)
+            if u_new and v_new and u_new in self.vm.nodes and v_new in self.vm.nodes:
+                e_new = e_orig.clone()
+                e_new.id = f"paste_edge_{len(self.vm.edges) + idx + 1}"
+                e_new.source_node = u_new
+                e_new.sink_node = v_new
+                u_node = self.vm.nodes[u_new]
+                v_node = self.vm.nodes[v_new]
+                e_new.is_inter_pipeline = (
+                    u_node.pipeline_id is not None
+                    and v_node.pipeline_id is not None
+                    and u_node.pipeline_id != v_node.pipeline_id
+                )
+                e_new.pipeline_id = u_node.pipeline_id if not e_new.is_inter_pipeline else None
+                e_new.config.set_scalar("source", u_new, origin="instance")
+                e_new.config.set_scalar("sink", v_new, origin="instance")
+                self.vm.edges.append(e_new)
+
+        update_container_bounds_from_nodes(self.vm)
+        self.selected_edge_id = None
+        self.selected_node_ids = set(new_nids)
+        self.selected_node_id = next(iter(new_nids), None)
+        self.selected_container_ids = set(new_pids)
+        self.selected_container_id = next(iter(new_pids), None)
+        self.vm.dirty = True
+        self._notify_current_selection()
+        if self.on_graph_modified:
+            self.on_graph_modified()
+        self.queue_draw()
+        return len(new_nids) + len(new_pids)
+
+    def zoom_in(self) -> None:
+        """Zoom in on the center of the graph canvas."""
+        w = float(self.get_width() or 1200)
+        h = float(self.get_height() or 800)
+        cx, cy = w * 0.5, h * 0.5
+        wx, wy = self.screen_to_world(cx, cy)
+        self.zoom = min(2.8, self.zoom * 1.18)
+        self.pan_x = cx - wx * self.zoom
+        self.pan_y = cy - wy * self.zoom
+        self.queue_draw()
+
+    def zoom_out(self) -> None:
+        """Zoom out from the center of the graph canvas."""
+        w = float(self.get_width() or 1200)
+        h = float(self.get_height() or 800)
+        cx, cy = w * 0.5, h * 0.5
+        wx, wy = self.screen_to_world(cx, cy)
+        self.zoom = max(0.18, self.zoom / 1.18)
+        self.pan_x = cx - wx * self.zoom
+        self.pan_y = cy - wy * self.zoom
+        self.queue_draw()
+
+    def reset_zoom_1to1(self) -> None:
+        """Reset zoom to 100% (1:1) centered on the graph."""
+        self.zoom = 1.0
+        self.pan_x = 40.0
+        self.pan_y = 44.0
+        self.queue_draw()
+
+    def export_to_pdf(self, pdf_path: str) -> bool:
+        """Render the complete topology graph onto an ISO A4 page (841.89 x 595.28 pt) vector PDF file."""
+        if not self.vm:
+            return False
+        import cairo
+
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+
+        for cont in self.vm.containers.values():
+            min_x = min(min_x, cont.x)
+            min_y = min(min_y, cont.y)
+            max_x = max(max_x, cont.x + cont.width)
+            max_y = max(max_y, cont.y + cont.height)
+
+        for node in self.vm.nodes.values():
+            pad = (CTRL_GROUP_PAD + CTRL_GROUP_HDR + 8.0) if node.class_category == "Control" else 0.0
+            min_x = min(min_x, node.x - pad)
+            min_y = min(min_y, node.y - pad)
+            max_x = max(max_x, node.x + node.width + pad)
+            max_y = max(max_y, node.y + node.height + pad)
+
+        if min_x == float("inf"):
+            min_x, min_y, max_x, max_y = 0.0, 0.0, 720.0, 460.0
+
+        content_w = max(1.0, max_x - min_x)
+        content_h = max(1.0, max_y - min_y)
+
+        # Standard ISO A4 page size in PDF points (297mm x 210mm @ 72 pt/inch = 841.89 x 595.28 pt)
+        a4_long = 841.89
+        a4_short = 595.28
+        if content_h > content_w * 1.25:
+            page_w, page_h = a4_short, a4_long
+        else:
+            page_w, page_h = a4_long, a4_short
+
+        margin_x = 24.0
+        margin_y = 20.0
+        header_h = 34.0
+        avail_w = max(100.0, page_w - 2.0 * margin_x)
+        avail_h = max(100.0, page_h - header_h - 2.0 * margin_y)
+
+        scale = min(1.15, avail_w / content_w, avail_h / content_h)
+        tx = margin_x + (avail_w - content_w * scale) * 0.5 - min_x * scale
+        ty = header_h + margin_y + (avail_h - content_h * scale) * 0.5 - min_y * scale
+
+        snap = Gtk.Snapshot.new()
+
+        # 1. Background fill across full A4 page
+        bounds = Graphene.Rect.alloc()
+        bounds.init(0.0, 0.0, page_w, page_h)
+        snap.append_color(BG_COLOR, bounds)
+
+        # 2. Subtle grid in A4 page space
+        old_pan_x, old_pan_y, old_zoom = self.pan_x, self.pan_y, self.zoom
+        try:
+            self.pan_x = tx
+            self.pan_y = ty
+            self.zoom = scale
+            self._snapshot_grid(snap, page_w, page_h)
+
+            # 3. Push world-to-A4-page transform (centered & scaled to fit A4)
+            snap.save()
+            pt = Graphene.Point.alloc()
+            pt.init(tx, ty)
+            snap.translate(pt)
+            snap.scale(scale, scale)
+
+            for pid, cont in self.vm.containers.items():
+                self._snapshot_container(snap, pid, cont)
+
+            for edge in self.vm.edges:
+                self._snapshot_edge(snap, edge)
+
+            self._snapshot_module_kcontrol_groups(
+                snap,
+                min_x - 500.0,
+                min_y - 500.0,
+                max_x + 500.0,
+                max_y + 500.0,
+            )
+
+            for nid, node in self.vm.nodes.items():
+                self._snapshot_node(snap, node, is_selected=False)
+
+            snap.restore()
+
+            # 4. Header banner on top of the A4 PDF page
+            hdr_rect = Graphene.Rect.alloc()
+            hdr_rect.init(0.0, 0.0, page_w, header_h)
+            snap.append_color(rgba(0.08, 0.10, 0.14, 0.96), hdr_rect)
+
+            src_info = f"  —  {os.path.basename(self.vm.source_file)}" if self.vm.source_file else ""
+            title_txt = (
+                f"{self.vm.title}{src_info}   "
+                f"({len(self.vm.containers)} pipelines, {len(self.vm.nodes)} nodes, {len(self.vm.edges)} routes)"
+            )
+            lyt = self._get_pango_layout(title_txt, size_pt=9, bold=True)
+            snap.save()
+            tpt = Graphene.Point.alloc()
+            tpt.init(14.0, 9.0)
+            snap.translate(tpt)
+            snap.append_layout(lyt, TEXT_WHITE)
+            snap.restore()
+        finally:
+            self.pan_x, self.pan_y, self.zoom = old_pan_x, old_pan_y, old_zoom
+
+        render_node = snap.to_node()
+        if render_node is None:
+            return False
+
+        parent_dir = os.path.dirname(os.path.abspath(pdf_path))
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        surface = cairo.PDFSurface(pdf_path, page_w, page_h)
+        cr = cairo.Context(surface)
+        render_node.draw(cr)
+        surface.show_page()
+        surface.finish()
+        return os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0
 
     def _find_target_pipeline_at(self, wx: Optional[float], wy: Optional[float]) -> Optional[int]:
         """Return the existing pipeline_id if (wx, wy) is placed inside an existing pipeline container or on one of its nodes/edges."""
@@ -2816,6 +3566,138 @@ class TopologyGraphCanvas(Gtk.Widget):
         pop.set_child(box)
         pop.connect("closed", lambda p: p.unparent())
         pop.popup()
+
+    # -------------------------------------------------------------------------
+    # Interactive Kcontrol Graphical Widget Helpers (Slider / Enum / Bytes)
+    # -------------------------------------------------------------------------
+
+    def _set_kcontrol_volume_from_local_y(self, node: GraphNode, ly: float, notify: bool = True) -> None:
+        """Update a vertical volume slider Kcontrol node value based on local Y position on the track."""
+        _, max_v = self._get_kcontrol_volume_state(node)
+        track_y = 21.0
+        track_h = max(32.0, node.height - 37.0)
+        ratio = max(0.0, min(1.0, 1.0 - (ly - track_y) / track_h))
+        new_val = int(round(ratio * max_v))
+        node.config.set_scalar("value", str(new_val), origin="instance")
+        if self.vm:
+            self.vm.dirty = True
+        if notify:
+            if self.on_kcontrol_changed:
+                self.on_kcontrol_changed(node)
+            if self.on_graph_modified:
+                self.on_graph_modified()
+        self.queue_draw()
+
+    def _set_kcontrol_volume_from_local_x(self, node: GraphNode, lx: float, notify: bool = True) -> None:
+        """Compatibility helper delegating to vertical fader setter."""
+        self._set_kcontrol_volume_from_local_y(node, lx, notify=notify)
+
+    def _open_kcontrol_enum_popover(self, node: GraphNode, sx: float, sy: float) -> None:
+        """Open a GTK4 Popover at (sx, sy) to select an option for a control_enum node."""
+        cur_opt, options = self._get_kcontrol_enum_state(node)
+        cur_idx = options.index(cur_opt) if cur_opt in options else 0
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x = int(sx)
+        rect.y = int(sy)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        title = Gtk.Label(
+            label=f"Enum: {self._get_kcontrol_short_name(node)}",
+            xalign=0.0,
+        )
+        title.add_css_class("heading")
+        box.append(title)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_max_content_height(240)
+        scroll.set_propagate_natural_height(True)
+
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        for idx, opt in enumerate(options):
+            btn = Gtk.Button(label=f"{opt}   (#{idx})")
+            if idx == cur_idx:
+                btn.add_css_class("suggested-action")
+            else:
+                btn.add_css_class("flat")
+
+            def _pick(_b: Gtk.Button, i: int = idx, label_txt: str = opt) -> None:
+                self.record_undo_snapshot(f"Set {self._get_kcontrol_short_name(node)} to {label_txt}")
+                node.config.set_scalar("value", label_txt, origin="instance")
+                if self.vm:
+                    self.vm.dirty = True
+                self.select_node(node.id)
+                if self.on_kcontrol_changed:
+                    self.on_kcontrol_changed(node)
+                if self.on_graph_modified:
+                    self.on_graph_modified()
+                self.queue_draw()
+                pop.popdown()
+
+            btn.connect("clicked", _pick)
+            list_box.append(btn)
+
+        scroll.set_child(list_box)
+        box.append(scroll)
+        pop.set_child(box)
+        pop.connect("closed", lambda p: p.unparent())
+        pop.popup()
+
+    def _open_kcontrol_bytes_file_chooser(self, node: GraphNode) -> None:
+        """Open a GTK4 FileDialog to choose a bytes parameter configuration/blob file."""
+        dialog = Gtk.FileDialog()
+        dialog.set_title(f"Select Bytes Parameter File ({self._get_kcontrol_short_name(node)})")
+        curr_file = self._get_kcontrol_bytes_file(node)
+        if self.vm and self.vm.source_file:
+            base_dir = os.path.dirname(os.path.abspath(self.vm.source_file))
+            if curr_file and curr_file != "(select file…)":
+                candidate = os.path.join(base_dir, curr_file)
+                if os.path.exists(candidate):
+                    base_dir = os.path.dirname(candidate)
+            if os.path.isdir(base_dir):
+                dialog.set_initial_folder(Gio.File.new_for_path(base_dir))
+
+        root = self.get_root()
+        win = root if isinstance(root, Gtk.Window) else None
+
+        def _on_done(dlg: Gtk.FileDialog, res: Gio.AsyncResult) -> None:
+            try:
+                gfile = dlg.open_finish(res)
+                if gfile and gfile.get_path():
+                    chosen = gfile.get_path()
+                    # Store relative path when inside topology2 root if possible
+                    if self.vm and self.vm.source_file:
+                        tplg_root = os.path.dirname(os.path.abspath(self.vm.source_file))
+                        try:
+                            rel = os.path.relpath(chosen, tplg_root)
+                            if not rel.startswith(".."):
+                                chosen = rel
+                        except ValueError:
+                            pass
+                    self.record_undo_snapshot(f"Set {self._get_kcontrol_short_name(node)} bytes file")
+                    node.config.set_scalar("included_param_file", chosen, origin="instance")
+                    if self.vm:
+                        self.vm.dirty = True
+                    self.select_node(node.id)
+                    if self.on_kcontrol_changed:
+                        self.on_kcontrol_changed(node)
+                    if self.on_graph_modified:
+                        self.on_graph_modified()
+                    self.queue_draw()
+            except Exception:
+                pass
+
+        dialog.open(win, None, _on_done)
 
     # -------------------------------------------------------------------------
     # Drag-Pause Drop Outcome Preview & Drag-and-Drop Handlers

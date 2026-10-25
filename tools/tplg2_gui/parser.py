@@ -288,12 +288,16 @@ def parse_stmt_list(
     return stmts
 
 
+def parse_conf_text(text: str, source_file: str = "") -> List[AstStmt]:
+    tokens = tokenize_alsaconf(text)
+    stream = TokenStream(tokens, source_file=source_file)
+    return parse_stmt_list(stream)
+
+
 def parse_conf_file(path: str) -> List[AstStmt]:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
-    tokens = tokenize_alsaconf(text)
-    stream = TokenStream(tokens, source_file=path)
-    return parse_stmt_list(stream)
+    return parse_conf_text(text, source_file=path)
 
 
 class Topology2Workspace:
@@ -532,6 +536,8 @@ class Topology2Workspace:
                                     adef.attr_type = "int"
                                 elif ref_t == "bool":
                                     adef.attr_type = "bool"
+                        elif ch.key == "value":
+                            cdef.defaults[attr_name] = ch.value
                     elif ch.stmt_type == "block" and ch.key == "constraints":
                         constraint = AttrConstraint()
                         for cch in ch.children:
@@ -2074,6 +2080,23 @@ class Topology2Workspace:
                     else:
                         cfg.children.append(conv)
 
+    @staticmethod
+    def _extract_kcontrol_enum_options(ctrl_cfg: ConfigNode) -> List[str]:
+        """Extract enum option strings from Object.Base -> text.* -> !values inside a Control.enum ConfigNode."""
+        opts: List[str] = []
+
+        def walk(node: ConfigNode) -> None:
+            if node.key in ("!values", "values") and node.children:
+                for ch in node.children:
+                    v = str(ch.value or ch.key or "").strip().strip('"').strip("'")
+                    if v and v not in opts:
+                        opts.append(v)
+            for ch in node.children:
+                walk(ch)
+
+        walk(ctrl_cfg)
+        return opts if opts else ["0", "1"]
+
     def attach_widget_kcontrol_nodes(self, vm: GraphViewModel, parent_node: GraphNode) -> None:
         """Instantiate child kcontrol GraphNodes below parent_node for each control in Object.Control."""
         ctrl_group = parent_node.config.get_child("Object.Control")
@@ -2086,6 +2109,11 @@ class Topology2Workspace:
             "enum": "control_enum",
         }
 
+        has_any_named = any(
+            bool(str(c.get_scalar("name", "")).strip())
+            for c in ctrl_group.children
+        )
+
         for idx, ctrl_cfg in enumerate(ctrl_group.children):
             cparts = split_dotted_key(ctrl_cfg.key)
             ctype = cparts[0] if cparts else "mixer"
@@ -2093,6 +2121,10 @@ class Topology2Workspace:
             node_cat = ctrl_cat_map.get(ctype, "control")
 
             kname = str(ctrl_cfg.get_scalar("name", "")).strip()
+            if has_any_named and not kname and vm.view_kind not in ("module", "base_class"):
+                # Skip unused class template control slots that were not instantiated/named in this pipeline
+                continue
+
             title = f"{ctype}.{cinst}: {kname}" if kname else f"{ctype}.{cinst}"
 
             badges: List[str] = []
@@ -2101,6 +2133,18 @@ class Topology2Workspace:
                 is_switch = max_val == "1"
                 if is_switch:
                     node_cat = "control_switch"
+                    if ctrl_cfg.get_scalar("value") is None:
+                        ctrl_cfg.set_scalar("value", "1", category_info="Switch state (0=Off, 1=On)", origin="default")
+                else:
+                    max_int = int(max_val) if max_val.isdigit() else 32
+                    if ctrl_cfg.get_scalar("value") is None:
+                        default_v = int(round(max_int * 0.78))
+                        ctrl_cfg.set_scalar(
+                            "value",
+                            f"{default_v},{default_v}",
+                            category_info=f"Volume level (0..{max_int})",
+                            origin="default",
+                        )
                 subtitle = f"Control.mixer ({'Switch' if is_switch else 'Volume'})"
                 if max_val:
                     badges.append(f"max {max_val}")
@@ -2116,6 +2160,24 @@ class Topology2Workspace:
                     badges.append(f"max {max_val}")
             elif ctype == "enum":
                 subtitle = "Control.enum (Enum)"
+                enum_opts = self._extract_kcontrol_enum_options(ctrl_cfg)
+                if ctrl_cfg.get_scalar("enum_options") is None:
+                    ctrl_cfg.set_scalar(
+                        "enum_options",
+                        ",".join(enum_opts),
+                        category_info="Available enum choices",
+                        origin="default",
+                        is_immutable=True,
+                    )
+                if ctrl_cfg.get_scalar("value") is None:
+                    default_opt = "0" if "0" in enum_opts else enum_opts[0]
+                    ctrl_cfg.set_scalar(
+                        "value",
+                        default_opt,
+                        category_info="Selected enum option",
+                        origin="default",
+                        valid_values=enum_opts,
+                    )
                 badges.append("enum")
             else:
                 subtitle = f"Control.{ctype}"
@@ -2666,3 +2728,341 @@ class Topology2Workspace:
         if class_name in ("mixin", "mixout", "module-copier"):
             return "mix"
         return "widget"
+
+    # -------------------------------------------------------------------------
+    # Factory Builders for File -> New (Module / Feature / Function / Monolithic)
+    # and File -> Open Arbitrary .conf File
+    # -------------------------------------------------------------------------
+
+    def create_new_module_graph(self, name: str = "custom-module") -> GraphViewModel:
+        """Create a new Processing Module (Class.Widget.<name>) GraphViewModel."""
+        if "gain" in self.processing_modules:
+            vm = self.build_graph_for_module("gain", include_testbench_io=True)
+        elif self.processing_modules:
+            first_m = sorted(self.processing_modules.keys())[0]
+            vm = self.build_graph_for_module(first_m, include_testbench_io=True)
+        else:
+            vm = GraphViewModel(title=f"Class.Widget.{name}", view_kind="module")
+        vm.title = f"Class.Widget.{name}"
+        vm.subtitle = "New Processing Module (include/components/)"
+        vm.view_kind = "module"
+        vm.source_file = ""
+        vm.dirty = True
+        renamed_nodes: Dict[str, GraphNode] = {}
+        old_w_id = ""
+        new_w_id = f"{name}.1.1"
+        for nid, node in vm.nodes.items():
+            if node.class_category == "Widget":
+                old_w_id = nid
+                node.id = new_w_id
+                node.class_name = name
+                node.title = name
+                node.subtitle = f"Class.Widget.{name} (effect)"
+                renamed_nodes[new_w_id] = node
+            else:
+                new_cid = nid.replace("gain.1.1", new_w_id)
+                node.id = new_cid
+                node.parent_node_id = new_w_id
+                renamed_nodes[new_cid] = node
+        if old_w_id:
+            vm.nodes = renamed_nodes
+            for edge in vm.edges:
+                edge.source_node = edge.source_node.replace(old_w_id, new_w_id)
+                edge.sink_node = edge.sink_node.replace(old_w_id, new_w_id)
+        return vm
+
+    def create_new_feature_topology_graph(self, name: str = "custom-feature-pipeline") -> GraphViewModel:
+        """Create a new Feature Topology (Class.Pipeline.<name>) GraphViewModel."""
+        vm = GraphViewModel(
+            title=f"Class.Pipeline.{name}",
+            subtitle="New Feature Topology Pipeline (include/pipelines/cavs/)",
+            view_kind="pipeline",
+            source_file="",
+            dirty=True,
+        )
+        defines = dict(self.global_defines)
+        c1 = PipelineContainer(
+            pipeline_id=1,
+            class_name=name,
+            direction="playback",
+        )
+        c1.config.set_scalar("index", "1", origin="pipeline")
+        c1.config.set_scalar("direction", "playback", origin="pipeline")
+        vm.containers[1] = c1
+
+        hc = self._instantiate_widget_node(
+            wclass="host-copier",
+            winst="0.playback",
+            pipeline_id=1,
+            pipeline_class=name,
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        gn = self._instantiate_widget_node(
+            wclass="gain",
+            winst="1",
+            pipeline_id=1,
+            pipeline_class=name,
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        mc = self._instantiate_widget_node(
+            wclass="module-copier",
+            winst="2",
+            pipeline_id=1,
+            pipeline_class=name,
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        for wnode in (hc, gn, mc):
+            vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
+
+        vm.edges.append(GraphEdge(id="edge_feat_0", source_node=hc.id, sink_node=gn.id, pipeline_id=1))
+        vm.edges.append(GraphEdge(id="edge_feat_1", source_node=gn.id, sink_node=mc.id, pipeline_id=1))
+        self.attach_host_copier_io_nodes(vm)
+        return vm
+
+    def create_new_function_topology_graph(self, name: str = "custom-function-topology") -> GraphViewModel:
+        """Create a new Function Topology (reusable multi-pipeline FE -> BE function block) GraphViewModel."""
+        vm = GraphViewModel(
+            title=name,
+            subtitle="New Function Topology (FE + BE Pipeline Block)",
+            view_kind="function_topology",
+            source_file="",
+            dirty=True,
+        )
+        defines = dict(self.global_defines)
+        # Pipeline 1: FE host-gateway-playback (host-copier -> gain -> module-copier)
+        c1 = PipelineContainer(
+            pipeline_id=1,
+            class_name="volume-playback",
+            direction="playback",
+        )
+        c1.config.set_scalar("index", "1", origin="pipeline")
+        c1.config.set_scalar("direction", "playback", origin="pipeline")
+        vm.containers[1] = c1
+
+        # Pipeline 2: BE io-gateway (dai-copier)
+        c2 = PipelineContainer(
+            pipeline_id=2,
+            class_name="io-gateway",
+            direction="playback",
+        )
+        c2.config.set_scalar("index", "2", origin="pipeline")
+        c2.config.set_scalar("direction", "playback", origin="pipeline")
+        vm.containers[2] = c2
+
+        hc = self._instantiate_widget_node(
+            wclass="host-copier",
+            winst="0.playback",
+            pipeline_id=1,
+            pipeline_class="volume-playback",
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        gn = self._instantiate_widget_node(
+            wclass="gain",
+            winst="1",
+            pipeline_id=1,
+            pipeline_class="volume-playback",
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        dc = self._instantiate_widget_node(
+            wclass="dai-copier",
+            winst="HDA.Analog.playback",
+            pipeline_id=2,
+            pipeline_class="io-gateway",
+            pipeline_direction="playback",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        for wnode in (hc, gn, dc):
+            vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
+
+        vm.edges.append(GraphEdge(id="edge_fn_0", source_node=hc.id, sink_node=gn.id, pipeline_id=1))
+        vm.edges.append(
+            GraphEdge(
+                id="edge_fn_1",
+                source_node=gn.id,
+                sink_node=dc.id,
+                pipeline_id=1,
+                is_inter_pipeline=True,
+            )
+        )
+        self.attach_host_copier_io_nodes(vm)
+        return vm
+
+    def create_new_monolithic_topology_graph(self, name: str = "sof-custom-generic") -> GraphViewModel:
+        """Create a new Monolithic Machine Topology (sof-*.conf) GraphViewModel."""
+        vm = self.create_new_function_topology_graph(name=name)
+        vm.title = name
+        vm.subtitle = "New Monolithic Machine Topology (sof-*.conf)"
+        vm.view_kind = "topology"
+        vm.source_file = ""
+        vm.dirty = True
+
+        defines = dict(self.global_defines)
+        # Add Capture pipelines 3 (FE) and 4 (BE) for a complete duplex machine topology
+        c3 = PipelineContainer(
+            pipeline_id=3,
+            class_name="host-gateway-capture",
+            direction="capture",
+        )
+        c3.config.set_scalar("index", "3", origin="pipeline")
+        c3.config.set_scalar("direction", "capture", origin="pipeline")
+        vm.containers[3] = c3
+
+        c4 = PipelineContainer(
+            pipeline_id=4,
+            class_name="io-gateway-capture",
+            direction="capture",
+        )
+        c4.config.set_scalar("index", "4", origin="pipeline")
+        c4.config.set_scalar("direction", "capture", origin="pipeline")
+        vm.containers[4] = c4
+
+        dc_cap = self._instantiate_widget_node(
+            wclass="dai-copier",
+            winst="HDA.Analog.capture",
+            pipeline_id=4,
+            pipeline_class="io-gateway-capture",
+            pipeline_direction="capture",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        gn_cap = self._instantiate_widget_node(
+            wclass="gain",
+            winst="1",
+            pipeline_id=3,
+            pipeline_class="host-gateway-capture",
+            pipeline_direction="capture",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        hc_cap = self._instantiate_widget_node(
+            wclass="host-copier",
+            winst="0.capture",
+            pipeline_id=3,
+            pipeline_class="host-gateway-capture",
+            pipeline_direction="capture",
+            override_stmts=[],
+            defines=defines,
+            source_file="",
+        )
+        for wnode in (dc_cap, gn_cap, hc_cap):
+            vm.nodes[wnode.id] = wnode
+            self.attach_widget_kcontrol_nodes(vm, wnode)
+
+        vm.edges.append(
+            GraphEdge(
+                id="edge_mono_2",
+                source_node=dc_cap.id,
+                sink_node=gn_cap.id,
+                pipeline_id=4,
+                is_inter_pipeline=True,
+            )
+        )
+        vm.edges.append(
+            GraphEdge(
+                id="edge_mono_3",
+                source_node=gn_cap.id,
+                sink_node=hc_cap.id,
+                pipeline_id=3,
+            )
+        )
+        # Re-attach Testbench IO nodes so capture pipelines also have source/sink cards
+        for nid in [k for k, v in vm.nodes.items() if v.class_category == "TestbenchIO"]:
+            del vm.nodes[nid]
+        vm.edges = [e for e in vm.edges if not e.id.startswith("tb_io_edge_")]
+        self.attach_host_copier_io_nodes(vm)
+        return vm
+
+    def build_graph_for_arbitrary_conf_file(self, conf_path: str) -> GraphViewModel:
+        """Open any .conf file and build the appropriate GraphViewModel."""
+        abs_path = os.path.abspath(conf_path)
+        for mname, mdef in self.processing_modules.items():
+            if os.path.abspath(mdef.source_file) == abs_path:
+                return self.build_graph_for_module(mname)
+        for pname, pdef in self.pipeline_classes.items():
+            if os.path.abspath(pdef.source_file) == abs_path:
+                return self.build_graph_for_pipeline(pname)
+        for bkey, bdef in self.base_classes.items():
+            if os.path.abspath(bdef.source_file) == abs_path:
+                return self.build_graph_for_base_class(bkey)
+        for entry in self.machine_topologies:
+            if os.path.abspath(entry.conf_path) == abs_path:
+                variant = entry.variants[0] if entry.variants else None
+                return self.build_graph_for_topology(abs_path, variant)
+        return self.build_graph_for_topology(abs_path, None)
+
+    def build_graph_from_conf_text(
+        self,
+        text: str,
+        source_file: str = "",
+        fallback_view_kind: str = "topology",
+        fallback_title: str = "",
+        target_variant: Optional[CMakeTargetVariant] = None,
+    ) -> GraphViewModel:
+        """Parse edited Topology2 (.conf) text directly and rebuild the GraphViewModel."""
+        eval_file = (
+            os.path.abspath(source_file)
+            if source_file
+            else os.path.join(self.root_dir, "__in_memory_editor__.conf")
+        )
+        stmts = parse_conf_text(text, source_file=eval_file)
+        rel_path = os.path.relpath(eval_file, self.root_dir) if source_file else "(Edited Buffer)"
+
+        # Check if the buffer defines a Class.<Category>.<Name>
+        for stmt in stmts:
+            if stmt.stmt_type == "block" and stmt.key.startswith("Class."):
+                parts = split_dotted_key(stmt.key)
+                if len(parts) >= 3:
+                    cat = parts[1]
+                    cname = parts[2]
+                    cdef = self._build_class_def(cat, cname, stmt, eval_file, rel_path)
+                    self.all_classes[f"{cat}.{cname}"] = cdef
+                    if cat == "Widget":
+                        self.processing_modules[cname] = cdef
+                        vm = self.build_graph_for_module(cname)
+                        vm.source_file = source_file
+                        vm.dirty = True
+                        return vm
+                    if cat == "Pipeline":
+                        self.pipeline_classes[cname] = cdef
+                        self._resolve_pipeline_inheritance()
+                        vm = self.build_graph_for_pipeline(cname)
+                        vm.source_file = source_file
+                        vm.dirty = True
+                        return vm
+                    self.base_classes[f"{cat}.{cname}"] = cdef
+                    vm = self.build_graph_for_base_class(f"{cat}.{cname}")
+                    vm.source_file = source_file
+                    vm.dirty = True
+                    return vm
+
+        # Otherwise evaluate as a multi-pipeline Function Topology or Monolithic Machine Topology
+        self._ast_cache[eval_file] = stmts
+        vm = self.build_graph_for_topology(eval_file, target_variant)
+        vm.source_file = source_file
+        if fallback_view_kind in ("function_topology", "topology"):
+            vm.view_kind = fallback_view_kind
+        if fallback_title and not source_file:
+            vm.title = fallback_title
+        vm.dirty = True
+        return vm
