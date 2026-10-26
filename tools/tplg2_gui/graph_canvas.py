@@ -188,7 +188,12 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         # Interaction state
         self._drag_mode: str = "none"  # "none", "pan", "node", "container", "wire"
-        self._right_drag_mode: str = "none"  # "none", "pan", "objects"
+        self._right_drag_mode: str = "none"  # "none", "box_select", "pan", "objects"
+        self._selection_box_world: Optional[Tuple[float, float, float, float]] = None
+        self._box_select_additive: bool = False
+        self._box_select_initial_nodes: Set[str] = set()
+        self._box_select_initial_containers: Set[int] = set()
+        self._left_click_kept_multisel: bool = False
         self._drag_start_screen: Tuple[float, float] = (0.0, 0.0)
         self._drag_start_world: Tuple[float, float] = (0.0, 0.0)
         self._drag_start_pan: Tuple[float, float] = (0.0, 0.0)
@@ -293,6 +298,90 @@ class TopologyGraphCanvas(Gtk.Widget):
             return True
         if any(pid in self.vm.containers for pid in self.selected_container_ids):
             return True
+        return False
+
+    def _has_multi_selection(self) -> bool:
+        if not self.vm:
+            return False
+        valid_nids = [nid for nid in self.selected_node_ids if nid in self.vm.nodes]
+        valid_pids = [pid for pid in self.selected_container_ids if pid in self.vm.containers]
+        return len(valid_nids) > 1 or len(valid_pids) > 1 or (len(valid_nids) >= 1 and len(valid_pids) >= 1)
+
+    def _get_selection_bounds_world(self) -> Optional[Tuple[float, float, float, float]]:
+        """Return (min_x, min_y, max_x, max_y) in world space for all currently selected objects."""
+        if not self.vm:
+            return None
+        sel_nids: Set[str] = {nid for nid in self.selected_node_ids if nid in self.vm.nodes}
+        if self.selected_node_id and self.selected_node_id in self.vm.nodes:
+            sel_nids.add(self.selected_node_id)
+        sel_pids: Set[int] = {pid for pid in self.selected_container_ids if pid in self.vm.containers}
+        if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
+            sel_pids.add(self.selected_container_id)
+
+        for pid in sel_pids:
+            for n in self.vm.nodes.values():
+                if n.pipeline_id == pid:
+                    sel_nids.add(n.id)
+
+        all_nids = set(sel_nids)
+        for cid, cnode in self.vm.nodes.items():
+            if cnode.parent_node_id and cnode.parent_node_id in sel_nids:
+                all_nids.add(cid)
+
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        for pid in sel_pids:
+            cont = self.vm.containers[pid]
+            min_x = min(min_x, cont.x)
+            min_y = min(min_y, cont.y)
+            max_x = max(max_x, cont.x + cont.width)
+            max_y = max(max_y, cont.y + cont.height)
+        for nid in all_nids:
+            n = self.vm.nodes[nid]
+            min_x = min(min_x, n.x)
+            min_y = min(min_y, n.y)
+            max_x = max(max_x, n.x + n.width)
+            max_y = max(max_y, n.y + n.height)
+
+        if min_x == float("inf"):
+            return None
+        return (min_x, min_y, max_x, max_y)
+
+    def _is_point_in_current_selection(self, wx: float, wy: float) -> bool:
+        """Return True if world point (wx, wy) hits a selected node/container or lies inside a multi-selection group box."""
+        if not self.vm or not self._has_selected_objects():
+            return False
+        nid = self._hit_test_node(wx, wy)
+        if nid and nid in self.vm.nodes:
+            node = self.vm.nodes[nid]
+            if nid in self.selected_node_ids or nid == self.selected_node_id:
+                return True
+            if node.parent_node_id and (
+                node.parent_node_id in self.selected_node_ids or node.parent_node_id == self.selected_node_id
+            ):
+                return True
+            if node.pipeline_id is not None and (
+                node.pipeline_id in self.selected_container_ids or node.pipeline_id == self.selected_container_id
+            ):
+                return True
+        pid = self._hit_test_container(wx, wy)
+        if pid is not None:
+            if pid in self.selected_container_ids or pid == self.selected_container_id:
+                return True
+            if any(
+                snid in self.vm.nodes and self.vm.nodes[snid].pipeline_id == pid
+                for snid in self.selected_node_ids
+            ):
+                return True
+        if self._has_multi_selection():
+            bounds = self._get_selection_bounds_world()
+            if bounds is not None:
+                bx0, by0, bx1, by1 = bounds
+                pad = 8.0
+                if (bx0 - pad) <= wx <= (bx1 + pad) and (by0 - pad) <= wy <= (by1 + pad):
+                    return True
         return False
 
     def clear_diagnostic_highlights(self) -> None:
@@ -401,7 +490,9 @@ class TopologyGraphCanvas(Gtk.Widget):
             return
         if self.selected_node_id and self.selected_node_id in self.vm.nodes:
             node = self.vm.nodes[self.selected_node_id]
-            self.on_selection_changed(node.title, node.config, node.subtitle)
+            extra_cnt = len(self.selected_node_ids) - 1 if self.selected_node_id in self.selected_node_ids else len(self.selected_node_ids)
+            title = f"{node.title}  (+{extra_cnt} selected)" if extra_cnt > 0 else node.title
+            self.on_selection_changed(title, node.config, node.subtitle)
         elif self.selected_edge_id:
             edge = next((e for e in self.vm.edges if e.id == self.selected_edge_id), None)
             if edge:
@@ -783,6 +874,14 @@ class TopologyGraphCanvas(Gtk.Widget):
         # 7b. Draw Drag-Pause Drop Outcome Preview in World Space (ghost container/node/wires + target highlight)
         if self.drop_preview is not None:
             self._snapshot_drop_preview_world(snapshot, self.drop_preview)
+
+        # 7c. Draw Right-Drag Rectangular Selection Box or Active Multi-Selection Group Box in World Space
+        if self._selection_box_world is not None:
+            self._snapshot_selection_box(snapshot, self._selection_box_world)
+        elif self._has_multi_selection():
+            bounds = self._get_selection_bounds_world()
+            if bounds is not None:
+                self._snapshot_group_selection_bounds(snapshot, bounds)
 
         snapshot.restore()
 
@@ -2191,13 +2290,114 @@ class TopologyGraphCanvas(Gtk.Widget):
         arrow_pb.close()
         snapshot.append_fill(arrow_pb.to_path(), Gsk.FillRule.WINDING, color)
 
+    def _snapshot_selection_box(
+        self,
+        snapshot: Gtk.Snapshot,
+        box_world: Tuple[float, float, float, float],
+    ) -> None:
+        """Render the right-button drag rectangular marquee selection box in world space."""
+        x0, y0, x1, y1 = box_world
+        bw = max(1.0, x1 - x0)
+        bh = max(1.0, y1 - y0)
+
+        rect = Graphene.Rect.alloc()
+        rect.init(x0, y0, bw, bh)
+        rrect = Gsk.RoundedRect()
+        rrect.init_from_rect(rect, 4.0 / max(0.25, self.zoom))
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(rgba(0.22, 0.72, 0.98, 0.16), rect)
+        snapshot.pop()
+
+        pb = Gsk.PathBuilder.new()
+        pb.add_rounded_rect(rrect)
+        stroke_w = max(1.2, 1.8 / max(0.25, self.zoom))
+        dash_len = max(3.0, 6.0 / max(0.25, self.zoom))
+        gap_len = max(2.0, 4.0 / max(0.25, self.zoom))
+        stroke = Gsk.Stroke.new(stroke_w)
+        stroke.set_dash([dash_len, gap_len])
+        snapshot.append_stroke(pb.to_path(), stroke, rgba(0.38, 0.84, 1.00, 0.95))
+
+        # Show live selection count badge at top-left of marquee when dragging
+        sel_cnt = len(self.selected_node_ids)
+        if sel_cnt > 0 and bw * self.zoom > 36.0 and bh * self.zoom > 24.0:
+            badge_txt = f"{sel_cnt} node{'s' if sel_cnt != 1 else ''} selected"
+            lyt = self._get_pango_layout(badge_txt, size_pt=7, bold=True)
+            _, ext = lyt.get_pixel_extents()
+            inv_z = 1.0 / max(0.25, self.zoom)
+            tag_w = (float(ext.width) + 12.0) * inv_z
+            tag_h = (float(ext.height) + 6.0) * inv_z
+            tag_rect = Graphene.Rect.alloc()
+            tag_rect.init(x0, max(0.0, y0 - tag_h - 4.0 * inv_z), tag_w, tag_h)
+            tag_rr = Gsk.RoundedRect()
+            tag_rr.init_from_rect(tag_rect, 4.0 * inv_z)
+            snapshot.push_rounded_clip(tag_rr)
+            snapshot.append_color(rgba(0.10, 0.34, 0.56, 0.92), tag_rect)
+            snapshot.pop()
+
+            snapshot.save()
+            pt = Graphene.Point.alloc()
+            pt.init(x0 + 6.0 * inv_z, max(0.0, y0 - tag_h - 4.0 * inv_z) + 3.0 * inv_z)
+            snapshot.translate(pt)
+            snapshot.scale(inv_z, inv_z)
+            snapshot.append_layout(lyt, TEXT_WHITE)
+            snapshot.restore()
+
+    def _snapshot_group_selection_bounds(
+        self,
+        snapshot: Gtk.Snapshot,
+        bounds_world: Tuple[float, float, float, float],
+    ) -> None:
+        """Render a dashed group bounding frame around an active multi-selection."""
+        pad = 10.0
+        x0 = bounds_world[0] - pad
+        y0 = bounds_world[1] - pad
+        bw = max(1.0, (bounds_world[2] - bounds_world[0]) + 2.0 * pad)
+        bh = max(1.0, (bounds_world[3] - bounds_world[1]) + 2.0 * pad)
+
+        inv_z = 1.0 / max(0.25, self.zoom)
+        rect = Graphene.Rect.alloc()
+        rect.init(x0, y0, bw, bh)
+        rrect = Gsk.RoundedRect()
+        rrect.init_from_rect(rect, 8.0 * inv_z)
+
+        pb = Gsk.PathBuilder.new()
+        pb.add_rounded_rect(rrect)
+        stroke = Gsk.Stroke.new(max(1.2, 1.8 * inv_z))
+        stroke.set_dash([max(4.0, 7.0 * inv_z), max(2.5, 4.5 * inv_z)])
+        snapshot.append_stroke(pb.to_path(), stroke, rgba(0.32, 0.82, 1.00, 0.78))
+
+        sel_cnt = len(self.selected_node_ids)
+        badge_txt = f"Group: {sel_cnt} node{'s' if sel_cnt != 1 else ''}  (Drag to move • Ctrl+C Copy • Ctrl+V Paste)"
+        lyt = self._get_pango_layout(badge_txt, size_pt=7, bold=True)
+        _, ext = lyt.get_pixel_extents()
+        tag_w = (float(ext.width) + 12.0) * inv_z
+        tag_h = (float(ext.height) + 6.0) * inv_z
+        tag_y = y0 - tag_h - 4.0 * inv_z
+        tag_rect = Graphene.Rect.alloc()
+        tag_rect.init(x0, tag_y, tag_w, tag_h)
+        tag_rr = Gsk.RoundedRect()
+        tag_rr.init_from_rect(tag_rect, 4.0 * inv_z)
+        snapshot.push_rounded_clip(tag_rr)
+        snapshot.append_color(rgba(0.10, 0.34, 0.56, 0.90), tag_rect)
+        snapshot.pop()
+
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(x0 + 6.0 * inv_z, tag_y + 3.0 * inv_z)
+        snapshot.translate(pt)
+        snapshot.scale(inv_z, inv_z)
+        snapshot.append_layout(lyt, TEXT_WHITE)
+        snapshot.restore()
+
     def _snapshot_hud(self, snapshot: Gtk.Snapshot, w: float, h: float) -> None:
         if not self.vm:
             return
         dirty_tag = " [Modified]" if self.vm.dirty else ""
+        sel_tag = f"  •  Selected: {len(self.selected_node_ids)}" if len(self.selected_node_ids) > 1 else ""
         hud_text = (
-            f"{self.vm.title}{dirty_tag}  •  {len(self.vm.nodes)} nodes, {len(self.vm.edges)} routes"
-            f"  •  Zoom: {int(self.zoom * 100)}%  (Drag port to wire, Del to remove, F to fit)"
+            f"{self.vm.title}{dirty_tag}  •  {len(self.vm.nodes)} nodes, {len(self.vm.edges)} routes{sel_tag}"
+            f"  •  Zoom: {int(self.zoom * 100)}%  (Right-drag to box-select, Drag port to wire, Del to remove, F to fit)"
         )
         layout = self._get_pango_layout(hud_text, size_pt=9, bold=False)
         ink, logical = layout.get_pixel_extents()
@@ -2289,9 +2489,21 @@ class TopologyGraphCanvas(Gtk.Widget):
         additive = bool(state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK))
 
         # Check port first (don't change selection if starting a wire drag)
-        if self._hit_test_port(wx, wy) is not None:
+        if not self._has_multi_selection() and self._hit_test_port(wx, wy) is not None:
             return
 
+        # If a multi-selection group is active and user presses inside the selected group/containers/nodes,
+        # preserve the multi-selection so left-dragging moves the entire group together.
+        if not additive and self._has_multi_selection() and self._is_point_in_current_selection(wx, wy):
+            self._left_click_kept_multisel = True
+            nid_hit = self._hit_test_node(wx, wy)
+            if nid_hit and nid_hit in self.selected_node_ids:
+                self.selected_node_id = nid_hit
+            self._notify_current_selection()
+            self.queue_draw()
+            return
+
+        self._left_click_kept_multisel = False
         nid = self._hit_test_node(wx, wy)
         if nid:
             node = self.vm.nodes[nid]
@@ -2430,6 +2642,20 @@ class TopologyGraphCanvas(Gtk.Widget):
         wx, wy = self.screen_to_world(sx, sy)
         self._drag_start_world = (wx, wy)
 
+        # If a multi-selection group is active and drag starts anywhere on/inside the selected group,
+        # drag all selected nodes and containers together as a unit.
+        state = gesture.get_current_event_state()
+        additive = bool(state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK))
+        if not additive and self._has_multi_selection() and self._is_point_in_current_selection(wx, wy):
+            self._drag_mode = "group"
+            self._pending_drag_history_entry = self._capture_history_entry(
+                f"Move {len(self.selected_node_ids)} selected node(s)"
+            )
+            self._capture_selected_objects_initial()
+            self._drag_children_initial = dict(self._right_drag_nodes_initial)
+            self.set_cursor_from_name("move")
+            return
+
         port_hit = self._hit_test_port(wx, wy)
         if port_hit and port_hit[2] == "out":
             nid, pid, _, px, py = port_hit
@@ -2458,13 +2684,15 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.select_node(nid)
             else:
                 self.selected_node_id = nid
-            self._pending_drag_history_entry = self._capture_history_entry(f"Move {nid}")
+            desc = (
+                f"Move {len(self.selected_node_ids)} selected nodes"
+                if len(self.selected_node_ids) > 1
+                else f"Move {nid}"
+            )
+            self._pending_drag_history_entry = self._capture_history_entry(desc)
             self._drag_node_initial = (node.x, node.y)
-            self._drag_children_initial = {
-                cid: (cnode.x, cnode.y)
-                for cid, cnode in self.vm.nodes.items()
-                if cnode.parent_node_id == nid
-            }
+            self._capture_selected_objects_initial()
+            self._drag_children_initial = dict(self._right_drag_nodes_initial)
             self.set_cursor_from_name("move")
             return
 
@@ -2497,12 +2725,13 @@ class TopologyGraphCanvas(Gtk.Widget):
             self.pan_x = self._drag_start_pan[0] + offset_x
             self.pan_y = self._drag_start_pan[1] + offset_y
             self.queue_draw()
-        elif self._drag_mode == "node" and self.selected_node_id in self.vm.nodes:
+        elif self._drag_mode in ("node", "group"):
             dx = offset_x / self.zoom
             dy = offset_y / self.zoom
-            node = self.vm.nodes[self.selected_node_id]
-            node.x = self._drag_node_initial[0] + dx
-            node.y = self._drag_node_initial[1] + dy
+            for pid, (cx0, cy0) in self._right_drag_containers_initial.items():
+                if pid in self.vm.containers:
+                    self.vm.containers[pid].x = cx0 + dx
+                    self.vm.containers[pid].y = cy0 + dy
             for cid, (cx0, cy0) in self._drag_children_initial.items():
                 if cid in self.vm.nodes:
                     self.vm.nodes[cid].x = cx0 + dx
@@ -2546,11 +2775,30 @@ class TopologyGraphCanvas(Gtk.Widget):
             target_pid = port_hit[1] if (port_hit and port_hit[2] == "in") else None
             if target_nid and target_nid != src_nid:
                 self._create_route_edge(src_nid, target_nid, src_port=src_pid, snk_port=target_pid)
-        elif self.vm and self._drag_mode in ("node", "container"):
+        elif self.vm and self._drag_mode in ("node", "container", "group"):
             if moved and self._pending_drag_history_entry is not None:
                 self.history.push_undo_entry(self._pending_drag_history_entry)
                 self.vm.dirty = True
-            if self._drag_mode == "node" and self.selected_node_id in self.vm.nodes:
+                debug_log_action(
+                    "CANVAS-MOVE",
+                    f"Moved selection ({len(self.selected_node_ids)} nodes, {len(self.selected_container_ids)} containers)",
+                    f"dx={offset_x / self.zoom:.1f} dy={offset_y / self.zoom:.1f}",
+                )
+            if not moved and self._left_click_kept_multisel:
+                wx0, wy0 = self._drag_start_world
+                nid_hit = self._hit_test_node(wx0, wy0)
+                pid_hit = self._hit_test_container(wx0, wy0)
+                if nid_hit:
+                    self.select_node(nid_hit, additive=False)
+                elif pid_hit is not None and pid_hit in self.vm.containers:
+                    self.selected_node_id = None
+                    self.selected_node_ids.clear()
+                    self.selected_container_ids = {pid_hit}
+                    self.selected_container_id = pid_hit
+                    self._notify_current_selection()
+                else:
+                    self.select_node(None)
+            elif self._drag_mode == "node" and self.selected_node_id in self.vm.nodes and len(self.selected_node_ids) <= 1:
                 self._suppress_auto_history = True
                 try:
                     self._maybe_reparent_dragged_node(self.selected_node_id)
@@ -2568,6 +2816,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                 self.on_kcontrol_changed(node)
             if self.on_graph_modified:
                 self.on_graph_modified()
+        self._left_click_kept_multisel = False
         self._pending_drag_history_entry = None
         self._drag_mode = "none"
         self._wire_source = None
@@ -2590,15 +2839,20 @@ class TopologyGraphCanvas(Gtk.Widget):
 
     # ------------------------------------------------------------------
     # Right Mouse Button Hold & Drag:
-    # - If object(s) are selected: change pointer to "move" and drag selected object(s)
-    # - If no object is selected: change pointer to "grabbing" and drag the whole view
+    # - Starting on empty space / outside selection (or with Shift/Ctrl):
+    #   drag a rectangular marquee selection area to select multiple nodes
+    # - Starting on/inside an active selection:
+    #   drag all selected nodes and containers together as a group
     # ------------------------------------------------------------------
     def _on_right_pressed(self, gesture: Gtk.GestureClick, n_press: int, sx: float, sy: float) -> None:
         self.grab_focus()
-        if self._has_selected_objects():
+        wx, wy = self.screen_to_world(sx, sy)
+        state = gesture.get_current_event_state()
+        additive = bool(state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK))
+        if not additive and self._is_point_in_current_selection(wx, wy):
             self.set_cursor_from_name("move")
         else:
-            self.set_cursor_from_name("grabbing")
+            self.set_cursor_from_name("crosshair")
 
     def _on_right_released(self, gesture: Gtk.GestureClick, n_press: int, sx: float, sy: float) -> None:
         if self._right_drag_mode == "none":
@@ -2626,7 +2880,7 @@ class TopologyGraphCanvas(Gtk.Widget):
                     if n.pipeline_id == pid:
                         sel_nids.add(n.id)
 
-        # Include attached child nodes (kcontrols, testbench I/O) of any selected node
+        # Include attached child nodes (kcontrols, testbench I/O, pin capability callouts) of any selected node
         all_nids = set(sel_nids)
         for cid, cnode in self.vm.nodes.items():
             if cnode.parent_node_id and cnode.parent_node_id in sel_nids:
@@ -2637,19 +2891,80 @@ class TopologyGraphCanvas(Gtk.Widget):
                 n = self.vm.nodes[nid]
                 self._right_drag_nodes_initial[nid] = (n.x, n.y)
 
+    def _apply_box_selection(self, bx0: float, by0: float, bx1: float, by1: float) -> None:
+        """Select all nodes intersecting the world-space selection rectangle (bx0, by0, bx1, by1)."""
+        if not self.vm:
+            return
+        widget_hits: List[str] = []
+        other_hits: List[str] = []
+        for nid, node in self.vm.nodes.items():
+            if node.class_category == "PinFormat":
+                continue
+            if node.x + node.width >= bx0 and node.x <= bx1 and node.y + node.height >= by0 and node.y <= by1:
+                if node.class_category not in ("Control", "TestbenchIO"):
+                    widget_hits.append(nid)
+                else:
+                    other_hits.append(nid)
+
+        hit_nids = set(widget_hits) | set(other_hits)
+        hit_pids: Set[int] = set()
+        for pid, cont in self.vm.containers.items():
+            if cont.x >= bx0 and cont.x + cont.width <= bx1 and cont.y >= by0 and cont.y + cont.height <= by1:
+                hit_pids.add(pid)
+                for nid, node in self.vm.nodes.items():
+                    if node.pipeline_id == pid and node.class_category != "PinFormat":
+                        hit_nids.add(nid)
+            else:
+                # Also mark pipeline container selected if all of its widget nodes are selected
+                pipe_widgets = [
+                    nid
+                    for nid, node in self.vm.nodes.items()
+                    if node.pipeline_id == pid and node.class_category not in ("PinFormat", "TestbenchIO", "Control")
+                ]
+                if pipe_widgets and all(nid in hit_nids for nid in pipe_widgets):
+                    hit_pids.add(pid)
+
+        self.selected_edge_id = None
+        self.selected_node_ids = (self._box_select_initial_nodes | hit_nids) if self._box_select_additive else hit_nids
+        if widget_hits:
+            self.selected_node_id = widget_hits[0]
+        elif other_hits:
+            self.selected_node_id = other_hits[0]
+        else:
+            self.selected_node_id = next(iter(self.selected_node_ids), None)
+
+        self.selected_container_ids = (
+            (self._box_select_initial_containers | hit_pids) if self._box_select_additive else hit_pids
+        )
+        self.selected_container_id = next(iter(self.selected_container_ids), None)
+
     def _on_right_drag_begin(self, gesture: Gtk.GestureDrag, sx: float, sy: float) -> None:
         if not self.vm:
             return
         self._drag_start_screen = (sx, sy)
-        if self._has_selected_objects():
+        wx, wy = self.screen_to_world(sx, sy)
+        self._drag_start_world = (wx, wy)
+        state = gesture.get_current_event_state()
+        additive = bool(
+            state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK)
+        )
+        if not additive and self._is_point_in_current_selection(wx, wy):
             self._right_drag_mode = "objects"
             self.set_cursor_from_name("move")
-            self._pending_drag_history_entry = self._capture_history_entry("Move selected object(s)")
+            self._pending_drag_history_entry = self._capture_history_entry(
+                f"Move {len(self.selected_node_ids)} selected node(s)"
+            )
             self._capture_selected_objects_initial()
-        else:
-            self._right_drag_mode = "pan"
-            self._drag_start_pan = (self.pan_x, self.pan_y)
-            self.set_cursor_from_name("grabbing")
+            return
+
+        self._box_select_additive = additive
+        self._box_select_initial_nodes = set(self.selected_node_ids) if self._box_select_additive else set()
+        self._box_select_initial_containers = (
+            set(self.selected_container_ids) if self._box_select_additive else set()
+        )
+        self._right_drag_mode = "box_select"
+        self._selection_box_world = None
+        self.set_cursor_from_name("crosshair")
 
     def _on_right_drag_update(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         if not self.vm:
@@ -2665,28 +2980,41 @@ class TopologyGraphCanvas(Gtk.Widget):
                 if nid in self.vm.nodes:
                     self.vm.nodes[nid].x = nx0 + dx
                     self.vm.nodes[nid].y = ny0 + dy
-            if not self._right_drag_containers_initial:
-                update_container_bounds_from_nodes(self.vm)
+            update_container_bounds_from_nodes(self.vm)
             self._schedule_drag_pause_preview(
                 self._drag_start_screen[0] + offset_x,
                 self._drag_start_screen[1] + offset_y,
             )
             self.queue_draw()
-        elif self._right_drag_mode == "pan":
-            if abs(offset_x) > 2.0 or abs(offset_y) > 2.0:
-                self._is_fitted = False
-            self.pan_x = self._drag_start_pan[0] + offset_x
-            self.pan_y = self._drag_start_pan[1] + offset_y
-            self.queue_draw()
+            return
+        if self._right_drag_mode != "box_select":
+            return
+        if math.hypot(offset_x, offset_y) <= 3.0:
+            return
+        wx0, wy0 = self._drag_start_world
+        wx1, wy1 = self.screen_to_world(
+            self._drag_start_screen[0] + offset_x,
+            self._drag_start_screen[1] + offset_y,
+        )
+        bx0, bx1 = min(wx0, wx1), max(wx0, wx1)
+        by0, by1 = min(wy0, wy1), max(wy0, wy1)
+        self._selection_box_world = (bx0, by0, bx1, by1)
+        self._apply_box_selection(bx0, by0, bx1, by1)
+        self.queue_draw()
 
     def _on_right_drag_end(self, gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         self._clear_drop_preview()
-        moved = abs(offset_x) > 1.0 or abs(offset_y) > 1.0
+        moved = math.hypot(offset_x, offset_y) > 3.0
         if self.vm and self._right_drag_mode == "objects":
             if moved and self._pending_drag_history_entry is not None:
                 self.history.push_undo_entry(self._pending_drag_history_entry)
                 self.vm.dirty = True
-            if not self._right_drag_containers_initial and self.selected_node_id in self.vm.nodes:
+                debug_log_action(
+                    "CANVAS-MOVE",
+                    f"Right-drag moved selection ({len(self.selected_node_ids)} nodes, {len(self.selected_container_ids)} containers)",
+                    f"dx={offset_x / self.zoom:.1f} dy={offset_y / self.zoom:.1f}",
+                )
+            if not self._right_drag_containers_initial and len(self.selected_node_ids) <= 1 and self.selected_node_id in self.vm.nodes:
                 self._suppress_auto_history = True
                 try:
                     self._maybe_reparent_dragged_node(self.selected_node_id)
@@ -2694,6 +3022,21 @@ class TopologyGraphCanvas(Gtk.Widget):
                     self._suppress_auto_history = False
             if moved and self.on_graph_modified:
                 self.on_graph_modified()
+        elif self.vm and self._right_drag_mode == "box_select":
+            if moved:
+                wx0, wy0 = self._drag_start_world
+                wx1, wy1 = self.screen_to_world(
+                    self._drag_start_screen[0] + offset_x,
+                    self._drag_start_screen[1] + offset_y,
+                )
+                self._apply_box_selection(min(wx0, wx1), min(wy0, wy1), max(wx0, wx1), max(wy0, wy1))
+                debug_log_action(
+                    "CANVAS-BOX-SELECT",
+                    f"Box-selected {len(self.selected_node_ids)} node(s)",
+                    f"nodes={sorted(self.selected_node_ids)} containers={sorted(self.selected_container_ids)}",
+                )
+                self._notify_current_selection()
+        self._selection_box_world = None
         self._pending_drag_history_entry = None
         self._right_drag_mode = "none"
         self._right_drag_nodes_initial.clear()
@@ -2923,34 +3266,50 @@ class TopologyGraphCanvas(Gtk.Widget):
         return len(self.selected_node_ids) + len(self.selected_container_ids)
 
     def copy_selected(self) -> int:
-        """Copy selected nodes (including attached child Kcontrols), containers, and internal routes to clipboard."""
+        """Copy selected nodes (including attached child Kcontrols/PinFormats), containers, and routes to clipboard."""
         if not self.vm:
             return 0
-        sel_nids: Set[str] = set(self.selected_node_ids)
-        if self.selected_node_id and self.selected_node_id in self.vm.nodes:
+        sel_nids: Set[str] = {
+            nid
+            for nid in self.selected_node_ids
+            if nid in self.vm.nodes and self.vm.nodes[nid].class_category not in ("TestbenchIO", "PinFormat")
+        }
+        if (
+            self.selected_node_id
+            and self.selected_node_id in self.vm.nodes
+            and self.vm.nodes[self.selected_node_id].class_category not in ("TestbenchIO", "PinFormat")
+        ):
             sel_nids.add(self.selected_node_id)
 
-        sel_pids: Set[int] = set(self.selected_container_ids)
+        sel_pids: Set[int] = {pid for pid in self.selected_container_ids if pid in self.vm.containers}
         if self.selected_container_id is not None and self.selected_container_id in self.vm.containers:
             sel_pids.add(self.selected_container_id)
 
         for pid in sel_pids:
             for nid, n in self.vm.nodes.items():
-                if n.pipeline_id == pid and n.class_category != "TestbenchIO":
+                if n.pipeline_id == pid and n.class_category not in ("TestbenchIO", "PinFormat"):
                     sel_nids.add(nid)
 
-        # Include attached child Kcontrols for any selected module node
+        # When copying a multi-node group, also include any pipeline container whose nodes are in the selection
+        copied_pids: Set[int] = set(sel_pids)
+        if len(sel_nids) > 1:
+            for nid in sel_nids:
+                n = self.vm.nodes.get(nid)
+                if n and n.pipeline_id is not None and n.pipeline_id in self.vm.containers:
+                    copied_pids.add(n.pipeline_id)
+
+        # Include attached child Kcontrols and PinFormat callouts for any selected module node
         all_nids = set(sel_nids)
         for cid, cn in self.vm.nodes.items():
             if cn.parent_node_id and cn.parent_node_id in sel_nids and cn.class_category != "TestbenchIO":
                 all_nids.add(cid)
 
-        if not all_nids and not sel_pids:
+        if not all_nids and not copied_pids:
             return 0
 
         TopologyGraphCanvas._clipboard_containers = [
             self.vm.containers[pid].clone()
-            for pid in sorted(sel_pids)
+            for pid in sorted(copied_pids)
             if pid in self.vm.containers
         ]
         TopologyGraphCanvas._clipboard_nodes = [
@@ -2964,7 +3323,36 @@ class TopologyGraphCanvas(Gtk.Widget):
             if e.source_node in all_nids and e.sink_node in all_nids
         ]
         TopologyGraphCanvas._clipboard_paste_count = 0
-        return len(TopologyGraphCanvas._clipboard_nodes) + len(TopologyGraphCanvas._clipboard_containers)
+
+        # Also serialize the copied topology objects into the system Gdk.Clipboard as .conf text
+        try:
+            from .serializer import serialize_config_node
+
+            conf_blocks: List[str] = []
+            for c_clip in TopologyGraphCanvas._clipboard_containers:
+                if c_clip.config:
+                    conf_blocks.append(serialize_config_node(c_clip.config))
+            for n_clip in TopologyGraphCanvas._clipboard_nodes:
+                if n_clip.class_category != "PinFormat" and n_clip.config:
+                    conf_blocks.append(serialize_config_node(n_clip.config))
+            for e_clip in TopologyGraphCanvas._clipboard_edges:
+                if e_clip.config and e_clip.config.key == "Object.Base.route":
+                    conf_blocks.append(serialize_config_node(e_clip.config))
+            clip_text = "\n".join(b.rstrip() for b in conf_blocks if b.strip())
+            if clip_text:
+                sys_clip = self.get_clipboard()
+                if sys_clip is not None:
+                    sys_clip.set(clip_text)
+        except Exception:
+            pass
+
+        primary_cnt = len(sel_nids)
+        debug_log_action(
+            "CANVAS-COPY",
+            f"Copied {primary_cnt} node(s) and {len(copied_pids)} container(s) to clipboard",
+            f"nodes={sorted(sel_nids)} containers={sorted(copied_pids)} routes={len(TopologyGraphCanvas._clipboard_edges)}",
+        )
+        return primary_cnt if primary_cnt > 0 else len(TopologyGraphCanvas._clipboard_containers)
 
     def cut_selected(self) -> int:
         """Cut selected objects to clipboard and delete them in a single Undo step."""
@@ -3039,7 +3427,7 @@ class TopologyGraphCanvas(Gtk.Widget):
             nid_map[n_orig.id] = new_id
             new_nids.add(new_id)
 
-        # 3. Second pass: clone child Kcontrol nodes attached to copied parents (or standalone copied controls)
+        # 3. Second pass: clone child Kcontrol and PinFormat nodes attached to copied parents
         for c_orig in child_nodes:
             c_new = c_orig.clone()
             new_parent_id = nid_map.get(c_orig.parent_node_id or "", c_orig.parent_node_id)
@@ -3047,8 +3435,12 @@ class TopologyGraphCanvas(Gtk.Widget):
             parent_node = self.vm.nodes.get(new_parent_id or "")
             if parent_node:
                 c_new.pipeline_id = parent_node.pipeline_id
-            suffix = c_orig.id.split(".ctl.")[-1] if ".ctl." in c_orig.id else c_orig.instance_id
-            base_cid = f"{new_parent_id}.ctl.{suffix}" if new_parent_id else f"{c_orig.id}_copy"
+            if c_orig.class_category == "PinFormat":
+                suffix = c_orig.id.split(".pinfmt.")[-1] if ".pinfmt." in c_orig.id else "fmt"
+                base_cid = f"{new_parent_id}.pinfmt.{suffix}" if new_parent_id else f"{c_orig.id}_copy"
+            else:
+                suffix = c_orig.id.split(".ctl.")[-1] if ".ctl." in c_orig.id else c_orig.instance_id
+                base_cid = f"{new_parent_id}.ctl.{suffix}" if new_parent_id else f"{c_orig.id}_copy"
             new_cid = base_cid
             k = 2
             while new_cid in self.vm.nodes:
@@ -3059,7 +3451,8 @@ class TopologyGraphCanvas(Gtk.Widget):
             c_new.y += offset
             self.vm.nodes[new_cid] = c_new
             nid_map[c_orig.id] = new_cid
-            new_nids.add(new_cid)
+            if c_orig.class_category != "PinFormat":
+                new_nids.add(new_cid)
 
         # 4. Reconstruct internal routes between pasted nodes
         for idx, e_orig in enumerate(TopologyGraphCanvas._clipboard_edges):
@@ -3089,11 +3482,17 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.selected_container_ids = set(new_pids)
         self.selected_container_id = next(iter(new_pids), None)
         self.vm.dirty = True
+        self.vm.graph_structure_modified = True
+        debug_log_action(
+            "CANVAS-PASTE",
+            f"Pasted {len(new_nids)} node(s) and {len(new_pids)} container(s) from clipboard",
+            f"nodes={sorted(new_nids)} containers={sorted(new_pids)}",
+        )
         self._notify_current_selection()
         if self.on_graph_modified:
             self.on_graph_modified()
         self.queue_draw()
-        return len(new_nids) + len(new_pids)
+        return len(new_nids) if new_nids else len(new_pids)
 
     def zoom_in(self) -> None:
         """Zoom in on the center of the graph canvas."""
