@@ -148,6 +148,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         on_kcontrol_changed: Optional[Callable[[GraphNode], None]] = None,
         on_probe_tap_toggled: Optional[Callable[[Optional[str], int, str], None]] = None,
         on_testbench_io_changed: Optional[Callable[[List[int]], None]] = None,
+        on_view_source_requested: Optional[Callable[[str, str, Optional[str], Optional[str]], None]] = None,
     ):
         super().__init__()
         self.set_hexpand(True)
@@ -160,6 +161,8 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.on_kcontrol_changed = on_kcontrol_changed
         self.on_probe_tap_toggled = on_probe_tap_toggled
         self.on_testbench_io_changed = on_testbench_io_changed
+        self.on_view_source_requested = on_view_source_requested
+        self._active_context_popover: Optional[Gtk.Popover] = None
         self.live_node_telemetry: Dict[str, Dict[str, Any]] = {}
         self.active_probe_node_id: Optional[str] = None
         self.history = UndoRedoManager(on_history_changed=on_history_changed)
@@ -3042,7 +3045,265 @@ class TopologyGraphCanvas(Gtk.Widget):
         self._right_drag_nodes_initial.clear()
         self._right_drag_containers_initial.clear()
         self.set_cursor(None)
+        if not moved and self.vm:
+            sx, sy = self._drag_start_screen
+            wx, wy = self._drag_start_world
+            hit_nid = self._hit_test_node(wx, wy)
+            hit_pid = (
+                self.vm.nodes[hit_nid].pipeline_id
+                if (hit_nid and hit_nid in self.vm.nodes)
+                else self._hit_test_container(wx, wy)
+            )
+            if hit_nid is not None:
+                if hit_nid not in self.selected_node_ids:
+                    self.select_node(hit_nid)
+                self._open_node_context_menu(sx, sy, node_id=hit_nid, container_id=hit_pid)
+            elif hit_pid is not None:
+                if hit_pid not in self.selected_container_ids:
+                    self.selected_node_id = None
+                    self.selected_node_ids.clear()
+                    self.selected_edge_id = None
+                    self.selected_container_ids = {hit_pid}
+                    self.selected_container_id = hit_pid
+                    self._notify_current_selection()
+                self._open_node_context_menu(sx, sy, node_id=None, container_id=hit_pid)
         self.queue_draw()
+
+    def resolve_node_source_targets(
+        self,
+        node_id: Optional[str] = None,
+        container_id: Optional[int] = None,
+    ) -> List[Tuple[str, str, str, Optional[str], Optional[str]]]:
+        """Resolve available source targets for a right-clicked node or pipeline container.
+
+        Returns a list of (menu_label, pane_kind, primary_id, secondary_id, search_hint).
+        """
+        targets: List[Tuple[str, str, str, Optional[str], Optional[str]]] = []
+        seen_keys: Set[Tuple[str, str]] = set()
+        if not self.vm:
+            return targets
+
+        def _add_target(
+            label: str,
+            pane_kind: str,
+            primary_id: str,
+            secondary_id: Optional[str] = None,
+            search_hint: Optional[str] = None,
+        ) -> None:
+            if not primary_id:
+                return
+            k = (pane_kind, os.path.abspath(primary_id) if os.path.isfile(primary_id) else primary_id)
+            if k in seen_keys:
+                return
+            seen_keys.add(k)
+            targets.append((label, pane_kind, primary_id, secondary_id, search_hint))
+
+        node = self.vm.nodes.get(node_id or "") if node_id else None
+        if node is not None:
+            if node.class_category == "Widget":
+                if node.class_name == "pipeline" and node.pipeline_id in self.vm.containers:
+                    cont = self.vm.containers[node.pipeline_id]
+                    if self.workspace and cont.class_name in self.workspace.pipeline_classes:
+                        pdef = self.workspace.pipeline_classes[cont.class_name]
+                        pfname = os.path.basename(pdef.source_file) if pdef.source_file else f"{cont.class_name}.conf"
+                        _add_target(f"View Source ({pfname})", "pipeline", cont.class_name, None, None)
+                elif self.workspace and node.class_name in self.workspace.processing_modules:
+                    cdef = self.workspace.processing_modules[node.class_name]
+                    mfname = os.path.basename(cdef.source_file) if cdef.source_file else f"{node.class_name}.conf"
+                    _add_target(
+                        f"View Source ({mfname})",
+                        "module",
+                        node.class_name,
+                        None,
+                        f'Class.Widget."{node.class_name}"',
+                    )
+                if node.pipeline_id in self.vm.containers:
+                    cont = self.vm.containers[node.pipeline_id]
+                    if self.workspace and cont.class_name in self.workspace.pipeline_classes:
+                        pdef = self.workspace.pipeline_classes[cont.class_name]
+                        pfname = os.path.basename(pdef.source_file) if pdef.source_file else f"{cont.class_name}.conf"
+                        lbl = f"View Source ({pfname})" if not targets else f"View Pipeline Source ({pfname})"
+                        _add_target(
+                            lbl,
+                            "pipeline",
+                            cont.class_name,
+                            None,
+                            f'{node.class_name}."{node.instance_id}"',
+                        )
+            elif node.class_category == "PinFormat":
+                fmt_key = "output_audio_format" if "out" in node.class_name else "input_audio_format"
+                if self.vm.view_kind == "module":
+                    mname = self.vm.title.replace("Class.Widget.", "").strip()
+                    mfname = os.path.basename(self.vm.source_file) if self.vm.source_file else f"{mname}.conf"
+                    _add_target(f"View Source ({mfname})", "module", mname, None, fmt_key)
+                elif self.vm.view_kind == "pipeline":
+                    pname = self.vm.title.replace("Class.Pipeline.", "").strip()
+                    pfname = os.path.basename(self.vm.source_file) if self.vm.source_file else f"{pname}.conf"
+                    _add_target(f"View Source ({pfname})", "pipeline", pname, None, node.parent_node_id or fmt_key)
+                bkey = f"Base.{node.class_name}"
+                if self.workspace and bkey in self.workspace.base_classes:
+                    bdef = self.workspace.base_classes[bkey]
+                    bfname = os.path.basename(bdef.source_file) if bdef.source_file else f"{node.class_name}.conf"
+                    lbl = f"View Source ({bfname})" if not targets else f"View Format Class Source ({bfname})"
+                    _add_target(lbl, "base_class", bkey, None, None)
+            elif node.class_category == "Control":
+                inc_rel = (node.config.get_scalar("included_param_file") or "").strip()
+                if inc_rel and self.workspace:
+                    inc_abs = (
+                        inc_rel
+                        if os.path.isabs(inc_rel)
+                        else os.path.join(self.workspace.root_dir, inc_rel)
+                    )
+                    if os.path.isfile(inc_abs):
+                        _add_target(
+                            f"View Source ({os.path.basename(inc_abs)})",
+                            "file",
+                            inc_abs,
+                            None,
+                            None,
+                        )
+                pnode = self.vm.nodes.get(node.parent_node_id or "") if node.parent_node_id else None
+                if pnode is not None:
+                    if pnode.pipeline_id in self.vm.containers:
+                        cont = self.vm.containers[pnode.pipeline_id]
+                        if self.workspace and cont.class_name in self.workspace.pipeline_classes:
+                            pdef = self.workspace.pipeline_classes[cont.class_name]
+                            pfname = os.path.basename(pdef.source_file) if pdef.source_file else f"{cont.class_name}.conf"
+                            lbl = f"View Source ({pfname})" if not targets else f"View Pipeline Source ({pfname})"
+                            _add_target(lbl, "pipeline", cont.class_name, None, f"Control.{node.class_name}")
+                    if self.workspace and pnode.class_name in self.workspace.processing_modules:
+                        cdef = self.workspace.processing_modules[pnode.class_name]
+                        mfname = os.path.basename(cdef.source_file) if cdef.source_file else f"{pnode.class_name}.conf"
+                        lbl = f"View Source ({mfname})" if not targets else f"View Module Source ({mfname})"
+                        _add_target(lbl, "module", pnode.class_name, None, f"Control.{node.class_name}")
+                bkey = f"Control.{node.class_name}"
+                if self.workspace and bkey in self.workspace.base_classes:
+                    bdef = self.workspace.base_classes[bkey]
+                    bfname = os.path.basename(bdef.source_file) if bdef.source_file else f"{node.class_name}.conf"
+                    lbl = f"View Source ({bfname})" if not targets else f"View Control Class Source ({bfname})"
+                    _add_target(lbl, "base_class", bkey, None, None)
+            else:
+                bkey = f"{node.class_category}.{node.class_name}"
+                if self.workspace and bkey in self.workspace.base_classes:
+                    bdef = self.workspace.base_classes[bkey]
+                    bfname = os.path.basename(bdef.source_file) if bdef.source_file else f"{node.class_name}.conf"
+                    _add_target(f"View Source ({bfname})", "base_class", bkey, None, None)
+                pnode = self.vm.nodes.get(node.parent_node_id or "") if node.parent_node_id else None
+                if pnode is not None and self.workspace and pnode.class_name in self.workspace.processing_modules:
+                    cdef = self.workspace.processing_modules[pnode.class_name]
+                    mfname = os.path.basename(cdef.source_file) if cdef.source_file else f"{pnode.class_name}.conf"
+                    lbl = f"View Source ({mfname})" if not targets else f"View Module Source ({mfname})"
+                    _add_target(lbl, "module", pnode.class_name, None, None)
+
+        if container_id is not None and container_id in self.vm.containers:
+            cont = self.vm.containers[container_id]
+            if self.workspace and cont.class_name in self.workspace.pipeline_classes:
+                pdef = self.workspace.pipeline_classes[cont.class_name]
+                pfname = os.path.basename(pdef.source_file) if pdef.source_file else f"{cont.class_name}.conf"
+                lbl = f"View Source ({pfname})" if not targets else f"View Pipeline Source ({pfname})"
+                _add_target(lbl, "pipeline", cont.class_name, None, None)
+
+        if self.vm.source_file and os.path.isfile(self.vm.source_file):
+            tfname = os.path.basename(self.vm.source_file)
+            kind = "topology" if self.vm.view_kind == "topology" else (
+                self.vm.view_kind if self.vm.view_kind in ("module", "pipeline", "base_class") else "file"
+            )
+            prim_id = self.vm.source_file
+            if kind == "module":
+                prim_id = self.vm.title.replace("Class.Widget.", "").strip() or self.vm.source_file
+            elif kind == "pipeline":
+                prim_id = self.vm.title.replace("Class.Pipeline.", "").strip() or self.vm.source_file
+            elif kind == "base_class":
+                prim_id = self.vm.title.replace("Class.", "").strip() or self.vm.source_file
+            lbl = f"View Source ({tfname})" if not targets else f"View Topology Source ({tfname})"
+            hint = node.class_name if node else (
+                self.vm.containers[container_id].class_name
+                if (container_id is not None and container_id in self.vm.containers)
+                else None
+            )
+            _add_target(lbl, kind, prim_id, None, hint)
+
+        return targets
+
+    def _open_node_context_menu(
+        self,
+        sx: float,
+        sy: float,
+        node_id: Optional[str] = None,
+        container_id: Optional[int] = None,
+    ) -> Optional[Gtk.Popover]:
+        """Open a right-click context menu Popover at (sx, sy) for a node or pipeline container."""
+        if not self.vm:
+            return None
+        if self._active_context_popover is not None:
+            try:
+                self._active_context_popover.popdown()
+            except Exception:
+                pass
+            self._active_context_popover = None
+
+        targets = self.resolve_node_source_targets(node_id=node_id, container_id=container_id)
+        if not targets:
+            return None
+
+        pop = Gtk.Popover()
+        pop.set_parent(self)
+        rect = Gdk.Rectangle()
+        rect.x = int(sx)
+        rect.y = int(sy)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        node = self.vm.nodes.get(node_id or "") if node_id else None
+        if node is not None:
+            hdr_text = f"{node.title} ({node.class_name})"
+        elif container_id is not None and container_id in self.vm.containers:
+            cont = self.vm.containers[container_id]
+            hdr_text = f"Pipeline {container_id}: {cont.class_name}"
+        else:
+            hdr_text = self.vm.title
+
+        hdr = Gtk.Label(label=hdr_text, xalign=0.0)
+        hdr.add_css_class("heading")
+        box.append(hdr)
+
+        for idx, (menu_lbl, p_kind, p_id, s_id, s_hint) in enumerate(targets):
+            btn = Gtk.Button(label=f"📄 {menu_lbl}")
+            if idx == 0:
+                btn.add_css_class("suggested-action")
+
+            def _on_view_source_clicked(
+                _b: Gtk.Button,
+                pk: str = p_kind,
+                pid: str = p_id,
+                sid: Optional[str] = s_id,
+                sh: Optional[str] = s_hint,
+            ) -> None:
+                pop.popdown()
+                if self.on_view_source_requested:
+                    self.on_view_source_requested(pk, pid, sid, sh)
+
+            btn.connect("clicked", _on_view_source_clicked)
+            box.append(btn)
+
+        pop.set_child(box)
+        self._active_context_popover = pop
+
+        def _on_closed(p: Gtk.Popover) -> None:
+            if self._active_context_popover is p:
+                self._active_context_popover = None
+            p.unparent()
+
+        pop.connect("closed", _on_closed)
+        pop.popup()
+        return pop
 
     def _on_motion_enter(self, controller: Gtk.EventControllerMotion, sx: float, sy: float) -> None:
         self._pointer_pos = (sx, sy)
@@ -4166,13 +4427,37 @@ class TopologyGraphCanvas(Gtk.Widget):
             if n.class_category == "TestbenchIO"
             and str(n.config.get_scalar("side", "left")).lower() == opp_side
         ]
+        opp_nodes.sort(key=lambda n: (n.y, n.x))
+        connected_opp: List[GraphNode] = []
         for n in opp_nodes:
             parent = self.vm.nodes.get(n.parent_node_id or "")
             parent_pid = parent.pipeline_id if parent else None
             is_connected = parent_pid in active_pids_set if parent_pid is not None else bool(
                 self._parse_pipe_ids(str(n.config.get_scalar("target_pipelines", ""))) & active_pids_set
             )
-            n.config.set_scalar("enabled", "true" if is_connected else "false", origin="instance")
+            if is_connected:
+                connected_opp.append(n)
+
+        # If any already-enabled opposite endpoint is connected to the active selection,
+        # keep the user's opposite selection subset; otherwise enable all connected opposite endpoints.
+        already_enabled_connected = [
+            n for n in connected_opp
+            if str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        target_enabled_opp_ids = (
+            {n.id for n in already_enabled_connected}
+            if (additive and already_enabled_connected)
+            else {n.id for n in connected_opp}
+        )
+        for n in opp_nodes:
+            n.config.set_scalar(
+                "enabled",
+                "true" if n.id in target_enabled_opp_ids else "false",
+                origin="instance",
+            )
+
+        from .serializer import _extract_active_pipeline_ids
+        effective_pids = _extract_active_pipeline_ids(self.vm)
 
         self.select_node(active_nid, additive=additive)
         if additive:
@@ -4185,10 +4470,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         debug_log_action(
             "CANVAS-TB-MULTI" if additive else "CANVAS-TB-RADIO",
             f"Enabled TestbenchIO {enabled_titles}",
-            f"clicked={active_nid} side={active_side} additive={additive} target_pipelines={combined_pids}",
+            f"clicked={active_nid} side={active_side} additive={additive} target_pipelines={effective_pids}",
         )
         if self.on_testbench_io_changed:
-            self.on_testbench_io_changed(list(combined_pids))
+            self.on_testbench_io_changed(list(effective_pids))
         self.queue_draw()
 
     @staticmethod

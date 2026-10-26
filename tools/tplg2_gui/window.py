@@ -63,6 +63,7 @@ from .testbench import (
     TestbenchRunner,
     TestbenchTelemetry,
     WaveformSnapshotWidget,
+    SchedulingTelemetryWidget,
 )
 from .text_editor import TopologyTextEditor
 
@@ -85,6 +86,7 @@ class GraphTabPage:
     text_needs_refresh_from_graph: bool = True
     stream_waveforms: Dict[str, Tuple[List[float], List[float]]] = field(default_factory=dict)
     last_tb_summary: str = ""
+    last_telemetry: Optional[TestbenchTelemetry] = None
 
 
 class Topology2MainWindow(Gtk.ApplicationWindow):
@@ -158,6 +160,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_kcontrol_changed=self._on_canvas_kcontrol_changed,
             on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
             on_testbench_io_changed=self._on_canvas_testbench_io_changed,
+            on_view_source_requested=self._on_view_source_requested,
         )
 
         self._build_header_bar()
@@ -718,6 +721,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_item_selected=self._on_left_pane_item_selected,
             on_add_module_requested=self._on_add_module_requested,
             on_add_pipeline_requested=self._on_add_pipeline_requested,
+            on_view_source_requested=self._on_view_source_requested,
         )
         self.left_panel.vpaned_main.set_position(self._saved_left_vpaned_main_pos)
         self.left_panel.vpaned_top.set_position(self._saved_left_vpaned_top_pos)
@@ -837,9 +841,96 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         wf_pane_box.append(wf_body_box)
 
+        # Page 2 of Bottom Waveform Notebook: Scheduling & Module Buffer Telemetry Graph
+        sched_pane_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        sched_pane_box.set_margin_start(4)
+        sched_pane_box.set_margin_end(4)
+        sched_pane_box.set_margin_top(3)
+        sched_pane_box.set_margin_bottom(3)
+
+        sched_toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.sched_status_lbl = Gtk.Label(
+            label="Scheduling (Y: Core ID × X: Time) & Module Buffers [IDLE]",
+            xalign=0.0,
+        )
+        self.sched_status_lbl.add_css_class("heading")
+        self.sched_status_lbl.set_ellipsize(Pango.EllipsizeMode.END)
+        self.sched_status_lbl.set_hexpand(True)
+        sched_toolbar.append(self.sched_status_lbl)
+
+        self.sched_expanded_btn = Gtk.ToggleButton(label="🔬 Expanded Slices")
+        self.sched_expanded_btn.set_active(True)
+        self.sched_expanded_btn.set_tooltip_text(
+            "Magnify sub-millisecond pipeline & module execution slices within each 1ms LL tick for readability "
+            "(uncheck for True 1:1 microsecond scale)"
+        )
+        self.sched_expanded_btn.connect("toggled", self._on_sched_expanded_toggled)
+        sched_toolbar.append(self.sched_expanded_btn)
+
+        self.sched_zoom_lbl = Gtk.Label(label="Win: 10.00/10.0 ms (1.0×, Expanded Slices)")
+        self.sched_zoom_lbl.add_css_class("monospace")
+        sched_toolbar.append(self.sched_zoom_lbl)
+
+        btn_sched_zout = Gtk.Button(label="🔍−")
+        btn_sched_zout.set_tooltip_text("Zoom Out scheduling time axis (or Mouse Wheel Down on timeline)")
+        btn_sched_zout.connect("clicked", lambda _b: self.sched_telemetry_widget.zoom_out_time())
+        sched_toolbar.append(btn_sched_zout)
+
+        btn_sched_zin = Gtk.Button(label="🔍+")
+        btn_sched_zin.set_tooltip_text("Zoom In scheduling time axis (or Mouse Wheel Up on timeline)")
+        btn_sched_zin.connect("clicked", lambda _b: self.sched_telemetry_widget.zoom_in_time())
+        sched_toolbar.append(btn_sched_zin)
+
+        btn_sched_zfit = Gtk.Button(label="1:1 Fit")
+        btn_sched_zfit.set_tooltip_text("Reset scheduling timeline zoom & pan (or Double-Click timeline)")
+        btn_sched_zfit.connect("clicked", lambda _b: self.sched_telemetry_widget.reset_zoom())
+        sched_toolbar.append(btn_sched_zfit)
+
+        btn_sched_refresh = Gtk.Button(label="⟳ Refresh")
+        btn_sched_refresh.set_tooltip_text("Poll live scheduling & buffer telemetry from sof-testbench4")
+        btn_sched_refresh.connect("clicked", self._on_refresh_telemetry_clicked)
+        sched_toolbar.append(btn_sched_refresh)
+
+        sched_pane_box.append(sched_toolbar)
+
+        sched_body_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        sched_body_box.set_hexpand(True)
+        sched_body_box.set_vexpand(True)
+
+        self.sched_telemetry_widget = SchedulingTelemetryWidget(
+            on_zoom_changed=self._on_sched_zoom_changed
+        )
+        self.sched_telemetry_widget.set_size_request(-1, 185)
+        sched_body_box.append(self.sched_telemetry_widget)
+
+        self.sched_vscrollbar = Gtk.Scrollbar.new(
+            Gtk.Orientation.VERTICAL,
+            self.sched_telemetry_widget.v_adj,
+        )
+        self.sched_vscrollbar.set_vexpand(True)
+        self.sched_vscrollbar.set_tooltip_text(
+            "Scroll vertically through module buffer statistics rows"
+        )
+        sched_body_box.append(self.sched_vscrollbar)
+
+        sched_pane_box.append(sched_body_box)
+
+        self.waveform_notebook = Gtk.Notebook()
+        self.waveform_notebook.set_hexpand(True)
+        self.waveform_notebook.set_vexpand(True)
+        self.waveform_notebook.set_show_border(False)
+        self.waveform_notebook.append_page(
+            wf_pane_box,
+            Gtk.Label(label="📈 Waveforms"),
+        )
+        self.waveform_notebook.append_page(
+            sched_pane_box,
+            Gtk.Label(label="⏱ Scheduling & Buffers"),
+        )
+
         wf_frame = Gtk.Frame()
         wf_frame.add_css_class("sub-panel-frame")
-        wf_frame.set_child(wf_pane_box)
+        wf_frame.set_child(self.waveform_notebook)
         self.center_vpaned.set_end_child(wf_frame)
 
         center_box.append(self.center_vpaned)
@@ -1576,7 +1667,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 enabled_tb_io_ids = tinfo.get("enabled_tb_io_ids")
 
                 tab: Optional[GraphTabPage] = None
-                if tab_key.startswith("file:"):
+                if tab_key.startswith("source:"):
+                    tab = self.open_source_in_tab(pane_kind or "file", primary_id or source_file, secondary_id)
+                elif tab_key.startswith("file:"):
                     fpath = primary_id if (primary_id and os.path.isfile(primary_id)) else source_file
                     if fpath and os.path.isfile(fpath):
                         tab = self.open_conf_file_in_tab(fpath)
@@ -1652,17 +1745,24 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         return False
 
     @staticmethod
-    def _format_tab_title(vm: Optional[GraphViewModel], fallback: str = "Untitled.conf") -> str:
+    def _format_tab_title(
+        vm: Optional[GraphViewModel],
+        fallback: str = "Untitled.conf",
+        is_source_mode: bool = False,
+    ) -> str:
         if vm is None:
             return fallback
-        icon_map = {
-            "module": "🧩",
-            "pipeline": "⛓",
-            "function_topology": "🔀",
-            "topology": "🎛",
-            "base_class": "📦",
-        }
-        icon = icon_map.get(vm.view_kind, "📄")
+        if is_source_mode:
+            icon = "📄"
+        else:
+            icon_map = {
+                "module": "🧩",
+                "pipeline": "⛓",
+                "function_topology": "🔀",
+                "topology": "🎛",
+                "base_class": "📦",
+            }
+            icon = icon_map.get(vm.view_kind, "📄")
         base = os.path.basename(vm.source_file) if vm.source_file else vm.title
         # Include variant suffix if viewing a specific topology variant
         if vm.view_kind == "topology" and "[" in vm.title and "]" in vm.title:
@@ -1676,7 +1776,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if tab is None:
             return
         vm = tab.canvas.vm
-        tab.title_lbl.set_text(self._format_tab_title(vm, tab.primary_id))
+        is_src = tab.tab_key.startswith("source:") or tab.mode_switch_btn.get_active()
+        tab.title_lbl.set_text(self._format_tab_title(vm, tab.primary_id, is_source_mode=is_src))
         if vm is not None:
             tip = f"{vm.title}\nFile: {vm.source_file or '(Unsaved)'}"
             tab.tab_box.set_tooltip_text(tip)
@@ -1709,6 +1810,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_kcontrol_changed=self._on_canvas_kcontrol_changed,
             on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
             on_testbench_io_changed=self._on_canvas_testbench_io_changed,
+            on_view_source_requested=self._on_view_source_requested,
         )
         new_canvas.set_graph(vm, self.workspace)
 
@@ -1724,7 +1826,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         view_stack.set_visible_child_name("graph")
 
         tab_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        title_lbl = Gtk.Label(label=self._format_tab_title(vm, primary_id))
+        title_lbl = Gtk.Label(
+            label=self._format_tab_title(vm, primary_id, is_source_mode=tab_key.startswith("source:"))
+        )
         tab_box.append(title_lbl)
 
         mode_switch_btn = Gtk.ToggleButton(label="</> Text")
@@ -1774,6 +1878,119 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self._schedule_ui_state_save()
         return tab_page
 
+    def _on_view_source_requested(
+        self,
+        pane_kind: str,
+        primary_id: str,
+        secondary_id: Optional[str] = None,
+        search_hint: Optional[str] = None,
+    ) -> None:
+        """Handle 'View Source' right-click context menu action from Graph Canvas or Left Panel."""
+        self.open_source_in_tab(pane_kind, primary_id, secondary_id, search_hint)
+
+    def open_source_in_tab(
+        self,
+        pane_kind: str,
+        primary_id: str,
+        secondary_id: Optional[str] = None,
+        search_hint: Optional[str] = None,
+    ) -> Optional[GraphTabPage]:
+        """Open a source editor tab in the Main Window notebook for the requested item/file,
+        or switch to and display its existing notebook tab if the source file is already open.
+        """
+        ws = self._ensure_workspace()
+        source_file = ""
+        if pane_kind == "module" and primary_id in ws.processing_modules:
+            source_file = ws.processing_modules[primary_id].source_file
+        elif pane_kind == "pipeline" and primary_id in ws.pipeline_classes:
+            source_file = ws.pipeline_classes[primary_id].source_file
+        elif pane_kind == "base_class" and primary_id in ws.base_classes:
+            source_file = ws.base_classes[primary_id].source_file
+        elif pane_kind in ("topology", "file", "source") and primary_id:
+            source_file = primary_id
+        elif os.path.isfile(primary_id):
+            source_file = primary_id
+
+        abs_path = os.path.abspath(source_file) if source_file else ""
+        source_tab_key = (
+            f"source:{abs_path}"
+            if abs_path
+            else f"source:{pane_kind}:{primary_id}:{secondary_id or ''}"
+        )
+
+        # Check if a source tab (or a tab already in text/source mode) for this file is already open
+        for existing in self.graph_tabs:
+            existing_src = (
+                os.path.abspath(existing.canvas.vm.source_file)
+                if (existing.canvas.vm and existing.canvas.vm.source_file)
+                else ""
+            )
+            if existing.tab_key == source_tab_key or (
+                abs_path
+                and existing_src == abs_path
+                and (
+                    existing.tab_key.startswith("source:")
+                    or existing.view_stack.get_visible_child_name() == "text"
+                    or existing.mode_switch_btn.get_active()
+                )
+            ):
+                pnum = self.graph_notebook.page_num(existing.view_stack)
+                if pnum >= 0:
+                    self.graph_notebook.set_current_page(pnum)
+                if not existing.mode_switch_btn.get_active():
+                    existing.mode_switch_btn.set_active(True)
+                if search_hint:
+                    existing.text_editor.scroll_to_hint(search_hint)
+                if not self._restoring_session_tabs:
+                    self._sync_ui_to_tab(existing)
+                    self._capture_open_tabs_state()
+                    self._schedule_ui_state_save()
+                self.status_lbl.set_text(
+                    f"Switched to open source tab: {os.path.basename(abs_path or primary_id)}"
+                )
+                return existing
+
+        try:
+            if pane_kind == "base_class" and primary_id in ws.base_classes:
+                vm = ws.build_graph_for_base_class(primary_id)
+            elif pane_kind == "module" and primary_id in ws.processing_modules:
+                vm = ws.build_graph_for_module(primary_id)
+            elif pane_kind == "pipeline" and primary_id in ws.pipeline_classes:
+                vm = ws.build_graph_for_pipeline(primary_id)
+            elif pane_kind == "topology" and abs_path and os.path.isfile(abs_path):
+                variant = None
+                if secondary_id:
+                    for entry in ws.machine_topologies:
+                        if os.path.abspath(entry.conf_path) == abs_path:
+                            variant = next((v for v in entry.variants if v.output_name == secondary_id), None)
+                            break
+                vm = ws.build_graph_for_topology(abs_path, variant)
+            elif abs_path and os.path.isfile(abs_path):
+                vm = ws.build_graph_for_arbitrary_conf_file(abs_path)
+            else:
+                return None
+
+            tab = self._open_or_switch_graph_tab(
+                tab_key=source_tab_key,
+                pane_kind=pane_kind,
+                primary_id=primary_id,
+                secondary_id=secondary_id,
+                vm=vm,
+                is_untitled=False,
+            )
+            if not tab.mode_switch_btn.get_active():
+                tab.mode_switch_btn.set_active(True)
+            if search_hint:
+                tab.text_editor.scroll_to_hint(search_hint)
+            self.status_lbl.set_text(
+                f"Opened source tab: {os.path.basename(abs_path or primary_id)}"
+            )
+            return tab
+        except Exception as exc:
+            self.append_log(f"Error opening source for {primary_id}: {exc}")
+            self.status_lbl.set_text(f"Error opening source: {exc}")
+            return None
+
     def _refresh_tab_text_from_graph(self, tab_page: GraphTabPage) -> None:
         """Populate tab_page.text_editor from its current GraphViewModel."""
         vm = tab_page.canvas.vm
@@ -1806,6 +2023,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             tab_page.view_stack.set_visible_child_name("text")
             tab_page.text_editor.text_view.grab_focus()
             vm = tab_page.canvas.vm
+            tab_page.title_lbl.set_text(
+                self._format_tab_title(vm, tab_page.primary_id, is_source_mode=True)
+            )
             self.status_lbl.set_text(
                 f"Text Editor mode: {vm.title if vm else tab_page.primary_id} "
                 f"(Edit .conf text directly — changes sync to diagram)"
@@ -1819,6 +2039,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             if tab_page.text_editor.is_modified_in_text:
                 tab_page.text_editor.commit_to_diagram()
             tab_page.view_stack.set_visible_child_name("graph")
+            tab_page.title_lbl.set_text(
+                self._format_tab_title(
+                    tab_page.canvas.vm,
+                    tab_page.primary_id,
+                    is_source_mode=tab_page.tab_key.startswith("source:"),
+                )
+            )
             if not self._restoring_session_tabs:
                 self._sync_ui_to_tab(tab_page)
         if not self._restoring_session_tabs:
@@ -1988,6 +2215,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.right_inspector.set_node_config(vm.title, vm.root_config, vm.source_file)
 
         self._update_waveform_stream_labels()
+        if hasattr(self, "sched_telemetry_widget"):
+            tab_telem = tab.last_telemetry if tab.last_telemetry is not None else self.last_telemetry
+            self.sched_telemetry_widget.set_telemetry(tab_telem)
+            self._update_sched_status_label(tab_telem)
         self.status_lbl.set_text(
             f"Viewing {vm.title} ({len(vm.nodes)} nodes, {len(vm.edges)} routes)"
         )
@@ -2416,24 +2647,37 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         raw_sinks.sort(key=_node_sort_key)
         return ([n for _, n in raw_sources], [n for _, n in raw_sinks])
 
+    def _get_ordered_active_io_keys(
+        self,
+        vm_override: Optional[GraphViewModel] = None,
+    ) -> Tuple[List[str], List[str]]:
+        """Return (active_in_keys, active_out_keys) for the currently enabled Input and Output PCMs
+        in `vm_override` (or active vm).
+        """
+        vm = vm_override if vm_override is not None else self.canvas.vm
+        if not vm:
+            return (["in:__default__"], ["out:__default__"])
+        enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes(vm)
+        in_keys = (
+            [f"in:{n.id}" for n in enabled_sources]
+            if enabled_sources
+            else ["in:__default__"]
+        )
+        if self.canvas.active_probe_node_id and self.canvas.active_probe_node_id in vm.nodes:
+            out_keys = [f"out:__probe__:{self.canvas.active_probe_node_id}"]
+        elif enabled_sinks:
+            out_keys = [f"out:{n.id}" for n in enabled_sinks]
+        else:
+            out_keys = ["out:__default__"]
+        return (in_keys, out_keys)
+
     def _get_ordered_active_stream_keys(
         self,
         vm_override: Optional[GraphViewModel] = None,
     ) -> List[str]:
-        """Return ordered unique keys for each currently enabled PCM stream in `vm_override` (or active vm)."""
-        vm = vm_override if vm_override is not None else self.canvas.vm
-        if not vm:
-            return []
-        enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes(vm)
-        n_streams = max(len(enabled_sources), len(enabled_sinks))
-        if n_streams == 0:
-            return ["__default__"]
-        keys: List[str] = []
-        for idx in range(n_streams):
-            src_id = enabled_sources[idx].id if idx < len(enabled_sources) else ""
-            snk_id = enabled_sinks[idx].id if idx < len(enabled_sinks) else ""
-            keys.append(src_id or snk_id or f"stream_{idx}")
-        return keys
+        """Return ordered unique keys for each currently enabled Input and Output PCM in `vm_override`."""
+        in_keys, out_keys = self._get_ordered_active_io_keys(vm_override)
+        return in_keys + out_keys
 
     @staticmethod
     def _describe_tb_source_signal(snode: GraphNode) -> Tuple[str, str, str]:
@@ -2569,16 +2813,17 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         vm = self.canvas.vm
         if vm:
             enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes()
-            is_multi = len(enabled_sources) > 1 or len(enabled_sinks) > 1
+            multi_in = len(enabled_sources) > 1
+            multi_out = len(enabled_sinks) > 1
 
             for idx, snode in enumerate(enabled_sources):
                 target_p = str(snode.config.get_scalar("target_pipelines", "")).strip()
                 p_badge = f" (Pipes: {target_p})" if target_p else ""
                 _sk, _ws, s_lbl = self._describe_tb_source_signal(snode)
                 multi_sig_labels.append(s_lbl)
-                if is_multi:
+                if multi_in:
                     multi_in_labels.append(
-                        f"S{idx + 1} IN: {snode.title}{f' ({target_p})' if target_p else ''}"
+                        f"IN {idx + 1}: {snode.title}{f' ({target_p})' if target_p else ''}"
                     )
                 else:
                     io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
@@ -2594,9 +2839,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
             for idx, knode in enumerate(enabled_sinks):
                 target_p = str(knode.config.get_scalar("target_pipelines", "")).strip()
-                if is_multi:
+                if multi_out:
                     multi_out_labels.append(
-                        f"S{idx + 1} OUT: {knode.title}{f' ({target_p})' if target_p else ''}"
+                        f"OUT {idx + 1}: {knode.title}{f' ({target_p})' if target_p else ''}"
                     )
                 else:
                     multi_out_labels.append(f"OUTPUT PCM: {knode.title} ({knode.subtitle})")
@@ -2650,25 +2895,30 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             multi_signal_labels=multi_sig_labels or [sig_label],
         )
 
-        # Align displayed waveforms with the currently selected PCMs on the active Main Graph tab,
-        # removing any deselected PCM waveforms and updating when switching between graph tabs.
+        # Align displayed waveforms with the currently selected Input and Output PCMs on the active
+        # Main Graph tab, removing any deselected PCM waveforms and updating when switching tabs.
         active_tab = self.get_active_tab()
-        active_keys = self._get_ordered_active_stream_keys(vm)
+        in_keys, out_keys = self._get_ordered_active_io_keys(vm)
         if active_tab is not None:
-            active_key_set = set(active_keys)
+            active_key_set = set(in_keys) | set(out_keys)
             for k in list(active_tab.stream_waveforms.keys()):
                 if k not in active_key_set:
                     del active_tab.stream_waveforms[k]
 
         aligned_in_samples: List[List[float]] = []
-        aligned_out_samples: List[List[float]] = []
-        for skey in active_keys:
-            if active_tab is not None and skey in active_tab.stream_waveforms:
-                s_in, s_out = active_tab.stream_waveforms[skey]
+        for ikey in in_keys:
+            if active_tab is not None and ikey in active_tab.stream_waveforms:
+                s_in, _ = active_tab.stream_waveforms[ikey]
                 aligned_in_samples.append(list(s_in))
-                aligned_out_samples.append(list(s_out))
             else:
                 aligned_in_samples.append([])
+
+        aligned_out_samples: List[List[float]] = []
+        for okey in out_keys:
+            if active_tab is not None and okey in active_tab.stream_waveforms:
+                _, s_out = active_tab.stream_waveforms[okey]
+                aligned_out_samples.append(list(s_out))
+            else:
                 aligned_out_samples.append([])
 
         primary_in = aligned_in_samples[0] if aligned_in_samples else []
@@ -2693,19 +2943,47 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             multi_out_samples=aligned_out_samples,
         )
         if not self.waveform_widget.is_realtime:
-            n_streams = max(1, len(aligned_in_samples), len(aligned_out_samples))
+            n_in = max(1, len(aligned_in_samples))
+            n_out = max(1, len(aligned_out_samples))
             has_any_out = any(len(s) > 0 for s in aligned_out_samples)
+            io_tag = f" — {n_in} In / {n_out} Out" if (n_in > 1 or n_out > 1) else ""
             if has_any_out:
-                self.wf_status_lbl.set_text(
-                    f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]"
-                )
+                self.wf_status_lbl.set_text(f"Waveforms [SNAPSHOT{io_tag}]")
             else:
-                self.wf_status_lbl.set_text(
-                    f"Waveforms [IDLE — {n_streams} Streams]" if n_streams > 1 else "Waveforms [IDLE]"
-                )
+                self.wf_status_lbl.set_text(f"Waveforms [IDLE{io_tag}]")
 
     def _on_waveform_zoom_changed(self) -> None:
         self.wf_zoom_lbl.set_text(self.waveform_widget.get_zoom_summary_text())
+
+    def _on_sched_zoom_changed(self) -> None:
+        if hasattr(self, "sched_zoom_lbl") and hasattr(self, "sched_telemetry_widget"):
+            self.sched_zoom_lbl.set_text(self.sched_telemetry_widget.get_zoom_summary_text())
+
+    def _on_sched_expanded_toggled(self, btn: Gtk.ToggleButton) -> None:
+        if hasattr(self, "sched_telemetry_widget"):
+            self.sched_telemetry_widget.set_expanded_tick_mode(btn.get_active())
+
+    def _update_sched_status_label(self, telem: Optional[TestbenchTelemetry]) -> None:
+        if not hasattr(self, "sched_status_lbl"):
+            return
+        if not telem or (
+            telem.total_ll_ticks == 0
+            and not telem.pipelines
+            and not any(c.iterations > 0 or c.in_pins or c.out_pins for c in telem.components)
+        ):
+            self.sched_status_lbl.set_text(
+                "Scheduling (Y: Core ID × X: Time) & Module Buffers [IDLE]"
+            )
+            return
+        active_mods = [
+            c for c in telem.components if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        active_kcps = sum(c.avg_kcps for c in telem.cores if c.enabled)
+        self.sched_status_lbl.set_text(
+            f"Scheduling & Buffers [Ticks={telem.total_ll_ticks} | "
+            f"Pipelines={len(telem.pipelines)} | Modules={len(active_mods)} | "
+            f"Active KCPS={active_kcps}]"
+        )
 
     def _on_wf_trigger_toggled(self, btn: Gtk.ToggleButton) -> None:
         self.waveform_widget.trigger_lock = btn.get_active()
@@ -2838,8 +3116,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                     self._sync_selected_pipelines_to_testbench(force_recreate=True)
                 elif key in ("signal_type", "io_type", "file_path"):
                     active_tab = self.get_active_tab()
-                    if active_tab is not None and node.id in active_tab.stream_waveforms:
-                        del active_tab.stream_waveforms[node.id]
+                    if active_tab is not None:
+                        active_tab.stream_waveforms.pop(f"in:{node.id}", None)
+                        active_tab.stream_waveforms.pop(f"out:{node.id}", None)
+                        active_tab.stream_waveforms.pop(node.id, None)
                     if key == "io_type" and new_val.strip().lower() == "sig_gen" and node.class_name == "testbench-source":
                         if not node.config.get_scalar("signal_type"):
                             node.config.set_scalar(
@@ -3055,7 +3335,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
         hot_reload = bool(hasattr(self, "hot_reload_btn") and self.hot_reload_btn.get_active())
         run_tab = self.get_active_tab()
-        run_keys = self._get_ordered_active_stream_keys(run_tab.canvas.vm if run_tab else None)
+        run_io_keys = self._get_ordered_active_io_keys(run_tab.canvas.vm if run_tab else None)
         self._stop_realtime_waveform_timer()
         self._update_waveform_stream_labels()
         self.wf_status_lbl.set_text("Waveforms [● Running Testbench…]")
@@ -3092,7 +3372,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 channels_out=ch_out,
                 hot_reload_if_alive=hot_reload,
             )
-            GLib.idle_add(self._on_testbench_finished, tb_res, run_tab, run_keys)
+            GLib.idle_add(self._on_testbench_finished, tb_res, run_tab, run_io_keys)
 
         threading.Thread(target=tb_worker, daemon=True).start()
         return False
@@ -3101,32 +3381,38 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self,
         tb_res: TestbenchRunResult,
         run_tab: Optional[GraphTabPage] = None,
-        run_keys: Optional[List[str]] = None,
+        run_io_keys: Optional[Tuple[List[str], List[str]]] = None,
     ) -> bool:
         self.run_tb_btn.set_sensitive(True)
         target_tab = run_tab if run_tab is not None else self.get_active_tab()
         if target_tab is not None and target_tab.canvas.vm is not None:
-            eff_keys = (
-                list(run_keys)
-                if run_keys
-                else self._get_ordered_active_stream_keys(target_tab.canvas.vm)
+            eff_in_keys, eff_out_keys = (
+                run_io_keys
+                if run_io_keys is not None
+                else self._get_ordered_active_io_keys(target_tab.canvas.vm)
             )
-            cur_active_set = set(self._get_ordered_active_stream_keys(target_tab.canvas.vm))
+            cur_in_keys, cur_out_keys = self._get_ordered_active_io_keys(target_tab.canvas.vm)
+            cur_in_set = set(cur_in_keys)
+            cur_out_set = set(cur_out_keys)
             target_tab.stream_waveforms.clear()
-            for idx, skey in enumerate(eff_keys):
-                if skey not in cur_active_set:
+            for idx, ikey in enumerate(eff_in_keys):
+                if ikey not in cur_in_set:
                     continue
                 s_in = (
                     list(tb_res.multi_in_samples[idx])
                     if idx < len(tb_res.multi_in_samples)
                     else (list(tb_res.in_samples) if idx == 0 else [])
                 )
+                target_tab.stream_waveforms[ikey] = (s_in, [])
+            for idx, okey in enumerate(eff_out_keys):
+                if okey not in cur_out_set:
+                    continue
                 s_out = (
                     list(tb_res.multi_out_samples[idx])
                     if idx < len(tb_res.multi_out_samples)
                     else (list(tb_res.out_samples) if idx == 0 else [])
                 )
-                target_tab.stream_waveforms[skey] = (s_in, s_out)
+                target_tab.stream_waveforms[okey] = ([], s_out)
             target_tab.last_tb_summary = tb_res.summary_text
 
         self.append_log(f"$ {tb_res.command}")
@@ -3153,27 +3439,25 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         active_tab = self.get_active_tab()
         if active_tab is target_tab:
-            n_streams = max(
-                1,
-                len(self.waveform_widget.multi_in_samples),
-                len(self.waveform_widget.multi_out_samples),
-            )
+            n_in = max(1, len(self.waveform_widget.multi_in_samples))
+            n_out = max(1, len(self.waveform_widget.multi_out_samples))
+            io_tag = f" — {n_in} In / {n_out} Out" if (n_in > 1 or n_out > 1) else ""
             has_any_out = bool(
                 any(len(s) > 0 for s in self.waveform_widget.multi_out_samples)
             )
             if live_active:
-                self.wf_status_lbl.set_text(
-                    f"Waveforms [● LIVE D0 — {n_streams} Streams]" if n_streams > 1 else "Waveforms [● LIVE D0]"
-                )
+                self.wf_status_lbl.set_text(f"Waveforms [● LIVE D0{io_tag}]")
                 self._start_realtime_waveform_timer()
             else:
                 self.wf_status_lbl.set_text(
-                    (f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]")
+                    f"Waveforms [SNAPSHOT{io_tag}]"
                     if has_any_out
                     else "Waveforms [FAILED]"
                 )
 
         if tb_res.telemetry:
+            if target_tab is not None:
+                target_tab.last_telemetry = tb_res.telemetry
             self._apply_telemetry_to_ui(tb_res.telemetry)
         self.right_notebook.set_current_page(1)
 
@@ -3184,6 +3468,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _apply_telemetry_to_ui(self, telem: TestbenchTelemetry) -> None:
         self.last_telemetry = telem
+        active_tab = self.get_active_tab()
+        if active_tab is not None:
+            active_tab.last_telemetry = telem
+        if hasattr(self, "sched_telemetry_widget"):
+            self.sched_telemetry_widget.set_telemetry(telem)
+            self._update_sched_status_label(telem)
         pwr = "D0 (ACTIVE)" if telem.dsp_power_state == 1 else "D3 (PAUSED)"
         active_kcps = sum(c.avg_kcps for c in telem.cores if c.enabled)
         self.telem_summary_lbl.set_text(

@@ -64,27 +64,58 @@ def serialize_config_node(node: ConfigNode, indent: int = 0) -> str:
 
 
 def _extract_active_pipeline_ids(vm: GraphViewModel) -> List[int]:
-    """Return the ordered union of active testbench pipeline IDs from all enabled TestbenchIO nodes,
+    """Return the ordered active testbench pipeline IDs from enabled TestbenchIO nodes,
     ordered top-to-bottom by the vertical (y) positions of the PCMs in the Main Graph.
+    When both testbench-source and testbench-sink nodes are enabled, returns the pipelines
+    lying on paths between enabled sources and enabled sinks.
     """
-    collected: List[int] = []
-    for target_side in ("left", "right"):
-        side_enabled = [
-            node
-            for node in vm.nodes.values()
-            if node.class_category == "TestbenchIO"
-            and str(node.config.get_scalar("side", "left")).lower() == target_side
-            and str(node.config.get_scalar("enabled", "false")).lower() == "true"
-        ]
-        side_enabled.sort(key=lambda n: (n.y, n.x))
-        for node in side_enabled:
-            tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
-            for m in re.findall(r"\d+", tp_str):
-                pid = int(m)
-                if pid not in collected:
-                    collected.append(pid)
-        if collected:
-            return collected
+    enabled_sources = [
+        node
+        for node in vm.nodes.values()
+        if node.class_category == "TestbenchIO"
+        and node.class_name == "testbench-source"
+        and str(node.config.get_scalar("enabled", "false")).lower() == "true"
+    ]
+    enabled_sinks = [
+        node
+        for node in vm.nodes.values()
+        if node.class_category == "TestbenchIO"
+        and node.class_name == "testbench-sink"
+        and str(node.config.get_scalar("enabled", "false")).lower() == "true"
+    ]
+    enabled_sources.sort(key=lambda n: (n.y, n.x))
+    enabled_sinks.sort(key=lambda n: (n.y, n.x))
+
+    src_pids: List[int] = []
+    for node in enabled_sources:
+        tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
+        for m in re.findall(r"\d+", tp_str):
+            pid = int(m)
+            if pid not in src_pids:
+                src_pids.append(pid)
+
+    snk_pids: List[int] = []
+    for node in enabled_sinks:
+        tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
+        for m in re.findall(r"\d+", tp_str):
+            pid = int(m)
+            if pid not in snk_pids:
+                snk_pids.append(pid)
+
+    if src_pids and snk_pids:
+        snk_set = set(snk_pids)
+        inter = [p for p in src_pids if p in snk_set]
+        if inter:
+            return inter
+        combined = list(src_pids)
+        for p in snk_pids:
+            if p not in combined:
+                combined.append(p)
+        return combined
+    if src_pids:
+        return src_pids
+    if snk_pids:
+        return snk_pids
 
     pipe_ids = sorted(vm.containers.keys())
     if 1 in pipe_ids and 2 in pipe_ids:
@@ -328,9 +359,11 @@ def _generate_standalone_harness_conf(
 
     comp_includes: Set[str] = {"include/components/gain.conf"}
     for n in proc_nodes:
-        inc_rel = f"include/components/{n.class_name}.conf"
-        if os.path.isfile(os.path.join(topology2_root, inc_rel)):
-            comp_includes.add(inc_rel)
+        for sub_dir in ("include/components", "include/components/cavs"):
+            inc_rel = f"{sub_dir}/{n.class_name}.conf"
+            if os.path.isfile(os.path.join(topology2_root, inc_rel)):
+                comp_includes.add(inc_rel)
+                break
     inc_lines = "\n".join(f"<{inc}>" for inc in sorted(comp_includes))
 
     w_blocks: List[str] = []

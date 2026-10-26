@@ -2595,6 +2595,7 @@ class Topology2Workspace:
             chain_pids: List[int] = []
             if start_node.pipeline_id is not None:
                 chain_pids.append(start_node.pipeline_id)
+            start_is_cap = _is_copier_capture(start_node)
             dq = deque([start_node.id])
             while dq:
                 cur_id = dq.popleft()
@@ -2610,6 +2611,12 @@ class Topology2Workspace:
                     nxt_node = vm.nodes.get(nxt_id)
                     if not nxt_node or nxt_node.class_category in ("Control", "TestbenchIO"):
                         continue
+                    if nxt_node.pipeline_id is not None and nxt_node.pipeline_id in vm.containers:
+                        nxt_dir = vm.containers[nxt_node.pipeline_id].direction.lower()
+                        if start_is_cap and "playback" in nxt_dir and "capture" not in nxt_dir:
+                            continue
+                        if not start_is_cap and "capture" in nxt_dir and "playback" not in nxt_dir:
+                            continue
                     if nxt_id not in visited_nids:
                         visited_nids.add(nxt_id)
                         if nxt_node.pipeline_id is not None and nxt_node.pipeline_id not in chain_pids:

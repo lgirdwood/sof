@@ -231,6 +231,26 @@ class TopologyTextEditor(Gtk.Box):
         end_it = self.buffer.get_end_iter()
         return self.buffer.get_text(start_it, end_it, True)
 
+    def scroll_to_hint(self, hint: Optional[str]) -> bool:
+        """Move the cursor to the first occurrence of hint in the buffer and scroll it into view."""
+        if not hint:
+            return False
+        text = self.get_text()
+        if not text:
+            return False
+        idx = text.find(hint)
+        if idx < 0:
+            # Try unquoted fallback if hint had quotes
+            unquoted = hint.replace('"', "").replace("'", "")
+            if unquoted:
+                idx = text.find(unquoted)
+        if idx < 0:
+            return False
+        it = self.buffer.get_iter_at_offset(idx)
+        self.buffer.place_cursor(it)
+        self.text_view.scroll_to_iter(it, 0.15, True, 0.0, 0.25)
+        return True
+
     def _cancel_timers(self) -> None:
         if self._highlight_timer_id is not None:
             GLib.source_remove(self._highlight_timer_id)

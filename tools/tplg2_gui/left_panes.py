@@ -7,6 +7,7 @@
 """
 
 from __future__ import annotations
+import os
 from typing import Callable, Dict, Optional, Tuple
 
 import gi
@@ -26,6 +27,7 @@ class LeftNavigationPanel(Gtk.Box):
         on_item_selected: Callable[[str, str, Optional[str]], None],
         on_add_module_requested: Optional[Callable[[str], None]] = None,
         on_add_pipeline_requested: Optional[Callable[[str], None]] = None,
+        on_view_source_requested: Optional[Callable[[str, str, Optional[str], Optional[str]], None]] = None,
     ):
         """
         Args:
@@ -33,6 +35,7 @@ class LeftNavigationPanel(Gtk.Box):
                 pane_kind in ("base_class", "module", "pipeline", "topology")
             on_add_module_requested: callback(module_name) when user clicks '+ Add Node'
             on_add_pipeline_requested: callback(pipeline_name) when user clicks '+ Add Pipeline'
+            on_view_source_requested: callback(pane_kind, primary_id, secondary_id, search_hint)
         """
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.set_size_request(320, -1)
@@ -44,6 +47,8 @@ class LeftNavigationPanel(Gtk.Box):
         self.on_item_selected = on_item_selected
         self.on_add_module_requested = on_add_module_requested
         self.on_add_pipeline_requested = on_add_pipeline_requested
+        self.on_view_source_requested = on_view_source_requested
+        self._active_context_popover: Optional[Gtk.Popover] = None
         self.workspace: Optional[Topology2Workspace] = None
         self._updating_selection: bool = False
         self._filter_text: str = ""
@@ -105,6 +110,10 @@ class LeftNavigationPanel(Gtk.Box):
         mod_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         mod_click.connect("pressed", self._on_obj_list_pressed, self.obj_mod_list)
         self.obj_mod_list.add_controller(mod_click)
+        mod_rclick = Gtk.GestureClick.new()
+        mod_rclick.set_button(3)
+        mod_rclick.connect("pressed", self._on_obj_list_right_pressed, self.obj_mod_list)
+        self.obj_mod_list.add_controller(mod_rclick)
         mod_motion = Gtk.EventControllerMotion.new()
         mod_motion.connect("motion", self._on_obj_list_motion, self.obj_mod_list)
         mod_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
@@ -146,6 +155,10 @@ class LeftNavigationPanel(Gtk.Box):
         pipe_click.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         pipe_click.connect("pressed", self._on_obj_list_pressed, self.obj_pipe_list)
         self.obj_pipe_list.add_controller(pipe_click)
+        pipe_rclick = Gtk.GestureClick.new()
+        pipe_rclick.set_button(3)
+        pipe_rclick.connect("pressed", self._on_obj_list_right_pressed, self.obj_pipe_list)
+        self.obj_pipe_list.add_controller(pipe_rclick)
         pipe_motion = Gtk.EventControllerMotion.new()
         pipe_motion.connect("motion", self._on_obj_list_motion, self.obj_pipe_list)
         pipe_motion.connect("leave", lambda _c: self._hide_hover_zoom_box())
@@ -269,6 +282,11 @@ class LeftNavigationPanel(Gtk.Box):
         sel = tree.get_selection()
         sel.set_mode(Gtk.SelectionMode.SINGLE)
         sel.connect("changed", self._on_tree_selection_changed, pane_kind)
+
+        tree_rclick = Gtk.GestureClick.new()
+        tree_rclick.set_button(3)
+        tree_rclick.connect("pressed", self._on_tree_right_pressed, tree, store)
+        tree.add_controller(tree_rclick)
 
         if enable_drag_add:
             drag_src = Gtk.DragSource.new()
@@ -646,6 +664,161 @@ class LeftNavigationPanel(Gtk.Box):
             if row is not None:
                 listbox.select_row(row)
                 self._on_obj_row_activated(listbox, row)
+
+    def _on_obj_list_right_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+        listbox: Gtk.ListBox,
+    ) -> None:
+        """Open right-click context menu ('View Source') for an Object View module or pipeline row."""
+        self._hide_hover_zoom_box()
+        row = listbox.get_row_at_y(int(y)) or listbox.get_selected_row()
+        if row is None:
+            return
+        listbox.select_row(row)
+        item_kind = str(getattr(row, "_item_kind", "") or "")
+        item_id = str(getattr(row, "_item_id", "") or "")
+        title_text = str(getattr(row, "_title_text", item_id) or item_id)
+        if item_kind and item_id:
+            self._open_item_context_menu(
+                parent_widget=listbox,
+                x=x,
+                y=y,
+                pane_kind=item_kind,
+                primary_id=item_id,
+                secondary_id=None,
+                display_title=title_text,
+            )
+
+    def _on_tree_right_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        _n_press: int,
+        x: float,
+        y: float,
+        tree: Gtk.TreeView,
+        store: Gtk.TreeStore,
+    ) -> None:
+        """Open right-click context menu ('View Source') for a File View TreeView row."""
+        bx, by = tree.convert_widget_to_bin_window_coords(int(x), int(y))
+        path_info = tree.get_path_at_pos(bx, by)
+        tree_iter: Optional[Gtk.TreeIter] = None
+        if path_info is not None and path_info[0] is not None:
+            path = path_info[0]
+            tree_iter = store.get_iter(path)
+            self._updating_selection = True
+            try:
+                tree.get_selection().select_path(path)
+            finally:
+                self._updating_selection = False
+        else:
+            _model, tree_iter = tree.get_selection().get_selected()
+
+        if not tree_iter:
+            return
+        disp = str(store.get_value(tree_iter, 0) or "")
+        kind = str(store.get_value(tree_iter, 2) or "")
+        primary = str(store.get_value(tree_iter, 3) or "")
+        secondary = str(store.get_value(tree_iter, 4) or "") or None
+        if kind and primary:
+            self._open_item_context_menu(
+                parent_widget=tree,
+                x=x,
+                y=y,
+                pane_kind=kind,
+                primary_id=primary,
+                secondary_id=secondary,
+                display_title=disp or primary,
+            )
+
+    def _open_item_context_menu(
+        self,
+        parent_widget: Gtk.Widget,
+        x: float,
+        y: float,
+        pane_kind: str,
+        primary_id: str,
+        secondary_id: Optional[str] = None,
+        display_title: str = "",
+    ) -> Optional[Gtk.Popover]:
+        """Open a right-click context menu Popover at (x, y) with 'View Source' and 'Open Graph'."""
+        if self._active_context_popover is not None:
+            try:
+                self._active_context_popover.popdown()
+            except Exception:
+                pass
+            self._active_context_popover = None
+
+        src_fname = f"{primary_id}.conf"
+        if self.workspace:
+            if pane_kind == "module" and primary_id in self.workspace.processing_modules:
+                sf = self.workspace.processing_modules[primary_id].source_file
+                if sf:
+                    src_fname = os.path.basename(sf)
+            elif pane_kind == "pipeline" and primary_id in self.workspace.pipeline_classes:
+                sf = self.workspace.pipeline_classes[primary_id].source_file
+                if sf:
+                    src_fname = os.path.basename(sf)
+            elif pane_kind == "base_class" and primary_id in self.workspace.base_classes:
+                sf = self.workspace.base_classes[primary_id].source_file
+                if sf:
+                    src_fname = os.path.basename(sf)
+            elif pane_kind == "topology":
+                src_fname = os.path.basename(primary_id)
+
+        pop = Gtk.Popover()
+        pop.set_parent(parent_widget)
+        rect = Gdk.Rectangle()
+        rect.x = int(x)
+        rect.y = int(y)
+        rect.width = 1
+        rect.height = 1
+        pop.set_pointing_to(rect)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+
+        hdr = Gtk.Label(label=display_title or primary_id, xalign=0.0)
+        hdr.add_css_class("heading")
+        box.append(hdr)
+
+        view_src_btn = Gtk.Button(label=f"📄 View Source ({src_fname})")
+        view_src_btn.add_css_class("suggested-action")
+
+        def _on_view_src(_b: Gtk.Button) -> None:
+            pop.popdown()
+            if self.on_view_source_requested:
+                self.on_view_source_requested(pane_kind, primary_id, secondary_id, None)
+
+        view_src_btn.connect("clicked", _on_view_src)
+        box.append(view_src_btn)
+
+        open_graph_btn = Gtk.Button(label="🕸 Open Graph")
+
+        def _on_open_graph(_b: Gtk.Button) -> None:
+            pop.popdown()
+            self.on_item_selected(pane_kind, primary_id, secondary_id)
+
+        open_graph_btn.connect("clicked", _on_open_graph)
+        box.append(open_graph_btn)
+
+        pop.set_child(box)
+        self._active_context_popover = pop
+
+        def _on_closed(p: Gtk.Popover) -> None:
+            if self._active_context_popover is p:
+                self._active_context_popover = None
+            p.unparent()
+
+        pop.connect("closed", _on_closed)
+        pop.popup()
+        return pop
 
     def _on_tree_selection_changed(self, selection: Gtk.TreeSelection, active_pane_kind: str) -> None:
         if self._updating_selection:

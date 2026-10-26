@@ -1091,14 +1091,48 @@ class TplgIpc4Parser:
                         wdesc.instance_id = instance_ids.get(SND_SOC_TPLG_DAPM_MIXER, 0)
                         instance_ids[SND_SOC_TPLG_DAPM_MIXER] = wdesc.instance_id + 1
                     elif w_id == SND_SOC_TPLG_DAPM_EFFECT:
-                        wdesc.module_id = TB_PROCESS_MODULE_ID
-                        wdesc.instance_id = instance_ids.get(SND_SOC_TPLG_DAPM_EFFECT, 0)
-                        instance_ids[SND_SOC_TPLG_DAPM_EFFECT] = wdesc.instance_id + 1
+                        _unsupported_tb_prefixes = (
+                            "smart_amp",
+                            "maxim_dsm",
+                            "dts",
+                            "kpb",
+                            "ov_noise_suppression",
+                            "wov",
+                        )
+                        _unsupported_tb_uuids = {
+                            bytes.fromhex("1e967a16e48aea1189f1000c29ce1635"),
+                            bytes.fromhex("6838be396ccb334694472379089c592f"),
+                            bytes.fromhex("b9809b625c141a4692f0c20369422784"),
+                            bytes.fromhex("a2423bc65a974e4b89fd4c19c39c8622"),
+                            bytes.fromhex("4fc35fd90f37c74abc86bfdc83f169a1"),
+                            bytes.fromhex("0f8421d82d5f4c4ab46842c24d262e12"),
+                            bytes.fromhex("438421d8f35f4c4ab3886cfe07b956aa"),
+                            bytes.fromhex("329ab5f7a5559f4c9004984c47678791"),
+                            bytes.fromhex("a771e67a1746094abf6d9d2975b68791"),
+                            bytes.fromhex("f9401882d5f24a4cb46842c24d262e12"),
+                            bytes.fromhex("ec7218a3e5c0464a9084f1f7c95340d2"),
+                        }
+                        _is_unsupported_effect = (
+                            wdesc.uuid_bytes in _unsupported_tb_uuids
+                            or any(w_name.startswith(pfx) for pfx in _unsupported_tb_prefixes)
+                        )
+                        if _is_unsupported_effect:
+                            wdesc.dapm_type = SND_SOC_TPLG_DAPM_BUFFER
+                            wdesc.module_id = TB_COPIER_MODULE_ID
+                            wdesc.uuid_bytes = bytes.fromhex("830ca09b12ca834a943c1fa2e82f9dda")
+                            wdesc.instance_id = instance_ids.get(SND_SOC_TPLG_DAPM_BUFFER, 0)
+                            instance_ids[SND_SOC_TPLG_DAPM_BUFFER] = wdesc.instance_id + 1
+                        else:
+                            wdesc.module_id = TB_PROCESS_MODULE_ID
+                            wdesc.instance_id = instance_ids.get(SND_SOC_TPLG_DAPM_EFFECT, 0)
+                            instance_ids[SND_SOC_TPLG_DAPM_EFFECT] = wdesc.instance_id + 1
 
                     # Parse widget kcontrols
                     off, w_ctls = TplgIpc4Parser._parse_widget_controls(
                         data, off, block_end, num_kctls, wdesc, tplg
                     )
+                    if w_id == SND_SOC_TPLG_DAPM_EFFECT and wdesc.dapm_type == SND_SOC_TPLG_DAPM_BUFFER:
+                        w_ctls = [c for c in w_ctls if c.ctl_type != SND_SOC_TPLG_TYPE_BYTES]
                     wdesc.kcontrols = w_ctls
                     tplg.widgets.append(wdesc)
                     tplg.widgets_by_name[wdesc.name] = wdesc
@@ -1506,14 +1540,27 @@ def build_ipc4_plan(
             if hw and hw.pipeline_id in enabled_set:
                 prepare_capture_dfs(hw, hw)
 
-    # Also prepare any remaining widgets in selected_pipeline_ids not reached from a PCM host
+    # Collect widgets that participate in at least one active route within enabled_set
+    # (so unconnected template widgets such as unused module-copier.18.2 / 20.2 are not initialized)
+    routed_widget_names: set = set()
+    for r in tplg.routes:
+        src_w = tplg.widgets_by_name.get(r.source_name)
+        sink_w = tplg.widgets_by_name.get(r.sink_name)
+        if src_w and sink_w and src_w.pipeline_id in enabled_set and sink_w.pipeline_id in enabled_set:
+            routed_widget_names.add(src_w.name)
+            routed_widget_names.add(sink_w.name)
+    if not routed_widget_names:
+        routed_widget_names = {w.name for w in tplg.widgets if w.pipeline_id in enabled_set}
+
+    # Also prepare any remaining routed widgets in selected_pipeline_ids not reached from a PCM host
     for w in tplg.widgets:
-        if w.pipeline_id in enabled_set and w.name not in prepared_widgets:
-            inferred_dir = (
-                SOF_IPC_STREAM_CAPTURE
-                if w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_OUT, SND_SOC_TPLG_DAPM_DAI_OUT)
-                else SOF_IPC_STREAM_PLAYBACK
-            )
+        if w.pipeline_id in enabled_set and w.name not in prepared_widgets and w.name in routed_widget_names:
+            if w.pipeline_id in pipe_dir:
+                inferred_dir = pipe_dir[w.pipeline_id]
+            elif w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_OUT, SND_SOC_TPLG_DAPM_DAI_OUT) or ".capture" in w.name:
+                inferred_dir = SOF_IPC_STREAM_CAPTURE
+            else:
+                inferred_dir = SOF_IPC_STREAM_PLAYBACK
             prepare_widget(w, inferred_dir)
 
     # Build IpcPipelineCreateOp descriptors
@@ -1777,6 +1824,9 @@ def build_ipc4_plan(
             return
         src_q = allocate_queue_id(src_w, sink_w, True)
         dst_q = allocate_queue_id(sink_w, src_w, False)
+        if sink_w.module_id == TB_COPIER_MODULE_ID and dst_q > 0:
+            setup_routes.add(rkey)
+            return
         copier_op: Optional[IpcLargeConfigSetOp] = None
         if src_w.module_id == TB_COPIER_MODULE_ID and src_q > 0:
             sink_fmt_payload = (
@@ -1908,9 +1958,9 @@ def build_ipc4_plan(
             if hw and hw.pipeline_id in enabled_set:
                 setup_capture_dfs(hw, hw)
 
-    # Also set up any remaining widgets & routes in selected_pipeline_ids
+    # Also set up any remaining routed widgets & routes in selected_pipeline_ids
     for w in tplg.widgets:
-        if w.pipeline_id in enabled_set and w.name not in setup_widgets:
+        if w.pipeline_id in enabled_set and w.name not in setup_widgets and w.name in routed_widget_names:
             set_up_widget(w)
     for r in tplg.routes:
         src_w = tplg.widgets_by_name.get(r.source_name)

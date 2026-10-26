@@ -207,12 +207,126 @@ class CoreTelemetry:
     peak_load_pct: float = 0.0
     freq_hz: int = 400_000_000
     ll_deadline_violations: int = 0
+    ll_active_tasks: int = 0
+    ll_avg_cycles: int = 0
+    ll_peak_cycles: int = 0
+    ll_total_cycles: int = 0
     ll_avg_exec_us: float = 0.0
     ll_peak_exec_us: float = 0.0
+    dp_run_count: int = 0
+    dp_active_threads: int = 0
+    dp_avg_cycles: int = 0
+    dp_peak_cycles: int = 0
+    dp_total_cycles: int = 0
     dp_avg_kcps: int = 0
     dp_peak_kcps: int = 0
     dp_avg_exec_us: float = 0.0
     dp_peak_exec_us: float = 0.0
+
+    @property
+    def ll_ticks(self) -> int:
+        return self.tick_count
+
+    @property
+    def dp_runs(self) -> int:
+        return self.dp_run_count
+
+    @property
+    def util_pct(self) -> float:
+        return self.cpu_load_pct
+
+    @property
+    def ll_exec_avg_us(self) -> float:
+        return self.ll_avg_exec_us if self.ll_avg_exec_us > 0 else self.last_time_elapsed_us
+
+    @property
+    def ll_exec_peak_us(self) -> float:
+        return self.ll_peak_exec_us if self.ll_peak_exec_us > 0 else self.max_time_elapsed_us
+
+    @property
+    def overruns(self) -> int:
+        return self.ll_deadline_violations
+
+    @property
+    def avg_cycles(self) -> int:
+        return self.ll_avg_cycles or self.last_time_elapsed_cyc
+
+
+@dataclass
+class PipelineSchedTelemetry:
+    pipeline_id: int
+    core_id: int = 0
+    priority: int = 0
+    period_us: int = 1000
+    mem_domain: str = "SRAM"
+    num_ll_modules: int = 0
+    num_dp_modules: int = 0
+    copy_iterations: int = 0
+    avg_cycles: int = 0
+    peak_cycles: int = 0
+    total_cycles: int = 0
+    avg_kcps: int = 0
+    peak_kcps: int = 0
+    avg_exec_us: float = 0.0
+    peak_exec_us: float = 0.0
+    xrun_count: int = 0
+
+    @property
+    def exec_avg_us(self) -> float:
+        return self.avg_exec_us
+
+    @property
+    def exec_peak_us(self) -> float:
+        return self.peak_exec_us
+
+    @property
+    def copies(self) -> int:
+        return self.copy_iterations
+
+    @property
+    def mem_type(self) -> str:
+        return self.mem_domain
+
+    @property
+    def ll_module_count(self) -> int:
+        return self.num_ll_modules
+
+    @property
+    def dp_module_count(self) -> int:
+        return self.num_dp_modules
+
+    @property
+    def xruns(self) -> int:
+        return self.xrun_count
+
+
+@dataclass
+class ModulePinBufferStats:
+    direction: str  # "IN" or "OUT"
+    pin_index: int = 0
+    buf_id: int = 0
+    peer_comp_id: int = 0xFFFFFFFF
+    peer_widget_name: str = ""
+    rate: int = 48000
+    channels: int = 2
+    frame_fmt: int = 2
+    buf_size: int = 0
+    ll_entry_avail: int = 0
+    ll_entry_free: int = 0
+    ll_exit_avail: int = 0
+    ll_exit_free: int = 0
+    dp_ring_size: int = 0
+    dp_entry_avail: int = 0
+    dp_entry_free: int = 0
+    dp_exit_avail: int = 0
+    dp_exit_free: int = 0
+    last_bytes_transferred: int = 0
+    total_bytes_transferred: int = 0
+    entry_rms_db: float = -120.0
+    entry_peak_db: float = -120.0
+    exit_rms_db: float = -120.0
+    exit_peak_db: float = -120.0
+    samples: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -230,18 +344,39 @@ class ComponentPerfItem:
     avg_kcps: int = 0
     peak_kcps: int = 0
     iterations: int = 0
+    last_cycles: int = 0
+    avg_cycles: int = 0
+    peak_cycles: int = 0
     total_cycles: int = 0
+    avg_exec_us: float = 0.0
+    peak_exec_us: float = 0.0
     heap_bytes: int = 0
     effective_cpc: int = 0
     cpc_violations: int = 0
     ibs: int = 0
     obs: int = 0
+    ll_ring_sync_iters: int = 0
+    ll_ring_sync_cycles: int = 0
     in_rms_db: float = -120.0
     out_rms_db: float = -120.0
+    in_pins: List[ModulePinBufferStats] = field(default_factory=list)
+    out_pins: List[ModulePinBufferStats] = field(default_factory=list)
 
     @property
     def comp_id(self) -> int:
         return self.resource_id
+
+    @property
+    def exec_avg_us(self) -> float:
+        return self.avg_exec_us
+
+    @property
+    def exec_peak_us(self) -> float:
+        return self.peak_exec_us
+
+    @property
+    def mem_type(self) -> str:
+        return self.mem_domain
 
 
 @dataclass
@@ -315,8 +450,9 @@ class TestbenchTelemetry:
     lpsram: SramSegmentState = field(default_factory=lambda: SramSegmentState("LPSRAM"))
     total_heap_bytes: int = 0
     module_heap: Dict[str, int] = field(default_factory=dict)
-    # Cores, Components, Kcontrols & Probes
+    # Cores, Pipelines, Components, Kcontrols & Probes
     cores: List[CoreTelemetry] = field(default_factory=list)
+    pipelines: List[PipelineSchedTelemetry] = field(default_factory=list)
     components: List[ComponentPerfItem] = field(default_factory=list)
     kcontrols: List[KcontrolTelemetryItem] = field(default_factory=list)
     probes: List[Dict[str, Any]] = field(default_factory=list)
@@ -1464,11 +1600,78 @@ class TestbenchRemoteClient:
                 if wname and wname != "dynamic_mod":
                     probe_by_id[cid] = wname
 
-        # Parse per-module scheduling & entry/exit buffer RMS dBFS from `sched-telem` output
+        # Parse per-core, per-pipeline, and per-module scheduling & entry/exit buffer stats from `sched-telem`
         sched_mod_map: Dict[int, Dict[str, Any]] = {}
+        sched_pipes: List[PipelineSchedTelemetry] = []
         for line in telem.shell_sched_telem.splitlines():
+            m_core = re.search(
+                r"\[Core\s+(\d+)\s+([\d.]+)MHz\]\s+util=([\d.]+)%\s+overruns=(\d+)\s+\|\s+"
+                r"LL:\s+ticks=(\d+)\s+tasks=(\d+)\s+avg=(\d+)\s+peak=(\d+)\s+tot=(\d+)\s+cyc\s+\((\d+)/(\d+)\s+kcps\)\s+exec=([\d.]+)/([\d.]+)us\s+\|\s+"
+                r"DP:\s+runs=(\d+)\s+thr=(\d+)\s+avg=(\d+)\s+peak=(\d+)\s+tot=(\d+)\s+cyc\s+\((\d+)/(\d+)\s+kcps\)\s+exec=([\d.]+)/([\d.]+)us",
+                line,
+            )
+            if m_core:
+                c_idx = int(m_core.group(1))
+                while len(telem.cores) <= c_idx:
+                    telem.cores.append(CoreTelemetry(core_id=len(telem.cores)))
+                ct = telem.cores[c_idx]
+                ct.enabled = True
+                ct.freq_hz = int(round(float(m_core.group(2)) * 1_000_000))
+                ct.cpu_load_pct = float(m_core.group(3))
+                ct.ll_deadline_violations = int(m_core.group(4))
+                ct.tick_count = int(m_core.group(5))
+                ct.ll_active_tasks = int(m_core.group(6))
+                ct.ll_avg_cycles = int(m_core.group(7))
+                ct.ll_peak_cycles = int(m_core.group(8))
+                ct.ll_total_cycles = int(m_core.group(9))
+                ct.avg_kcps = int(m_core.group(10))
+                ct.peak_kcps = int(m_core.group(11))
+                ct.ll_avg_exec_us = float(m_core.group(12))
+                ct.ll_peak_exec_us = float(m_core.group(13))
+                ct.dp_run_count = int(m_core.group(14))
+                ct.dp_active_threads = int(m_core.group(15))
+                ct.dp_avg_cycles = int(m_core.group(16))
+                ct.dp_peak_cycles = int(m_core.group(17))
+                ct.dp_total_cycles = int(m_core.group(18))
+                ct.dp_avg_kcps = int(m_core.group(19))
+                ct.dp_peak_kcps = int(m_core.group(20))
+                ct.dp_avg_exec_us = float(m_core.group(21))
+                ct.dp_peak_exec_us = float(m_core.group(22))
+                continue
+
+            m_pipe = re.search(
+                r"\[Pipe\s+(\d+)\]\s+core=(\d+)\s+prio=(\d+)\s+per=(\d+)us\s+mem=(SRAM|DRAM)\s+"
+                r"mods=(\d+)LL/(\d+)DP\s+copies=(\d+)\s+avg=(\d+)\s+peak=(\d+)\s+tot=(\d+)\s+cyc\s+"
+                r"\((\d+)/(\d+)\s+kcps\)\s+exec=([\d.]+)/([\d.]+)us\s+xruns=(\d+)",
+                line,
+            )
+            if m_pipe:
+                sched_pipes.append(
+                    PipelineSchedTelemetry(
+                        pipeline_id=int(m_pipe.group(1)),
+                        core_id=int(m_pipe.group(2)),
+                        priority=int(m_pipe.group(3)),
+                        period_us=int(m_pipe.group(4)),
+                        mem_domain=m_pipe.group(5),
+                        num_ll_modules=int(m_pipe.group(6)),
+                        num_dp_modules=int(m_pipe.group(7)),
+                        copy_iterations=int(m_pipe.group(8)),
+                        avg_cycles=int(m_pipe.group(9)),
+                        peak_cycles=int(m_pipe.group(10)),
+                        total_cycles=int(m_pipe.group(11)),
+                        avg_kcps=int(m_pipe.group(12)),
+                        peak_kcps=int(m_pipe.group(13)),
+                        avg_exec_us=float(m_pipe.group(14)),
+                        peak_exec_us=float(m_pipe.group(15)),
+                        xrun_count=int(m_pipe.group(16)),
+                    )
+                )
+                continue
+
             m_mod = re.search(
-                r"\[0x([0-9a-fA-F]+)\s+(\S+)\s*\]\s+pipe=(\d+)\s+core=(\d+)\s+(LL|DP)\s+mem=(SRAM|DRAM).*?ibs=(\d+)\s+obs=(\d+)\s+cpc=(\d+)\(viol=(\d+)\)",
+                r"\[0x([0-9a-fA-F]+)\s+(\S+)\s*\]\s+pipe=(\d+)\s+core=(\d+)\s+(LL|DP)\s+mem=(SRAM|DRAM)\s+"
+                r"iters=(\d+)\s+avg=(\d+)\s+peak=(\d+)\s+tot=(\d+)\s+cyc\s+\((\d+)/(\d+)\s+kcps\)\s+"
+                r"exec=([\d.]+)/([\d.]+)us\s+ibs=(\d+)\s+obs=(\d+)\s+cpc=(\d+)\(viol=(\d+)\)",
                 line,
             )
             if m_mod:
@@ -1484,18 +1687,147 @@ class TestbenchRemoteClient:
                 m_out = re.search(r"OUT0:.*?rms=([+-]?\d+\.\d+)dBFS", line)
                 if m_out:
                     out_rms = float(m_out.group(1))
+                ll_sync_it = 0
+                ll_sync_cyc = 0
+                m_sync = re.search(r"ll_sync=(\d+)\((\d+)\s+cyc\)", line)
+                if m_sync:
+                    ll_sync_it = int(m_sync.group(1))
+                    ll_sync_cyc = int(m_sync.group(2))
                 sched_mod_map[cid] = {
                     "pipeline_id": int(m_mod.group(3)),
                     "core_id": int(m_mod.group(4)),
                     "domain": m_mod.group(5),
                     "mem_domain": m_mod.group(6),
-                    "ibs": int(m_mod.group(7)),
-                    "obs": int(m_mod.group(8)),
-                    "effective_cpc": int(m_mod.group(9)),
-                    "cpc_violations": int(m_mod.group(10)),
+                    "iterations": int(m_mod.group(7)),
+                    "avg_cycles": int(m_mod.group(8)),
+                    "peak_cycles": int(m_mod.group(9)),
+                    "total_cycles": int(m_mod.group(10)),
+                    "avg_kcps": int(m_mod.group(11)),
+                    "peak_kcps": int(m_mod.group(12)),
+                    "avg_exec_us": float(m_mod.group(13)),
+                    "peak_exec_us": float(m_mod.group(14)),
+                    "ibs": int(m_mod.group(15)),
+                    "obs": int(m_mod.group(16)),
+                    "effective_cpc": int(m_mod.group(17)),
+                    "cpc_violations": int(m_mod.group(18)),
+                    "ll_ring_sync_iters": ll_sync_it,
+                    "ll_ring_sync_cycles": ll_sync_cyc,
                     "in_rms_db": in_rms,
                     "out_rms_db": out_rms,
                 }
+        telem.pipelines = sorted(sched_pipes, key=lambda p: (p.core_id, p.pipeline_id))
+
+        # Parse detailed per-module & per-pin buffer stats from `mod-buffers` output
+        mod_buf_map: Dict[int, Dict[str, Any]] = {}
+        cur_mod_cid: Optional[int] = None
+        cur_pin_obj: Optional[ModulePinBufferStats] = None
+        for line in telem.shell_mod_buffers.splitlines():
+            m_hdr = re.match(
+                r"^\[0x([0-9a-fA-F]+)\s+(\S+)\]\s+pipe=(\d+)\s+core=(\d+)\s+domain=(LL|DP)\s+"
+                r"iters=(\d+)\s+cyc\(last=(\d+)\s+avg=(\d+)\s+peak=(\d+)\)",
+                line.strip(),
+            )
+            if m_hdr:
+                cur_mod_cid = int(m_hdr.group(1), 16)
+                wname = m_hdr.group(2)
+                if wname and wname != "comp":
+                    probe_by_id[cur_mod_cid] = wname
+                mod_buf_map[cur_mod_cid] = {
+                    "pipeline_id": int(m_hdr.group(3)),
+                    "core_id": int(m_hdr.group(4)),
+                    "domain": m_hdr.group(5),
+                    "iterations": int(m_hdr.group(6)),
+                    "last_cycles": int(m_hdr.group(7)),
+                    "avg_cycles": int(m_hdr.group(8)),
+                    "peak_cycles": int(m_hdr.group(9)),
+                    "in_pins": [],
+                    "out_pins": [],
+                }
+                cur_pin_obj = None
+                continue
+
+            if cur_mod_cid is not None:
+                m_pin = re.match(
+                    r"^\s*(IN|OUT)\s*\[(\d+)\]\s+buf=(\d+)\s+peer=0x([0-9a-fA-F]+)\s+"
+                    r"(\d+)Hz/(\d+)ch/fmt=(\d+)\s+size=(\d+)B\s+"
+                    r"LL\(entry=(\d+)/(\d+)B\s*->\s*exit=(\d+)/(\d+)B\)",
+                    line,
+                )
+                if m_pin:
+                    direction = m_pin.group(1)
+                    peer_cid = int(m_pin.group(4), 16)
+                    pin_stat = ModulePinBufferStats(
+                        direction=direction,
+                        pin_index=int(m_pin.group(2)),
+                        buf_id=int(m_pin.group(3)),
+                        peer_comp_id=peer_cid,
+                        rate=int(m_pin.group(5)),
+                        channels=int(m_pin.group(6)),
+                        frame_fmt=int(m_pin.group(7)),
+                        buf_size=int(m_pin.group(8)),
+                        ll_entry_avail=int(m_pin.group(9)),
+                        ll_entry_free=int(m_pin.group(10)),
+                        ll_exit_avail=int(m_pin.group(11)),
+                        ll_exit_free=int(m_pin.group(12)),
+                    )
+                    m_dp = re.search(
+                        r"DP_RING\(size=(\d+)B\s+entry=(\d+)/(\d+)B\s*->\s*exit=(\d+)/(\d+)B\)",
+                        line,
+                    )
+                    if m_dp:
+                        pin_stat.dp_ring_size = int(m_dp.group(1))
+                        pin_stat.dp_entry_avail = int(m_dp.group(2))
+                        pin_stat.dp_entry_free = int(m_dp.group(3))
+                        pin_stat.dp_exit_avail = int(m_dp.group(4))
+                        pin_stat.dp_exit_free = int(m_dp.group(5))
+                    m_xfer = re.search(r"(?:consumed|produced)=(\d+)B\(tot=(\d+)B\)", line)
+                    if m_xfer:
+                        pin_stat.last_bytes_transferred = int(m_xfer.group(1))
+                        pin_stat.total_bytes_transferred = int(m_xfer.group(2))
+                    m_erms = re.search(r"entry_rms=([+-]?\d+\.\d+)dB(?:\(pk=([+-]?\d+\.\d+)dB\))?", line)
+                    if m_erms:
+                        pin_stat.entry_rms_db = float(m_erms.group(1))
+                        if m_erms.group(2) is not None:
+                            pin_stat.entry_peak_db = float(m_erms.group(2))
+                    m_xrms = re.search(r"exit_rms=([+-]?\d+\.\d+)dB(?:\(pk=([+-]?\d+\.\d+)dB\))?", line)
+                    if m_xrms:
+                        pin_stat.exit_rms_db = float(m_xrms.group(1))
+                        if m_xrms.group(2) is not None:
+                            pin_stat.exit_peak_db = float(m_xrms.group(2))
+                    if direction == "IN":
+                        mod_buf_map[cur_mod_cid]["in_pins"].append(pin_stat)
+                    else:
+                        mod_buf_map[cur_mod_cid]["out_pins"].append(pin_stat)
+                    cur_pin_obj = pin_stat
+                    continue
+
+                if cur_pin_obj is not None:
+                    m_smp = re.match(r"^\s*(?:entry_samples|exit_samples)\[\d+\]:\s*(.+)$", line)
+                    if m_smp:
+                        vals: List[int] = []
+                        for tok in m_smp.group(1).split():
+                            try:
+                                vals.append(int(tok))
+                            except ValueError:
+                                pass
+                        cur_pin_obj.samples = vals
+
+        # Ensure any active modules reported by sched-telem/mod-buffers are present in telem.components
+        known_comp_ids = {c.resource_id for c in telem.components}
+        for cid in list(sched_mod_map.keys()) + list(mod_buf_map.keys()):
+            if cid not in known_comp_ids:
+                known_comp_ids.add(cid)
+                mod_id = cid & 0xFFFF
+                inst_id = (cid >> 16) & 0xFFFF
+                mname = self.cached_modules.get(mod_id, f"mod_0x{mod_id:02x}")
+                telem.components.append(
+                    ComponentPerfItem(
+                        resource_id=cid,
+                        module_id=mod_id,
+                        instance_id=inst_id,
+                        module_name=mname,
+                    )
+                )
 
         # Parse per-module heap usage from `stats` shell output
         in_heap_sec = False
@@ -1533,12 +1865,36 @@ class TestbenchRemoteClient:
                 comp.core_id = sinfo["core_id"]
                 comp.domain = sinfo["domain"]
                 comp.mem_domain = sinfo["mem_domain"]
+                comp.iterations = sinfo["iterations"]
+                comp.avg_cycles = sinfo["avg_cycles"]
+                comp.peak_cycles = sinfo["peak_cycles"]
+                comp.total_cycles = sinfo["total_cycles"]
+                comp.avg_kcps = sinfo["avg_kcps"]
+                comp.peak_kcps = sinfo["peak_kcps"]
+                comp.avg_exec_us = sinfo["avg_exec_us"]
+                comp.peak_exec_us = sinfo["peak_exec_us"]
                 comp.ibs = sinfo["ibs"]
                 comp.obs = sinfo["obs"]
                 comp.effective_cpc = sinfo["effective_cpc"]
                 comp.cpc_violations = sinfo["cpc_violations"]
+                comp.ll_ring_sync_iters = sinfo["ll_ring_sync_iters"]
+                comp.ll_ring_sync_cycles = sinfo["ll_ring_sync_cycles"]
                 comp.in_rms_db = sinfo["in_rms_db"]
                 comp.out_rms_db = sinfo["out_rms_db"]
+            binfo = mod_buf_map.get(comp.resource_id)
+            if binfo:
+                comp.last_cycles = binfo["last_cycles"]
+                if comp.avg_cycles == 0:
+                    comp.avg_cycles = binfo["avg_cycles"]
+                if comp.peak_cycles == 0:
+                    comp.peak_cycles = binfo["peak_cycles"]
+                comp.in_pins = list(binfo["in_pins"])
+                comp.out_pins = list(binfo["out_pins"])
+                for p in comp.in_pins + comp.out_pins:
+                    if p.peer_comp_id in probe_by_id:
+                        p.peer_widget_name = probe_by_id[p.peer_comp_id]
+                    elif p.peer_comp_id in self.ipc_widget_map:
+                        p.peer_widget_name = self.ipc_widget_map[p.peer_comp_id][0]
             if comp.widget_name and comp.widget_name in telem.module_heap:
                 comp.heap_bytes = telem.module_heap[comp.widget_name]
             elif comp.module_name in telem.module_heap:
@@ -2974,11 +3330,12 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.multi_signal_labels = (
             list(multi_signal_labels) if multi_signal_labels else [self.signal_label]
         )
-        expected_streams = max(1, len(self.multi_in_labels), len(self.multi_out_labels))
-        if len(self.multi_in_samples) > expected_streams:
-            self.multi_in_samples = self.multi_in_samples[:expected_streams]
-        if len(self.multi_out_samples) > expected_streams:
-            self.multi_out_samples = self.multi_out_samples[:expected_streams]
+        expected_in = max(1, len(self.multi_in_labels))
+        expected_out = max(1, len(self.multi_out_labels))
+        if len(self.multi_in_samples) > expected_in:
+            self.multi_in_samples = self.multi_in_samples[:expected_in]
+        if len(self.multi_out_samples) > expected_out:
+            self.multi_out_samples = self.multi_out_samples[:expected_out]
         self.sample_rate = max(1000, rate)
         self.channels = max(1, channels)
         self.bits = bits
@@ -3274,34 +3631,29 @@ class WaveformSnapshotWidget(Gtk.Widget):
         bounds.init(0.0, 0.0, w, h)
         snapshot.append_color(self._rgba(0.06, 0.07, 0.10, 1.0), bounds)
 
-        num_streams = max(
-            1,
-            len(self.multi_in_samples),
-            len(self.multi_out_samples),
-            len(self.multi_in_labels),
-            len(self.multi_out_labels),
-        )
-        num_streams = min(16, num_streams)
+        num_in_lanes = min(16, max(1, len(self.multi_in_labels), len(self.multi_in_samples)))
+        num_out_lanes = min(16, max(1, len(self.multi_out_labels), len(self.multi_out_samples)))
+        total_lanes = num_in_lanes + num_out_lanes
 
         left_gutter = 62.0
         right_pad = 8.0
         top_pad = 4.0
         bottom_ruler_h = 22.0
-        intra_pair_gap = 3.0 if num_streams >= 2 else 6.0
-        inter_stream_gap = 7.0 if num_streams >= 2 else 0.0
+        intra_gap = 4.0
+        group_gap = 7.0 if total_lanes > 2 else 6.0
 
         plot_x = left_gutter
         plot_w = max(20.0, w - left_gutter - right_pad)
-        total_gaps = num_streams * intra_pair_gap + max(0, num_streams - 1) * inter_stream_gap
-        viewport_lanes_h = max(32.0, h - top_pad - bottom_ruler_h)
-        natural_lane_h = max(16.0, (viewport_lanes_h - total_gaps) / float(2 * num_streams))
-        min_lane_h = 66.0 if num_streams > 1 else 24.0
-        lane_h = max(min_lane_h, natural_lane_h)
-        stream_block_h = 2.0 * lane_h + intra_pair_gap
-        virtual_lanes_h = (
-            num_streams * stream_block_h
-            + max(0, num_streams - 1) * inter_stream_gap
+        total_gaps = (
+            max(0, num_in_lanes - 1) * intra_gap
+            + group_gap
+            + max(0, num_out_lanes - 1) * intra_gap
         )
+        viewport_lanes_h = max(32.0, h - top_pad - bottom_ruler_h)
+        natural_lane_h = max(16.0, (viewport_lanes_h - total_gaps) / float(total_lanes))
+        min_lane_h = 62.0 if total_lanes > 2 else 24.0
+        lane_h = max(min_lane_h, natural_lane_h)
+        virtual_lanes_h = total_lanes * lane_h + total_gaps
         self._sync_v_adj(viewport_lanes_h, virtual_lanes_h)
         all_lanes_bot_y = top_pad + min(viewport_lanes_h, virtual_lanes_h)
         ruler_y = top_pad + viewport_lanes_h + 2.0
@@ -3316,7 +3668,7 @@ class WaveformSnapshotWidget(Gtk.Widget):
                 trig_shift = self._find_rising_zero_crossing(ref, max_search=min(240, max(1, len(ref) - vis)))
         start_idx = min(max(0, total - vis), self.pan_offset + trig_shift) if total > vis else 0
 
-        # Color palettes per vertically stacked stream (Input trace/fill/hdr/accent, Output trace/fill/hdr/accent)
+        # Color palettes per vertically stacked Input lane and Output lane
         in_palettes = [
             (self._rgba(0.28, 0.80, 0.98, 0.96), self._rgba(0.28, 0.80, 0.98, 0.13), self._rgba(0.10, 0.16, 0.24, 0.95), self._rgba(0.35, 0.85, 1.0, 1.0)),
             (self._rgba(0.98, 0.76, 0.24, 0.96), self._rgba(0.98, 0.76, 0.24, 0.13), self._rgba(0.22, 0.17, 0.08, 0.95), self._rgba(1.0, 0.82, 0.35, 1.0)),
@@ -3332,73 +3684,61 @@ class WaveformSnapshotWidget(Gtk.Widget):
             (self._rgba(0.95, 0.88, 0.32, 0.96), self._rgba(0.95, 0.88, 0.32, 0.13), self._rgba(0.22, 0.20, 0.08, 0.95), self._rgba(1.0, 0.94, 0.45, 1.0)),
         ]
 
-        resolved_streams: List[Tuple[List[float], List[float], float, float]] = []
+        # Build flat list of active Input lanes (num_in_lanes) followed by active Output lanes (num_out_lanes)
+        resolved_lanes: List[Tuple[str, str, List[float], float, float]] = []
+        self.last_rendered_lanes: List[Tuple[str, str, int]] = []
 
         lanes_clip = Graphene.Rect.alloc()
         lanes_clip.init(0.0, top_pad, w, viewport_lanes_h)
         snapshot.push_clip(lanes_clip)
 
-        for s_idx in range(num_streams):
-            in_lane_y = top_pad + s_idx * (stream_block_h + inter_stream_gap) - self.v_scroll_offset
-            out_lane_y = in_lane_y + lane_h + intra_pair_gap
+        cur_y = top_pad - self.v_scroll_offset
+        for in_idx in range(num_in_lanes):
+            lane_y = cur_y
+            cur_y += lane_h + (group_gap if in_idx == num_in_lanes - 1 else intra_gap)
 
-            if s_idx < len(self.multi_in_samples):
-                s_in = self.multi_in_samples[s_idx]
-            elif s_idx == 0:
+            if in_idx < len(self.multi_in_samples):
+                s_in = self.multi_in_samples[in_idx]
+            elif in_idx == 0:
                 s_in = self.in_samples
             else:
                 s_in = []
 
-            if s_idx < len(self.multi_out_samples):
-                s_out = self.multi_out_samples[s_idx]
-            elif s_idx == 0:
-                s_out = self.out_samples
-            else:
-                s_out = []
-
-            resolved_streams.append((s_in, s_out, in_lane_y, out_lane_y + lane_h))
-            if out_lane_y + lane_h < top_pad or in_lane_y > top_pad + viewport_lanes_h:
-                continue
-
             s_in_lbl = (
-                self.multi_in_labels[s_idx]
-                if s_idx < len(self.multi_in_labels)
-                else (f"STREAM {s_idx + 1} IN" if num_streams > 1 else self.in_label)
-            )
-            s_out_lbl = (
-                self.multi_out_labels[s_idx]
-                if s_idx < len(self.multi_out_labels)
-                else (
-                    self.multi_out_labels[0]
-                    if self.multi_out_labels
-                    else (f"STREAM {s_idx + 1} OUT" if num_streams > 1 else self.out_label)
-                )
+                self.multi_in_labels[in_idx]
+                if in_idx < len(self.multi_in_labels)
+                else (f"IN {in_idx + 1}" if num_in_lanes > 1 else self.in_label)
             )
             s_sig_lbl = (
-                self.multi_signal_labels[s_idx]
-                if s_idx < len(self.multi_signal_labels)
+                self.multi_signal_labels[in_idx]
+                if in_idx < len(self.multi_signal_labels)
                 else self.signal_label
             )
+            in_fmt_str = f"{s_sig_lbl} @ {self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+            title_badge = f"● {s_in_lbl}  [{in_fmt_str}]"
+            short_tag = f"IN {in_idx + 1}" if num_in_lanes > 1 else "IN"
+            resolved_lanes.append((short_tag, s_in_lbl, s_in, lane_y, lane_y + lane_h))
+            self.last_rendered_lanes.append(("in", s_in_lbl, len(s_in)))
+
+            if lane_y + lane_h < top_pad or lane_y > top_pad + viewport_lanes_h:
+                continue
 
             in_pk, in_rms = TestbenchRunner._compute_metrics(s_in)
-            out_pk, out_rms = TestbenchRunner._compute_metrics(s_out)
-
-            in_fmt_str = f"{s_sig_lbl} @ {self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
             in_dur_ms = (len(s_in) / float(max(1, self.sample_rate))) * 1000.0
             in_metrics = (
                 f"Peak: {in_pk:+.1f} dBFS  |  RMS: {in_rms:+.1f} dBFS  |  {len(s_in)} smp ({in_dur_ms:.1f} ms)"
                 if s_in
                 else "No input signal loaded"
             )
-            in_tr, in_fl, in_hb, in_ac = in_palettes[s_idx % len(in_palettes)]
+            in_tr, in_fl, in_hb, in_ac = in_palettes[in_idx % len(in_palettes)]
             self._draw_waveform_lane(
                 snapshot=snapshot,
                 lane_x=plot_x,
-                lane_y=in_lane_y,
+                lane_y=lane_y,
                 lane_w=plot_w,
                 lane_h=lane_h,
                 left_gutter=left_gutter,
-                title_badge=f"● {s_in_lbl}  [{in_fmt_str}]",
+                title_badge=title_badge,
                 metrics_badge=in_metrics,
                 samples=s_in,
                 start_idx=start_idx,
@@ -3409,22 +3749,47 @@ class WaveformSnapshotWidget(Gtk.Widget):
                 accent_color=in_ac,
             )
 
+        for out_idx in range(num_out_lanes):
+            lane_y = cur_y
+            cur_y += lane_h + intra_gap
+
+            if out_idx < len(self.multi_out_samples):
+                s_out = self.multi_out_samples[out_idx]
+            elif out_idx == 0:
+                s_out = self.out_samples
+            else:
+                s_out = []
+
+            s_out_lbl = (
+                self.multi_out_labels[out_idx]
+                if out_idx < len(self.multi_out_labels)
+                else (f"OUT {out_idx + 1}" if num_out_lanes > 1 else self.out_label)
+            )
             out_fmt_str = f"{self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+            title_badge = f"● {s_out_lbl}  [{out_fmt_str}]"
+            short_tag = f"OUT {out_idx + 1}" if num_out_lanes > 1 else "OUT"
+            resolved_lanes.append((short_tag, s_out_lbl, s_out, lane_y, lane_y + lane_h))
+            self.last_rendered_lanes.append(("out", s_out_lbl, len(s_out)))
+
+            if lane_y + lane_h < top_pad or lane_y > top_pad + viewport_lanes_h:
+                continue
+
+            out_pk, out_rms = TestbenchRunner._compute_metrics(s_out)
             out_dur_ms = (len(s_out) / float(max(1, self.sample_rate))) * 1000.0
             out_metrics = (
                 f"Peak: {out_pk:+.1f} dBFS  |  RMS: {out_rms:+.1f} dBFS  |  {len(s_out)} smp ({out_dur_ms:.1f} ms)"
                 if s_out
                 else "No output captured yet"
             )
-            out_tr, out_fl, out_hb, out_ac = out_palettes[s_idx % len(out_palettes)]
+            out_tr, out_fl, out_hb, out_ac = out_palettes[out_idx % len(out_palettes)]
             self._draw_waveform_lane(
                 snapshot=snapshot,
                 lane_x=plot_x,
-                lane_y=out_lane_y,
+                lane_y=lane_y,
                 lane_w=plot_w,
                 lane_h=lane_h,
                 left_gutter=left_gutter,
-                title_badge=f"● {s_out_lbl}  [{out_fmt_str}]",
+                title_badge=title_badge,
                 metrics_badge=out_metrics,
                 samples=s_out,
                 start_idx=start_idx,
@@ -3454,14 +3819,16 @@ class WaveformSnapshotWidget(Gtk.Widget):
             and self._hover_y is not None
             and plot_x <= self._hover_x <= plot_x + plot_w
             and top_pad <= self._hover_y <= all_lanes_bot_y
-            and resolved_streams
+            and resolved_lanes
         ):
             hov_idx = 0
-            for idx, (_sin, _sout, sy0, sy1) in enumerate(resolved_streams):
-                if sy0 <= self._hover_y <= sy1:
+            for idx, (_tag, _lbl, _smps, ly0, ly1) in enumerate(resolved_lanes):
+                if ly0 <= self._hover_y <= ly1:
                     hov_idx = idx
                     break
-            h_in, h_out, _hy0, _hy1 = resolved_streams[hov_idx]
+            h_tag, _h_lbl, h_samples, _hy0, _hy1 = resolved_lanes[hov_idx]
+            primary_in = resolved_lanes[0][2] if num_in_lanes >= 1 else self.in_samples
+            primary_out = resolved_lanes[num_in_lanes][2] if len(resolved_lanes) > num_in_lanes else self.out_samples
             self._draw_hover_crosshair(
                 snapshot=snapshot,
                 hx=self._hover_x,
@@ -3472,9 +3839,10 @@ class WaveformSnapshotWidget(Gtk.Widget):
                 bot_y=all_lanes_bot_y,
                 start_idx=start_idx,
                 vis_count=vis,
-                in_samples_col=h_in,
-                out_samples_col=h_out,
-                stream_idx=(hov_idx + 1) if num_streams > 1 else None,
+                in_samples_col=primary_in,
+                out_samples_col=primary_out,
+                hovered_tag=h_tag if total_lanes > 2 else None,
+                hovered_samples=h_samples if total_lanes > 2 else None,
             )
 
     def _draw_waveform_lane(
@@ -3742,17 +4110,12 @@ class WaveformSnapshotWidget(Gtk.Widget):
         out_samples_col: Optional[List[float]] = None,
         hy: float = 0.0,
         stream_idx: Optional[int] = None,
+        hovered_tag: Optional[str] = None,
+        hovered_samples: Optional[List[float]] = None,
     ) -> None:
         rel = max(0.0, min(1.0, (hx - plot_x) / max(1.0, plot_w)))
         smp_idx = start_idx + int(round(rel * max(1, vis_count - 1)))
         t_ms = (smp_idx / float(max(1, self.sample_rate))) * 1000.0
-
-        in_arr = in_samples_col if in_samples_col is not None else self.in_samples
-        out_arr = out_samples_col if out_samples_col is not None else self.out_samples
-        in_val = in_arr[smp_idx] if smp_idx < len(in_arr) else 0.0
-        out_val = out_arr[smp_idx] if smp_idx < len(out_arr) else 0.0
-        in_db = 20.0 * math.log10(abs(in_val)) if abs(in_val) > 1e-9 else -120.0
-        out_db = 20.0 * math.log10(abs(out_val)) if abs(out_val) > 1e-9 else -120.0
 
         # Vertical cursor line
         cpb = Gsk.PathBuilder.new()
@@ -3764,13 +4127,26 @@ class WaveformSnapshotWidget(Gtk.Widget):
             self._rgba(1.0, 0.86, 0.36, 0.85),
         )
 
-        # Floating readout pill
-        stream_prefix = f"S{stream_idx}  |  " if stream_idx is not None else ""
-        info_txt = (
-            f"{stream_prefix}Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
-            f"IN: {in_val:+.4f} ({in_db:+.1f} dBFS)  |  "
-            f"OUT: {out_val:+.4f} ({out_db:+.1f} dBFS)"
-        )
+        if hovered_tag is not None and hovered_samples is not None:
+            h_val = hovered_samples[smp_idx] if smp_idx < len(hovered_samples) else 0.0
+            h_db = 20.0 * math.log10(abs(h_val)) if abs(h_val) > 1e-9 else -120.0
+            info_txt = (
+                f"{hovered_tag}  |  Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
+                f"{h_val:+.4f} ({h_db:+.1f} dBFS)"
+            )
+        else:
+            in_arr = in_samples_col if in_samples_col is not None else self.in_samples
+            out_arr = out_samples_col if out_samples_col is not None else self.out_samples
+            in_val = in_arr[smp_idx] if smp_idx < len(in_arr) else 0.0
+            out_val = out_arr[smp_idx] if smp_idx < len(out_arr) else 0.0
+            in_db = 20.0 * math.log10(abs(in_val)) if abs(in_val) > 1e-9 else -120.0
+            out_db = 20.0 * math.log10(abs(out_val)) if abs(out_val) > 1e-9 else -120.0
+            stream_prefix = f"S{stream_idx}  |  " if stream_idx is not None else ""
+            info_txt = (
+                f"{stream_prefix}Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
+                f"IN: {in_val:+.4f} ({in_db:+.1f} dBFS)  |  "
+                f"OUT: {out_val:+.4f} ({out_db:+.1f} dBFS)"
+            )
         layout = self.create_pango_layout(info_txt)
         layout.set_font_description(Pango.FontDescription.from_string("Monospace Bold 8"))
         tw, th = layout.get_pixel_size()
@@ -3791,4 +4167,1411 @@ class WaveformSnapshotWidget(Gtk.Widget):
         snapshot.translate(pt)
         snapshot.append_layout(layout, self._rgba(0.98, 0.95, 0.82, 1.0))
         snapshot.restore()
+
+
+class SchedulingTelemetryWidget(Gtk.Widget):
+    """Custom GTK4 Gsk.Path/Snapshot widget rendering SOF Testbench Scheduling & Buffer Telemetry:
+    - Top chart: Core ID (Y-axis, Cores 0..3) vs. Time (X-axis, ms/us across LL ticks & DP periods),
+      showing which pipeline and which module are running when on each DSP core.
+    - Bottom chart: Per-module buffer statistics (IBS/OBS/CPC, IN/OUT pin buffer capacity,
+      LL entry->exit available/free bytes, DP ring fill, bytes consumed/produced, RMS/Peak dBFS,
+      and pin sample tap sparklines).
+    """
+
+    PIPE_PALETTE: List[Tuple[float, float, float]] = [
+        (0.24, 0.68, 0.96),  # Pipe 1: Cyan-Blue
+        (0.32, 0.86, 0.56),  # Pipe 2: Emerald Green
+        (0.96, 0.64, 0.24),  # Pipe 3: Amber Orange
+        (0.76, 0.46, 0.96),  # Pipe 4: Purple
+        (0.96, 0.38, 0.58),  # Pipe 5: Rose Pink
+        (0.88, 0.84, 0.28),  # Pipe 6: Yellow-Gold
+    ]
+
+    MOD_PALETTE: List[Tuple[float, float, float]] = [
+        (0.20, 0.58, 0.88),
+        (0.26, 0.76, 0.52),
+        (0.88, 0.56, 0.22),
+        (0.68, 0.42, 0.88),
+        (0.22, 0.74, 0.78),
+        (0.86, 0.38, 0.52),
+        (0.56, 0.76, 0.28),
+        (0.82, 0.68, 0.26),
+    ]
+
+    def __init__(self, on_zoom_changed: Optional[Callable[[], None]] = None):
+        super().__init__()
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+
+        self.telemetry: Optional[TestbenchTelemetry] = None
+        self.on_zoom_changed = on_zoom_changed
+
+        # Time axis zoom & pan state
+        self.time_zoom: float = 1.0          # 1.0x = show ~12 LL ticks across viewport, up to 32.0x
+        self.pan_offset_ms: float = 0.0      # Horizontal scroll offset in milliseconds
+        self.expanded_tick_mode: bool = True # Magnify sub-ms execution blocks within each 1ms tick for readability
+        self.show_all_cores: bool = True     # Show Cores 0..3 on Y axis
+
+        # Vertical scroll adjustment for the Module Buffer Stats section
+        self.v_scroll_offset: float = 0.0
+        self._updating_v_adj: bool = False
+        self._v_adj_idle_scheduled: bool = False
+        self._pending_v_adj_cfg: Optional[Tuple[float, float, float]] = None
+        self.v_adj = Gtk.Adjustment.new(0.0, 0.0, 100.0, 24.0, 96.0, 100.0)
+        self.v_adj.connect("value-changed", self._on_v_adj_value_changed)
+
+        # Interactive hover & drag state
+        self._hover_x: float = -1.0
+        self._hover_y: float = -1.0
+        self._hovered_comp_id: Optional[int] = None
+        self._hovered_pipe_id: Optional[int] = None
+        self._hovered_hit_info: Optional[Dict[str, Any]] = None
+        self._hit_boxes: List[Dict[str, Any]] = []
+        self._drag_start_pan_ms: float = 0.0
+        self._drag_start_v_scroll: float = 0.0
+        self._last_plot_w: float = 700.0
+        self._last_buf_area_y: float = 200.0
+
+        self._setup_controllers()
+
+    def _setup_controllers(self) -> None:
+        scroll_ctrl = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL
+        )
+        scroll_ctrl.connect("scroll", self._on_scroll)
+        self.add_controller(scroll_ctrl)
+
+        drag_ctrl = Gtk.GestureDrag.new()
+        drag_ctrl.set_button(1)
+        drag_ctrl.connect("drag-begin", self._on_drag_begin)
+        drag_ctrl.connect("drag-update", self._on_drag_update)
+        self.add_controller(drag_ctrl)
+
+        click_ctrl = Gtk.GestureClick.new()
+        click_ctrl.set_button(1)
+        click_ctrl.connect("pressed", self._on_click_pressed)
+        self.add_controller(click_ctrl)
+
+        motion_ctrl = Gtk.EventControllerMotion.new()
+        motion_ctrl.connect("motion", self._on_motion)
+        motion_ctrl.connect("leave", self._on_leave)
+        self.add_controller(motion_ctrl)
+
+    def _on_v_adj_value_changed(self, adj: Gtk.Adjustment) -> None:
+        if self._updating_v_adj:
+            return
+        self.v_scroll_offset = max(0.0, float(adj.get_value()))
+        self.queue_draw()
+
+    def _sync_v_adjustment(self, content_h: float, viewport_h: float) -> None:
+        eff_upper = max(content_h, viewport_h)
+        max_scroll = max(0.0, eff_upper - viewport_h)
+        if self.v_scroll_offset > max_scroll:
+            self.v_scroll_offset = max_scroll
+        if (
+            abs(self.v_adj.get_upper() - eff_upper) > 0.5
+            or abs(self.v_adj.get_page_size() - viewport_h) > 0.5
+            or abs(self.v_adj.get_value() - self.v_scroll_offset) > 0.5
+        ):
+            self._pending_v_adj_cfg = (self.v_scroll_offset, eff_upper, viewport_h)
+            if not self._v_adj_idle_scheduled:
+                self._v_adj_idle_scheduled = True
+                GLib.idle_add(self._apply_pending_v_adj_cfg)
+
+    def _apply_pending_v_adj_cfg(self) -> bool:
+        self._v_adj_idle_scheduled = False
+        cfg = self._pending_v_adj_cfg
+        self._pending_v_adj_cfg = None
+        if cfg is None:
+            return False
+        val, eff_upper, viewport_h = cfg
+        self._updating_v_adj = True
+        try:
+            self.v_adj.configure(
+                val,
+                0.0,
+                eff_upper,
+                28.0,
+                max(48.0, viewport_h * 0.75),
+                viewport_h,
+            )
+        finally:
+            self._updating_v_adj = False
+        return False
+
+    def set_telemetry(self, telemetry: Optional[TestbenchTelemetry]) -> None:
+        self.telemetry = telemetry
+        self._clamp_pan()
+        self._notify_zoom()
+        self.queue_draw()
+
+    def set_expanded_tick_mode(self, expanded: bool) -> None:
+        self.expanded_tick_mode = bool(expanded)
+        self._notify_zoom()
+        self.queue_draw()
+
+    def zoom_in_time(self, factor: float = 1.4) -> None:
+        self.time_zoom = min(32.0, self.time_zoom * factor)
+        self._clamp_pan()
+        self._notify_zoom()
+        self.queue_draw()
+
+    def zoom_out_time(self, factor: float = 1.4) -> None:
+        self.time_zoom = max(0.25, self.time_zoom / factor)
+        self._clamp_pan()
+        self._notify_zoom()
+        self.queue_draw()
+
+    def reset_zoom(self) -> None:
+        self.time_zoom = 1.0
+        self.pan_offset_ms = 0.0
+        self.v_scroll_offset = 0.0
+        self._notify_zoom()
+        self.queue_draw()
+
+    def _get_total_duration_ms(self) -> float:
+        telem = self.telemetry
+        if not telem:
+            return 10.0
+        ticks = max(1, telem.total_ll_ticks)
+        if ticks <= 1 and telem.components:
+            ticks = max([1] + [c.iterations for c in telem.components])
+        period_ms = 1.0
+        if telem.pipelines:
+            p_us = max((p.period_us for p in telem.pipelines if p.period_us > 0), default=1000)
+            period_ms = max(0.25, p_us / 1000.0)
+        return max(4.0, float(ticks) * period_ms)
+
+    def _get_visible_window_ms(self) -> float:
+        total_ms = self._get_total_duration_ms()
+        base_win = min(total_ms, 12.0)
+        return max(0.5, min(total_ms, base_win / max(0.25, self.time_zoom)))
+
+    def _clamp_pan(self) -> None:
+        total_ms = self._get_total_duration_ms()
+        vis_ms = self._get_visible_window_ms()
+        max_pan = max(0.0, total_ms - vis_ms)
+        self.pan_offset_ms = max(0.0, min(max_pan, self.pan_offset_ms))
+
+    def get_zoom_summary_text(self) -> str:
+        vis_ms = self._get_visible_window_ms()
+        total_ms = self._get_total_duration_ms()
+        mode_tag = "Expanded Slices" if self.expanded_tick_mode else "True 1:1 µs"
+        return f"Win: {vis_ms:.2f}/{total_ms:.1f} ms ({self.time_zoom:.1f}×, {mode_tag})"
+
+    def _notify_zoom(self) -> None:
+        if self.on_zoom_changed:
+            self.on_zoom_changed()
+
+    def _on_scroll(
+        self,
+        ctrl: Gtk.EventControllerScroll,
+        dx: float,
+        dy: float,
+    ) -> bool:
+        state = ctrl.get_current_event_state()
+        shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+
+        # If scrolling over the bottom buffer stats area without Ctrl/Shift, scroll buffer rows vertically
+        if not ctrl_held and not shift_held and self._hover_y >= self._last_buf_area_y:
+            step = 34.0
+            self.v_adj.set_value(
+                max(
+                    0.0,
+                    min(
+                        self.v_adj.get_upper() - self.v_adj.get_page_size(),
+                        self.v_adj.get_value() + dy * step,
+                    ),
+                )
+            )
+            return True
+
+        if shift_held or abs(dx) > abs(dy):
+            delta = dx if abs(dx) > abs(dy) else dy
+            vis_ms = self._get_visible_window_ms()
+            self.pan_offset_ms += delta * max(0.25, vis_ms * 0.12)
+            self._clamp_pan()
+            self._notify_zoom()
+            self.queue_draw()
+            return True
+
+        if dy < 0:
+            self.zoom_in_time(1.25)
+        elif dy > 0:
+            self.zoom_out_time(1.25)
+        return True
+
+    def _on_drag_begin(self, _gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
+        self._drag_start_pan_ms = self.pan_offset_ms
+        self._drag_start_v_scroll = self.v_scroll_offset
+        self._hover_x = start_x
+        self._hover_y = start_y
+
+    def _on_drag_update(self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
+        vis_ms = self._get_visible_window_ms()
+        ms_per_px = vis_ms / max(60.0, self._last_plot_w)
+        self.pan_offset_ms = self._drag_start_pan_ms - offset_x * ms_per_px
+        self._clamp_pan()
+        if self._hover_y >= self._last_buf_area_y:
+            max_s = max(0.0, self.v_adj.get_upper() - self.v_adj.get_page_size())
+            self.v_adj.set_value(max(0.0, min(max_s, self._drag_start_v_scroll - offset_y)))
+        self._notify_zoom()
+        self.queue_draw()
+
+    def _on_click_pressed(
+        self,
+        _gesture: Gtk.GestureClick,
+        n_press: int,
+        _x: float,
+        _y: float,
+    ) -> None:
+        if n_press == 2:
+            self.reset_zoom()
+
+    def _on_motion(self, _ctrl: Gtk.EventControllerMotion, x: float, y: float) -> None:
+        self._hover_x = x
+        self._hover_y = y
+        self._update_hover_hit(x, y)
+        self.queue_draw()
+
+    def _on_leave(self, _ctrl: Gtk.EventControllerMotion) -> None:
+        self._hover_x = -1.0
+        self._hover_y = -1.0
+        self._hovered_comp_id = None
+        self._hovered_pipe_id = None
+        self._hovered_hit_info = None
+        self.queue_draw()
+
+    def _update_hover_hit(self, x: float, y: float) -> None:
+        self._hovered_comp_id = None
+        self._hovered_pipe_id = None
+        self._hovered_hit_info = None
+        for hb in reversed(self._hit_boxes):
+            if hb["x"] <= x <= hb["x"] + hb["w"] and hb["y"] <= y <= hb["y"] + hb["h"]:
+                self._hovered_comp_id = hb.get("comp_id")
+                self._hovered_pipe_id = hb.get("pipe_id")
+                self._hovered_hit_info = hb
+                break
+
+    @staticmethod
+    def _rgba(r: float, g: float, b: float, a: float = 1.0) -> Gdk.RGBA:
+        c = Gdk.RGBA()
+        c.red, c.green, c.blue, c.alpha = r, g, b, a
+        return c
+
+    def _draw_text(
+        self,
+        snapshot: Gtk.Snapshot,
+        text: str,
+        x: float,
+        y: float,
+        font_str: str,
+        color: Gdk.RGBA,
+        max_w: Optional[float] = None,
+    ) -> Tuple[int, int]:
+        layout = self.create_pango_layout(text)
+        layout.set_font_description(Pango.FontDescription.from_string(font_str))
+        if max_w is not None and max_w > 8.0:
+            layout.set_width(int(max_w * Pango.SCALE))
+            layout.set_ellipsize(Pango.EllipsizeMode.END)
+        tw, th = layout.get_pixel_size()
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(float(x), float(y))
+        snapshot.translate(pt)
+        snapshot.append_layout(layout, color)
+        snapshot.restore()
+        return tw, th
+
+    def _draw_rect_fill_stroke(
+        self,
+        snapshot: Gtk.Snapshot,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        fill_rgba: Optional[Gdk.RGBA],
+        stroke_rgba: Optional[Gdk.RGBA] = None,
+        stroke_width: float = 1.0,
+    ) -> None:
+        if w <= 0.2 or h <= 0.2:
+            return
+        rect = Graphene.Rect.alloc()
+        rect.init(float(x), float(y), float(w), float(h))
+        if fill_rgba is not None:
+            snapshot.append_color(fill_rgba, rect)
+        if stroke_rgba is not None:
+            pb = Gsk.PathBuilder.new()
+            pb.add_rect(rect)
+            snapshot.append_stroke(pb.to_path(), Gsk.Stroke.new(stroke_width), stroke_rgba)
+
+    def _pipe_color(self, pipe_id: int) -> Tuple[float, float, float]:
+        idx = max(0, pipe_id - 1) % len(self.PIPE_PALETTE)
+        return self.PIPE_PALETTE[idx]
+
+    def _mod_color(self, comp_id: int, pipe_id: int) -> Tuple[float, float, float]:
+        idx = (comp_id + max(0, pipe_id - 1) * 3) % len(self.MOD_PALETTE)
+        return self.MOD_PALETTE[idx]
+
+    def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:
+        w = float(self.get_width()) or 920.0
+        h = float(self.get_height()) or 240.0
+        if w <= 10 or h <= 10:
+            w, h = 920.0, 240.0
+
+        self._hit_boxes = []
+
+        # Overall dark background
+        bg_rect = Graphene.Rect.alloc()
+        bg_rect.init(0.0, 0.0, w, h)
+        snapshot.append_color(self._rgba(0.07, 0.08, 0.11, 1.0), bg_rect)
+
+        telem = self.telemetry
+        has_sched_data = bool(
+            telem
+            and (
+                telem.total_ll_ticks > 0
+                or any(c.iterations > 0 or c.in_pins or c.out_pins for c in telem.components)
+                or telem.pipelines
+            )
+        )
+        if not has_sched_data:
+            self._draw_text(
+                snapshot,
+                "No scheduling or buffer telemetry captured yet — click [▶ Run in Testbench] to profile Core Schedule & Module Buffers",
+                16.0,
+                h * 0.45,
+                "Sans Italic 9.5",
+                self._rgba(0.62, 0.68, 0.78, 0.85),
+                max_w=w - 32.0,
+            )
+            return
+
+        assert telem is not None
+
+        # Layout split between:
+        # 1) Top: Core ID (Y-axis) vs. Time (X-axis) Schedule Timeline
+        # 2) Bottom: Module Buffer Stats & Pin Telemetry Inspector
+        top_header_h = 20.0
+        time_axis_h = 18.0
+        sched_fraction = 0.54 if h >= 220.0 else 0.50
+        sched_total_h = max(108.0, min(h - 72.0, round(h * sched_fraction)))
+        buf_section_y = sched_total_h + 2.0
+        buf_section_h = max(60.0, h - buf_section_y)
+        self._last_buf_area_y = buf_section_y
+
+        gutter_w = 156.0
+        right_pad = 10.0
+        plot_x = gutter_w
+        plot_w = max(80.0, w - gutter_w - right_pad)
+        self._last_plot_w = plot_w
+
+        # ------------------------------------------------------------------
+        # 1. Top Section Header & Legend
+        # ------------------------------------------------------------------
+        self._draw_rect_fill_stroke(
+            snapshot,
+            0.0,
+            0.0,
+            w,
+            top_header_h,
+            self._rgba(0.10, 0.12, 0.17, 1.0),
+            self._rgba(0.22, 0.26, 0.34, 0.9),
+            1.0,
+        )
+        active_pipes = sorted(telem.pipelines, key=lambda p: p.pipeline_id)
+        active_mods = [
+            c for c in telem.components if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        if not active_mods:
+            active_mods = list(telem.components)
+
+        total_ticks = max(
+            1,
+            telem.total_ll_ticks,
+            max((c.iterations for c in active_mods), default=1),
+        )
+        period_us = max((p.period_us for p in active_pipes if p.period_us > 0), default=1000)
+        period_ms = max(0.25, float(period_us) / 1000.0)
+        total_ms = self._get_total_duration_ms()
+        vis_ms = self._get_visible_window_ms()
+        self._clamp_pan()
+        t_start_ms = self.pan_offset_ms
+        t_end_ms = t_start_ms + vis_ms
+
+        hdr_text = (
+            f"DSP CORE SCHEDULE TIMELINE (Y: Core ID  ×  X: Time)  —  "
+            f"{total_ticks} LL Ticks ({period_us} µs/tick)  |  "
+            f"{len(active_pipes)} Pipelines  |  {len(active_mods)} Active Modules"
+        )
+        self._draw_text(
+            snapshot,
+            hdr_text,
+            8.0,
+            3.0,
+            "Monospace Bold 8",
+            self._rgba(0.84, 0.91, 0.98, 1.0),
+            max_w=w * 0.62,
+        )
+
+        # Draw Pipeline color legend pills in top right of header
+        leg_x = w - right_pad
+        for p in reversed(active_pipes):
+            pr, pg, pb_col = self._pipe_color(p.pipeline_id)
+            p_lbl = f"Pipe {p.pipeline_id} (C{p.core_id}•{p.exec_avg_us:.1f}µs)"
+            layout = self.create_pango_layout(p_lbl)
+            layout.set_font_description(Pango.FontDescription.from_string("Monospace Bold 7.5"))
+            tw, th = layout.get_pixel_size()
+            pill_w = float(tw + 14)
+            leg_x -= pill_w + 5.0
+            if leg_x < w * 0.55:
+                break
+            self._draw_rect_fill_stroke(
+                snapshot,
+                leg_x,
+                2.5,
+                pill_w,
+                top_header_h - 5.0,
+                self._rgba(pr, pg, pb_col, 0.25),
+                self._rgba(pr, pg, pb_col, 0.85),
+                1.0,
+            )
+            self._draw_text(
+                snapshot,
+                p_lbl,
+                leg_x + 6.0,
+                3.5,
+                "Monospace Bold 7.5",
+                self._rgba(0.95, 0.97, 1.0, 1.0),
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Core Swimlanes (Y-Axis = Core 0..3) & Time Grid (X-Axis = ms)
+        # ------------------------------------------------------------------
+        lanes_top_y = top_header_h
+        lanes_bot_y = sched_total_h - time_axis_h
+        lanes_h = max(60.0, lanes_bot_y - lanes_top_y)
+
+        cores_by_id: Dict[int, CoreTelemetry] = {c.core_id: c for c in telem.cores}
+        num_cores = 4
+        lane_h = lanes_h / float(num_cores)
+
+        # Group pipelines and modules by core_id
+        pipes_by_core: Dict[int, List[PipelineSchedTelemetry]] = {cid: [] for cid in range(num_cores)}
+        for p in active_pipes:
+            cid = p.core_id if 0 <= p.core_id < num_cores else 0
+            pipes_by_core[cid].append(p)
+
+        mods_by_core: Dict[int, List[ComponentPerfItem]] = {cid: [] for cid in range(num_cores)}
+        for m in active_mods:
+            cid = m.core_id if 0 <= m.core_id < num_cores else 0
+            mods_by_core[cid].append(m)
+        for cid in range(num_cores):
+            mods_by_core[cid].sort(key=lambda c: (c.pipeline_id, c.comp_id))
+
+        # Helper to map time (ms) -> X pixel
+        def time_to_x(t_ms: float) -> float:
+            return plot_x + ((t_ms - t_start_ms) / max(1e-6, vis_ms)) * plot_w
+
+        # Determine visible LL tick range
+        first_tick = max(0, int(math.floor(t_start_ms / period_ms)))
+        last_tick = min(total_ticks - 1, int(math.ceil(t_end_ms / period_ms)))
+
+        # Draw each Core swimlane background & Y-axis header
+        for cid in range(num_cores):
+            ly = lanes_top_y + cid * lane_h
+            c_info = cores_by_id.get(cid)
+            has_work = bool(
+                (c_info and (c_info.ll_ticks > 0 or c_info.dp_runs > 0 or c_info.avg_cycles > 0))
+                or pipes_by_core[cid]
+                or mods_by_core[cid]
+            )
+            is_enabled = bool(c_info.enabled) if c_info else (cid == 0 or has_work)
+
+            bg_col = (
+                self._rgba(0.09, 0.11, 0.16, 1.0)
+                if (cid % 2 == 0)
+                else self._rgba(0.075, 0.09, 0.135, 1.0)
+            )
+            self._draw_rect_fill_stroke(
+                snapshot,
+                0.0,
+                ly,
+                w,
+                lane_h,
+                bg_col,
+                self._rgba(0.18, 0.22, 0.30, 0.85),
+                1.0,
+            )
+
+            # Left Y-Axis Core ID Gutter
+            gutter_bg = (
+                self._rgba(0.12, 0.16, 0.23, 1.0)
+                if has_work
+                else (
+                    self._rgba(0.10, 0.12, 0.17, 1.0)
+                    if is_enabled
+                    else self._rgba(0.08, 0.09, 0.12, 1.0)
+                )
+            )
+            self._draw_rect_fill_stroke(
+                snapshot,
+                0.0,
+                ly,
+                gutter_w,
+                lane_h,
+                gutter_bg,
+                self._rgba(0.24, 0.29, 0.38, 0.9),
+                1.0,
+            )
+
+            freq_mhz = (c_info.freq_hz / 1e6) if (c_info and c_info.freq_hz > 0) else 393.2
+            util_pct = c_info.util_pct if c_info else 0.0
+            core_title = f"Core {cid}"
+            status_tag = f"{freq_mhz:.0f}MHz • {util_pct:.2f}%" if is_enabled else "OFFLINE"
+            title_col = (
+                self._rgba(0.45, 0.88, 1.0, 1.0)
+                if has_work
+                else (
+                    self._rgba(0.75, 0.82, 0.90, 0.9)
+                    if is_enabled
+                    else self._rgba(0.48, 0.52, 0.60, 0.75)
+                )
+            )
+            self._draw_text(
+                snapshot,
+                f"{core_title}  [{status_tag}]",
+                6.0,
+                ly + 2.0,
+                "Monospace Bold 8",
+                title_col,
+                max_w=gutter_w - 10.0,
+            )
+
+            if c_info and is_enabled and lane_h >= 24.0:
+                sub_line = (
+                    f"LL:{c_info.ll_exec_avg_us:.1f}/{c_info.ll_exec_peak_us:.1f}µs "
+                    f"({c_info.avg_kcps}kcps)"
+                )
+                if c_info.dp_runs > 0:
+                    sub_line += f" DP:{c_info.dp_runs}"
+                if c_info.overruns > 0:
+                    sub_line += f" XRUN:{c_info.overruns}"
+                self._draw_text(
+                    snapshot,
+                    sub_line,
+                    6.0,
+                    ly + min(lane_h - 11.0, 13.5),
+                    "Monospace 7",
+                    self._rgba(0.72, 0.79, 0.88, 0.9),
+                    max_w=gutter_w - 10.0,
+                )
+
+                # Mini core utilization bar at bottom of gutter cell
+                if lane_h >= 30.0:
+                    bar_y = ly + lane_h - 5.5
+                    bar_w = gutter_w - 12.0
+                    self._draw_rect_fill_stroke(
+                        snapshot,
+                        6.0,
+                        bar_y,
+                        bar_w,
+                        3.5,
+                        self._rgba(0.05, 0.06, 0.09, 0.9),
+                        None,
+                    )
+                    fill_ratio = min(1.0, max(0.03 if has_work else 0.0, util_pct / 25.0))
+                    u_col = (
+                        self._rgba(0.95, 0.35, 0.35, 0.95)
+                        if util_pct > 80.0
+                        else (
+                            self._rgba(0.95, 0.75, 0.25, 0.95)
+                            if util_pct > 40.0
+                            else self._rgba(0.28, 0.82, 0.58, 0.95)
+                        )
+                    )
+                    self._draw_rect_fill_stroke(
+                        snapshot,
+                        6.0,
+                        bar_y,
+                        bar_w * fill_ratio,
+                        3.5,
+                        u_col,
+                        None,
+                    )
+
+        # Clip timeline drawing to the plot area
+        clip_rect = Graphene.Rect.alloc()
+        clip_rect.init(plot_x, lanes_top_y, plot_w, lanes_h + time_axis_h)
+        snapshot.push_clip(clip_rect)
+
+        # Draw vertical LL tick grid lines & sub-tick grid lines across all Core lanes
+        tick_px_w = (period_ms / max(1e-6, vis_ms)) * plot_w
+        tick_step = max(1, int(math.ceil(42.0 / max(1.0, tick_px_w))))
+
+        for tick_idx in range(first_tick, last_tick + 2):
+            t_ms = tick_idx * period_ms
+            tx = time_to_x(t_ms)
+            if plot_x - 2.0 <= tx <= plot_x + plot_w + 2.0:
+                is_major = (tick_idx % tick_step) == 0
+                pb = Gsk.PathBuilder.new()
+                pb.move_to(tx, lanes_top_y)
+                pb.line_to(tx, lanes_bot_y)
+                snapshot.append_stroke(
+                    pb.to_path(),
+                    Gsk.Stroke.new(1.0 if is_major else 0.6),
+                    self._rgba(0.26, 0.32, 0.44, 0.55 if is_major else 0.25),
+                )
+
+                # Sub-tick 0.25ms / 0.5ms grid lines when zoomed in
+                if tick_px_w >= 110.0:
+                    for sub_i in (1, 2, 3):
+                        sub_x = tx + (sub_i * 0.25) * tick_px_w
+                        if plot_x <= sub_x <= plot_x + plot_w:
+                            spb = Gsk.PathBuilder.new()
+                            spb.move_to(sub_x, lanes_top_y)
+                            spb.line_to(sub_x, lanes_bot_y)
+                            snapshot.append_stroke(
+                                spb.to_path(),
+                                Gsk.Stroke.new(0.5),
+                                self._rgba(0.20, 0.25, 0.35, 0.22),
+                            )
+
+        # Render Pipeline & Module execution blocks inside each Core lane along the Time X-axis
+        for cid in range(num_cores):
+            core_mods = mods_by_core[cid]
+            core_pipes = pipes_by_core[cid]
+            c_info = cores_by_id.get(cid)
+            if not core_mods and not core_pipes:
+                continue
+
+            ly = lanes_top_y + cid * lane_h
+            ll_mods = [m for m in core_mods if m.domain.upper() != "DP"]
+            dp_mods = [m for m in core_mods if m.domain.upper() == "DP"]
+
+            has_dp = bool(dp_mods or (c_info and c_info.dp_runs > 0))
+            pipe_band_h = min(13.0, max(9.0, lane_h * 0.28))
+            mod_band_y = ly + pipe_band_h + 2.0
+            mod_band_h = max(
+                10.0,
+                (lane_h - pipe_band_h - (13.0 if has_dp else 3.0)),
+            )
+            dp_band_y = mod_band_y + mod_band_h + 1.5
+            dp_band_h = max(8.0, ly + lane_h - dp_band_y - 1.5) if has_dp else 0.0
+
+            # Compute total LL execution time on this core per tick (in us)
+            total_mod_exec_us = sum(
+                max(0.05, m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216))
+                for m in ll_mods
+            )
+            core_ll_us = (
+                c_info.ll_exec_avg_us
+                if (c_info and c_info.ll_exec_avg_us > 0)
+                else max(total_mod_exec_us, sum(p.exec_avg_us for p in core_pipes))
+            )
+            core_ll_us = max(core_ll_us, total_mod_exec_us, 0.2)
+
+            # In Expanded Tick View, scale the active LL execution window to occupy 76% of the tick slot
+            # (or proportional to utilization) so module sequence & relative duration are clearly visible.
+            # In True 1:1 µs View, use exact (exec_us / period_us) width.
+            for tick_idx in range(first_tick, last_tick + 1):
+                tick_start_ms = tick_idx * period_ms
+                tick_x = time_to_x(tick_start_ms)
+                if tick_x + tick_px_w < plot_x or tick_x > plot_x + plot_w:
+                    continue
+
+                if self.expanded_tick_mode:
+                    # Keep proportional differences between cores while ensuring readability
+                    busy_frac = min(0.84, max(0.58, (core_ll_us / float(period_us)) * 18.0))
+                    active_span_px = max(12.0, tick_px_w * busy_frac)
+                else:
+                    true_frac = min(0.98, max(0.004, core_ll_us / float(period_us)))
+                    active_span_px = max(3.0, tick_px_w * true_frac)
+
+                # 2a. Draw Pipeline Execution Spans in the top band of Core `cid`
+                cur_px = tick_x + 1.0
+                pipes_for_tick = [p for p in core_pipes if tick_idx < max(1, p.copies)]
+                if not pipes_for_tick and ll_mods:
+                    # Synthesize pipeline grouping from modules if pipeline list is empty
+                    seen_pids: List[int] = []
+                    for m in ll_mods:
+                        if m.pipeline_id not in seen_pids:
+                            seen_pids.append(m.pipeline_id)
+                    pipes_for_tick = [
+                        PipelineSchedTelemetry(
+                            pipeline_id=pid,
+                            core_id=cid,
+                            period_us=period_us,
+                            copies=total_ticks,
+                            exec_avg_us=sum(
+                                max(0.05, m.exec_avg_us) for m in ll_mods if m.pipeline_id == pid
+                            ),
+                        )
+                        for pid in seen_pids
+                    ]
+
+                total_pipe_us = sum(max(0.05, p.exec_avg_us) for p in pipes_for_tick) or 1.0
+                for p_obj in pipes_for_tick:
+                    p_frac = max(0.05, p_obj.exec_avg_us) / total_pipe_us
+                    pw = max(4.0, active_span_px * p_frac - 1.0)
+                    pr, pg, pb_col = self._pipe_color(p_obj.pipeline_id)
+                    is_p_hov = (
+                        self._hovered_pipe_id == p_obj.pipeline_id and self._hovered_comp_id is None
+                    )
+                    self._draw_rect_fill_stroke(
+                        snapshot,
+                        cur_px,
+                        ly + 1.5,
+                        pw,
+                        pipe_band_h,
+                        self._rgba(pr, pg, pb_col, 0.48 if is_p_hov else 0.32),
+                        self._rgba(pr, pg, pb_col, 1.0 if is_p_hov else 0.80),
+                        1.2 if is_p_hov else 0.9,
+                    )
+                    if pw >= 26.0:
+                        p_txt = (
+                            f"Pipe {p_obj.pipeline_id} ({p_obj.exec_avg_us:.2f}µs)"
+                            if pw >= 68.0
+                            else f"P{p_obj.pipeline_id}"
+                        )
+                        self._draw_text(
+                            snapshot,
+                            p_txt,
+                            cur_px + 3.0,
+                            ly + 1.5,
+                            "Monospace Bold 7",
+                            self._rgba(0.96, 0.98, 1.0, 0.98),
+                            max_w=pw - 4.0,
+                        )
+                    self._hit_boxes.append(
+                        {
+                            "kind": "pipeline",
+                            "pipe_id": p_obj.pipeline_id,
+                            "core_id": cid,
+                            "tick_idx": tick_idx,
+                            "time_ms": tick_start_ms,
+                            "pipe": p_obj,
+                            "x": cur_px,
+                            "y": ly + 1.5,
+                            "w": pw,
+                            "h": pipe_band_h,
+                        }
+                    )
+                    cur_px += pw + 1.0
+
+                # 2b. Draw sequential Module Execution Blocks inside Core `cid`
+                mod_x = tick_x + 1.0
+                mods_in_tick = [m for m in ll_mods if tick_idx < max(1, m.iterations)]
+                tot_m_us = (
+                    sum(
+                        max(0.05, m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216))
+                        for m in mods_in_tick
+                    )
+                    or 1.0
+                )
+                cum_us = 0.0
+                for m_obj in mods_in_tick:
+                    m_us = max(
+                        0.05,
+                        m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216),
+                    )
+                    m_frac = m_us / tot_m_us
+                    mw = max(3.5, active_span_px * m_frac - 1.0)
+                    mr, mg, mb_col = self._mod_color(m_obj.comp_id, m_obj.pipeline_id)
+                    is_hov = self._hovered_comp_id == m_obj.comp_id
+
+                    self._draw_rect_fill_stroke(
+                        snapshot,
+                        mod_x,
+                        mod_band_y,
+                        mw,
+                        mod_band_h,
+                        self._rgba(mr, mg, mb_col, 0.82 if is_hov else 0.56),
+                        self._rgba(
+                            1.0 if is_hov else mr * 1.15,
+                            0.92 if is_hov else mg * 1.15,
+                            0.42 if is_hov else mb_col * 1.15,
+                            1.0 if is_hov else 0.9,
+                        ),
+                        1.5 if is_hov else 1.0,
+                    )
+
+                    # Mini buffer fill indicator bar along the bottom edge of the module block
+                    if mod_band_h >= 14.0 and mw >= 8.0 and (m_obj.in_pins or m_obj.out_pins):
+                        in_fill = 0.0
+                        if m_obj.in_pins and m_obj.in_pins[0].buf_size > 0:
+                            in_fill = min(
+                                1.0,
+                                m_obj.in_pins[0].ll_entry_avail / float(m_obj.in_pins[0].buf_size),
+                            )
+                        out_fill = 0.0
+                        if m_obj.out_pins and m_obj.out_pins[0].buf_size > 0:
+                            out_fill = min(
+                                1.0,
+                                m_obj.out_pins[0].ll_exit_avail / float(m_obj.out_pins[0].buf_size),
+                            )
+                        bf_h = 3.0
+                        bf_y = mod_band_y + mod_band_h - bf_h - 0.5
+                        half_w = max(2.0, (mw - 2.0) * 0.5)
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            mod_x + 1.0,
+                            bf_y,
+                            half_w * in_fill,
+                            bf_h,
+                            self._rgba(0.32, 0.92, 0.98, 0.95),
+                            None,
+                        )
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            mod_x + 1.0 + half_w,
+                            bf_y,
+                            half_w * out_fill,
+                            bf_h,
+                            self._rgba(0.42, 0.98, 0.56, 0.95),
+                            None,
+                        )
+
+                    if mw >= 22.0:
+                        short_name = m_obj.widget_name
+                        lbl = (
+                            f"{short_name} ({m_us:.2f}µs)"
+                            if mw >= 78.0
+                            else short_name
+                        )
+                        self._draw_text(
+                            snapshot,
+                            lbl,
+                            mod_x + 2.5,
+                            mod_band_y + 1.0,
+                            "Monospace Bold 7",
+                            self._rgba(0.98, 0.99, 1.0, 1.0),
+                            max_w=mw - 4.0,
+                        )
+
+                    self._hit_boxes.append(
+                        {
+                            "kind": "module_slice",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": cid,
+                            "tick_idx": tick_idx,
+                            "start_us": tick_idx * period_us + cum_us,
+                            "dur_us": m_us,
+                            "mod": m_obj,
+                            "x": mod_x,
+                            "y": mod_band_y,
+                            "w": mw,
+                            "h": mod_band_h,
+                        }
+                    )
+                    cum_us += m_us
+                    mod_x += mw + 1.0
+
+            # 2c. Draw DP Thread Execution Spans & LL-Sync markers if Core has DP modules
+            if has_dp and dp_band_h >= 6.0:
+                for dm in dp_mods:
+                    dp_iters = max(1, dm.iterations)
+                    ticks_per_dp = max(1, total_ticks // dp_iters)
+                    mr, mg, mb_col = self._mod_color(dm.comp_id, dm.pipeline_id)
+                    is_hov = self._hovered_comp_id == dm.comp_id
+                    for dp_idx in range(dp_iters):
+                        dp_t0_ms = dp_idx * ticks_per_dp * period_ms
+                        dp_span_ms = ticks_per_dp * period_ms * 0.85
+                        dx0 = time_to_x(dp_t0_ms)
+                        dx1 = time_to_x(dp_t0_ms + dp_span_ms)
+                        dw = max(6.0, dx1 - dx0)
+                        if dx0 + dw < plot_x or dx0 > plot_x + plot_w:
+                            continue
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            dx0,
+                            dp_band_y,
+                            dw,
+                            dp_band_h,
+                            self._rgba(0.92, 0.58, 0.18, 0.78 if is_hov else 0.52),
+                            self._rgba(1.0, 0.78, 0.32, 0.95),
+                            1.0,
+                        )
+                        if dw >= 32.0:
+                            self._draw_text(
+                                snapshot,
+                                f"[DP] {dm.widget_name} ({dm.exec_avg_us:.1f}µs)",
+                                dx0 + 3.0,
+                                dp_band_y,
+                                "Monospace Bold 6.5",
+                                self._rgba(1.0, 0.96, 0.88, 1.0),
+                                max_w=dw - 5.0,
+                            )
+                        self._hit_boxes.append(
+                            {
+                                "kind": "module_slice",
+                                "comp_id": dm.comp_id,
+                                "pipe_id": dm.pipeline_id,
+                                "core_id": cid,
+                                "tick_idx": dp_idx * ticks_per_dp,
+                                "start_us": dp_t0_ms * 1000.0,
+                                "dur_us": dm.exec_avg_us,
+                                "mod": dm,
+                                "x": dx0,
+                                "y": dp_band_y,
+                                "w": dw,
+                                "h": dp_band_h,
+                            }
+                        )
+
+        # ------------------------------------------------------------------
+        # 3. X-Axis Time Ruler (bottom of Core Schedule Timeline)
+        # ------------------------------------------------------------------
+        self._draw_rect_fill_stroke(
+            snapshot,
+            0.0,
+            lanes_bot_y,
+            w,
+            time_axis_h,
+            self._rgba(0.10, 0.12, 0.17, 1.0),
+            self._rgba(0.24, 0.28, 0.38, 0.9),
+            1.0,
+        )
+        self._draw_text(
+            snapshot,
+            "Time (ms / LL Tick) ▸",
+            6.0,
+            lanes_bot_y + 2.5,
+            "Monospace Bold 7.5",
+            self._rgba(0.75, 0.82, 0.92, 0.95),
+            max_w=gutter_w - 8.0,
+        )
+
+        for tick_idx in range(first_tick, last_tick + 2, tick_step):
+            t_ms = tick_idx * period_ms
+            tx = time_to_x(t_ms)
+            if plot_x <= tx <= plot_x + plot_w - 28.0:
+                lbl = f"{t_ms:.1f}ms (T{tick_idx})" if tick_px_w >= 55.0 else f"{t_ms:.1f}ms"
+                self._draw_text(
+                    snapshot,
+                    lbl,
+                    tx + 2.0,
+                    lanes_bot_y + 2.5,
+                    "Monospace 7.5",
+                    self._rgba(0.82, 0.88, 0.96, 0.95),
+                )
+
+        snapshot.pop()
+
+        # ------------------------------------------------------------------
+        # 4. Bottom Section: Module Buffer Stats & Pin Fill Inspector
+        # ------------------------------------------------------------------
+        buf_hdr_h = 19.0
+        self._draw_rect_fill_stroke(
+            snapshot,
+            0.0,
+            buf_section_y,
+            w,
+            buf_hdr_h,
+            self._rgba(0.11, 0.14, 0.20, 1.0),
+            self._rgba(0.25, 0.30, 0.40, 0.95),
+            1.0,
+        )
+
+        total_xfer_bytes = sum(
+            sum(p.total_bytes_transferred for p in m.in_pins)
+            + sum(p.total_bytes_transferred for p in m.out_pins)
+            for m in active_mods
+        )
+        cpc_violations = sum(m.cpc_violations for m in active_mods)
+        self._draw_text(
+            snapshot,
+            f"MODULE BUFFER STATS & PIN TELEMETRY  —  {len(active_mods)} Modules  |  "
+            f"Total Pin Xfer: {total_xfer_bytes:,} B  |  CPC Violations: {cpc_violations}",
+            8.0,
+            buf_section_y + 2.5,
+            "Monospace Bold 8",
+            self._rgba(0.84, 0.92, 0.98, 1.0),
+            max_w=w - 16.0,
+        )
+
+        rows_top_y = buf_section_y + buf_hdr_h
+        rows_viewport_h = max(30.0, h - rows_top_y)
+        row_h = 30.0
+        content_h = max(rows_viewport_h, len(active_mods) * row_h + 4.0)
+        self._sync_v_adjustment(content_h, rows_viewport_h)
+
+        rows_clip = Graphene.Rect.alloc()
+        rows_clip.init(0.0, rows_top_y, w, rows_viewport_h)
+        snapshot.push_clip(rows_clip)
+
+        col_mod_w = min(230.0, max(165.0, w * 0.24))
+        col_exec_w = min(175.0, max(130.0, w * 0.18))
+        rem_w = max(160.0, w - col_mod_w - col_exec_w - 12.0)
+        col_in_w = rem_w * 0.50
+        col_out_w = rem_w * 0.50
+
+        for idx, m_obj in enumerate(active_mods):
+            ry = rows_top_y + idx * row_h - self.v_scroll_offset
+            if ry + row_h < rows_top_y or ry > rows_top_y + rows_viewport_h:
+                continue
+
+            is_hov = self._hovered_comp_id == m_obj.comp_id
+            row_bg = (
+                self._rgba(0.16, 0.22, 0.32, 0.95)
+                if is_hov
+                else (
+                    self._rgba(0.085, 0.10, 0.145, 0.95)
+                    if (idx % 2 == 0)
+                    else self._rgba(0.075, 0.09, 0.13, 0.95)
+                )
+            )
+            self._draw_rect_fill_stroke(
+                snapshot,
+                0.0,
+                ry,
+                w,
+                row_h,
+                row_bg,
+                self._rgba(0.20, 0.25, 0.34, 0.75),
+                0.8,
+            )
+
+            # Color stripe on left matching module's timeline color
+            mr, mg, mb_col = self._mod_color(m_obj.comp_id, m_obj.pipeline_id)
+            self._draw_rect_fill_stroke(
+                snapshot,
+                0.0,
+                ry,
+                4.5,
+                row_h,
+                self._rgba(mr, mg, mb_col, 0.95),
+                None,
+            )
+
+            # Column 1: Module Name, Pipe, Core, Domain, Memory
+            m_title = f"[P{m_obj.pipeline_id}•C{m_obj.core_id}•{m_obj.domain}] {m_obj.widget_name}"
+            self._draw_text(
+                snapshot,
+                m_title,
+                8.0,
+                ry + 2.0,
+                "Monospace Bold 8",
+                self._rgba(0.94, 0.97, 1.0, 1.0),
+                max_w=col_mod_w - 12.0,
+            )
+            m_sub = (
+                f"id=0x{m_obj.comp_id:x} {m_obj.mem_type} iters={m_obj.iterations} "
+                f"ibs={m_obj.ibs}B obs={m_obj.obs}B"
+            )
+            self._draw_text(
+                snapshot,
+                m_sub,
+                8.0,
+                ry + 15.0,
+                "Monospace 7",
+                self._rgba(0.68, 0.76, 0.86, 0.92),
+                max_w=col_mod_w - 12.0,
+            )
+
+            # Column 2: Execution Time, Cycles, KCPS, CPC
+            ex_x = col_mod_w + 4.0
+            m_us = m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216)
+            m_pk_us = m_obj.exec_peak_us if m_obj.exec_peak_us > 0 else (m_obj.peak_cycles / 393.216)
+            self._draw_text(
+                snapshot,
+                f"exec: {m_us:.2f}/{m_pk_us:.2f} µs ({m_obj.avg_kcps} kcps)",
+                ex_x,
+                ry + 2.0,
+                "Monospace Bold 7.5",
+                self._rgba(0.86, 0.92, 0.98, 0.95),
+                max_w=col_exec_w - 6.0,
+            )
+            cpc_col = (
+                self._rgba(0.98, 0.45, 0.45, 1.0)
+                if m_obj.cpc_violations > 0
+                else self._rgba(0.66, 0.78, 0.88, 0.9)
+            )
+            self._draw_text(
+                snapshot,
+                f"cyc: {m_obj.avg_cycles}/{m_obj.peak_cycles} | CPC:{m_obj.effective_cpc}(v={m_obj.cpc_violations})",
+                ex_x,
+                ry + 15.0,
+                "Monospace 7",
+                cpc_col,
+                max_w=col_exec_w - 6.0,
+            )
+
+            # Column 3: Input Pin Buffer Stats (IN[0..])
+            in_x = col_mod_w + col_exec_w + 6.0
+            self._draw_pin_buffer_cell(
+                snapshot,
+                m_obj.in_pins,
+                "IN",
+                in_x,
+                ry,
+                col_in_w - 6.0,
+                row_h,
+                is_input=True,
+            )
+
+            # Column 4: Output Pin Buffer Stats (OUT[0..])
+            out_x = in_x + col_in_w
+            self._draw_pin_buffer_cell(
+                snapshot,
+                m_obj.out_pins,
+                "OUT",
+                out_x,
+                ry,
+                col_out_w - 6.0,
+                row_h,
+                is_input=False,
+            )
+
+            self._hit_boxes.append(
+                {
+                    "kind": "buffer_row",
+                    "comp_id": m_obj.comp_id,
+                    "pipe_id": m_obj.pipeline_id,
+                    "core_id": m_obj.core_id,
+                    "mod": m_obj,
+                    "x": 0.0,
+                    "y": ry,
+                    "w": w,
+                    "h": row_h,
+                }
+            )
+
+        snapshot.pop()
+
+        # ------------------------------------------------------------------
+        # 5. Interactive Hover Crosshair & Floating Telemetry Tooltip
+        # ------------------------------------------------------------------
+        if self._hovered_hit_info is not None and self._hover_x >= 0.0 and self._hover_y >= 0.0:
+            self._draw_hover_tooltip(snapshot, w, h, self._hovered_hit_info)
+
+    def _draw_pin_buffer_cell(
+        self,
+        snapshot: Gtk.Snapshot,
+        pins: List[ModulePinBufferStats],
+        dir_label: str,
+        x: float,
+        y: float,
+        w: float,
+        h: float,
+        is_input: bool,
+    ) -> None:
+        if w <= 24.0:
+            return
+        if not pins:
+            self._draw_text(
+                snapshot,
+                f"{dir_label}: (endpoint / host-dai)",
+                x,
+                y + 8.0,
+                "Monospace Italic 7",
+                self._rgba(0.48, 0.54, 0.64, 0.75),
+                max_w=w,
+            )
+            return
+
+        p0 = pins[0]
+        bsize = max(1, p0.buf_size)
+        entry_b = p0.ll_entry_avail
+        exit_b = p0.ll_exit_avail
+        xfer_b = p0.last_bytes_transferred
+        tot_b = p0.total_bytes_transferred
+        rms_db = p0.entry_rms_db if is_input else p0.exit_rms_db
+
+        # Reserve right portion of cell for sample sparkline if samples are available
+        spark_w = min(56.0, w * 0.24) if p0.samples and w >= 150.0 else 0.0
+        text_w = max(40.0, w - spark_w - 4.0)
+
+        pin_cnt_tag = f"{dir_label}[0..{len(pins)-1}]" if len(pins) > 1 else f"{dir_label}[{p0.pin_index}]"
+        dp_tag = f" DP:{p0.dp_entry_avail}->{p0.dp_exit_avail}/{p0.dp_ring_size}B" if p0.dp_ring_size > 0 else ""
+        top_txt = (
+            f"{pin_cnt_tag} {entry_b}->{exit_b}/{p0.buf_size}B{dp_tag} "
+            f"xfer={xfer_b}B(tot={tot_b // 1024}KB) {rms_db:+.1f}dB"
+        )
+        self._draw_text(
+            snapshot,
+            top_txt,
+            x,
+            y + 2.0,
+            "Monospace 7",
+            self._rgba(0.84, 0.93, 0.98, 0.96) if is_input else self._rgba(0.84, 0.98, 0.88, 0.96),
+            max_w=text_w,
+        )
+
+        # Draw visual buffer capacity & entry->exit fill gauge bar
+        bar_y = y + 16.5
+        bar_h = 8.5
+        bar_w = max(30.0, text_w - 6.0)
+        self._draw_rect_fill_stroke(
+            snapshot,
+            x,
+            bar_y,
+            bar_w,
+            bar_h,
+            self._rgba(0.05, 0.06, 0.09, 0.95),
+            self._rgba(0.24, 0.30, 0.40, 0.85),
+            0.8,
+        )
+
+        # Fill bar: entry fill (cyan/blue) and exit fill (emerald green) or transferred fraction
+        active_bytes = entry_b if is_input else exit_b
+        if active_bytes == 0 and xfer_b > 0:
+            active_bytes = min(p0.buf_size, xfer_b)
+        fill_frac = min(1.0, max(0.0, float(active_bytes) / float(bsize)))
+        fill_col = (
+            self._rgba(0.24, 0.78, 0.96, 0.80)
+            if is_input
+            else self._rgba(0.28, 0.86, 0.54, 0.80)
+        )
+        self._draw_rect_fill_stroke(
+            snapshot,
+            x + 0.5,
+            bar_y + 0.5,
+            (bar_w - 1.0) * fill_frac,
+            bar_h - 1.0,
+            fill_col,
+            None,
+        )
+
+        # Overlay rate/ch & fill percentage inside the bar
+        pct = (float(active_bytes) / float(bsize)) * 100.0
+        fmt_lbl = (
+            f"{p0.rate // 1000}kHz/{p0.channels}ch • {active_bytes}/{p0.buf_size}B ({pct:.0f}%)"
+            if p0.rate > 0
+            else f"{active_bytes}/{p0.buf_size}B ({pct:.0f}%)"
+        )
+        self._draw_text(
+            snapshot,
+            fmt_lbl,
+            x + 4.0,
+            bar_y - 0.5,
+            "Monospace Bold 6.5",
+            self._rgba(0.96, 0.98, 1.0, 0.95),
+            max_w=bar_w - 6.0,
+        )
+
+        # Mini sample tap sparkline on the right of the cell
+        if spark_w >= 28.0 and p0.samples:
+            sx = x + text_w + 2.0
+            sy = y + 3.0
+            sh = h - 6.0
+            self._draw_rect_fill_stroke(
+                snapshot,
+                sx,
+                sy,
+                spark_w,
+                sh,
+                self._rgba(0.04, 0.05, 0.08, 0.95),
+                self._rgba(0.22, 0.28, 0.38, 0.8),
+                0.7,
+            )
+            smps = p0.samples
+            peak_s = max((abs(v) for v in smps), default=1) or 1
+            pb = Gsk.PathBuilder.new()
+            n_pts = len(smps)
+            mid_y = sy + sh * 0.5
+            for s_idx, val in enumerate(smps):
+                px = sx + 1.0 + (s_idx / float(max(1, n_pts - 1))) * (spark_w - 2.0)
+                py = mid_y - (float(val) / float(peak_s)) * (sh * 0.42)
+                if s_idx == 0:
+                    pb.move_to(px, py)
+                else:
+                    pb.line_to(px, py)
+            snapshot.append_stroke(
+                pb.to_path(),
+                Gsk.Stroke.new(1.0),
+                self._rgba(0.38, 0.88, 1.0, 0.95) if is_input else self._rgba(0.42, 0.96, 0.62, 0.95),
+            )
+
+    def _draw_hover_tooltip(
+        self,
+        snapshot: Gtk.Snapshot,
+        w: float,
+        h: float,
+        hit: Dict[str, Any],
+    ) -> None:
+        lines: List[str] = []
+        if hit.get("kind") == "pipeline":
+            p: PipelineSchedTelemetry = hit["pipe"]
+            t_idx = hit.get("tick_idx", 0)
+            lines.append(
+                f"Pipeline {p.pipeline_id}  |  Core {p.core_id}  |  Tick #{t_idx} ({hit.get('time_ms', 0.0):.2f} ms)"
+            )
+            lines.append(
+                f"Priority: {p.priority}  |  Period: {p.period_us} µs  |  Mem: {p.mem_type}  |  "
+                f"Modules: {p.ll_module_count} LL / {p.dp_module_count} DP"
+            )
+            lines.append(
+                f"Exec Time: avg={p.exec_avg_us:.3f} µs / peak={p.exec_peak_us:.3f} µs  |  "
+                f"Cycles: avg={p.avg_cycles} / peak={p.peak_cycles} ({p.avg_kcps} kcps)  |  Xruns: {p.xruns}"
+            )
+        else:
+            m: ComponentPerfItem = hit["mod"]
+            m_us = m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216)
+            m_pk_us = m.exec_peak_us if m.exec_peak_us > 0 else (m.peak_cycles / 393.216)
+            tick_str = (
+                f"  |  Tick #{hit['tick_idx']} (@ {hit.get('start_us', 0.0):.1f} µs)"
+                if "tick_idx" in hit
+                else ""
+            )
+            lines.append(
+                f"Module: {m.widget_name} (0x{m.comp_id:06x})  |  Pipe {m.pipeline_id}  |  "
+                f"Core {m.core_id} [{m.domain} • {m.mem_type}]{tick_str}"
+            )
+            lines.append(
+                f"Exec: avg={m_us:.3f} µs / peak={m_pk_us:.3f} µs  |  "
+                f"Cycles: avg={m.avg_cycles} / peak={m.peak_cycles} ({m.avg_kcps}/{m.peak_kcps} kcps)  |  "
+                f"Iters: {m.iterations}"
+            )
+            lines.append(
+                f"Audio Frame: IBS={m.ibs} B, OBS={m.obs} B  |  "
+                f"Effective CPC={m.effective_cpc} (Violations={m.cpc_violations})"
+            )
+            for p_in in m.in_pins[:2]:
+                lines.append(
+                    f"  IN[{p_in.pin_index}] buf={p_in.buf_id}: size={p_in.buf_size}B "
+                    f"LL({p_in.ll_entry_avail}->{p_in.ll_exit_avail}B) "
+                    f"consumed={p_in.last_bytes_transferred}B(tot={p_in.total_bytes_transferred}B) "
+                    f"rms={p_in.entry_rms_db:+.2f}->{p_in.exit_rms_db:+.2f}dBFS"
+                )
+            for p_out in m.out_pins[:2]:
+                lines.append(
+                    f"  OUT[{p_out.pin_index}] buf={p_out.buf_id}: size={p_out.buf_size}B "
+                    f"LL({p_out.ll_entry_avail}->{p_out.ll_exit_avail}B) "
+                    f"produced={p_out.last_bytes_transferred}B(tot={p_out.total_bytes_transferred}B) "
+                    f"rms={p_out.exit_rms_db:+.2f}dBFS(pk={p_out.exit_peak_db:+.2f}dB)"
+                )
+
+        tooltip_txt = "\n".join(lines)
+        layout = self.create_pango_layout(tooltip_txt)
+        layout.set_font_description(Pango.FontDescription.from_string("Monospace 7.5"))
+        tw, th = layout.get_pixel_size()
+
+        box_w = float(tw + 14)
+        box_h = float(th + 10)
+        bx = min(w - box_w - 8.0, max(8.0, self._hover_x + 12.0))
+        by = self._hover_y - box_h - 10.0
+        if by < 6.0:
+            by = min(h - box_h - 6.0, self._hover_y + 14.0)
+
+        self._draw_rect_fill_stroke(
+            snapshot,
+            bx,
+            by,
+            box_w,
+            box_h,
+            self._rgba(0.04, 0.05, 0.08, 0.95),
+            self._rgba(0.98, 0.84, 0.34, 0.90),
+            1.1,
+        )
+        snapshot.save()
+        pt = Graphene.Point.alloc()
+        pt.init(bx + 7.0, by + 5.0)
+        snapshot.translate(pt)
+        snapshot.append_layout(layout, self._rgba(0.96, 0.97, 1.0, 1.0))
+        snapshot.restore()
+
 
