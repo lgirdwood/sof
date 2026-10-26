@@ -1973,81 +1973,100 @@ class TopologyGraphCanvas(Gtk.Widget):
         header_col: Gdk.RGBA,
         body_col: Gdk.RGBA,
     ) -> None:
-        """Render left-hand Input Pin or right-hand Output Pin audio format specification card."""
+        """Render left-hand Input Pin or right-hand Output Pin capability callout as a translucent
+        bracketed schematic annotation (distinct from solid widget/module nodes).
+        """
         is_in = node.category == "pin_fmt_in"
         f_line = str(node.config.get_scalar("formats_line", "s16, s24/32, s32"))
         r_line = str(node.config.get_scalar("rates_line", "48 kHz"))
         c_line = str(node.config.get_scalar("channels_line", "2 ch • interleaved"))
 
+        # Subtle translucent callout background (grid/canvas remains visible behind it)
+        tint_col = (
+            rgba(0.08, 0.16, 0.24, 0.38 if is_selected else 0.22)
+            if is_in
+            else rgba(0.16, 0.13, 0.08, 0.38 if is_selected else 0.22)
+        )
         snapshot.push_rounded_clip(rrect)
-        snapshot.append_color(body_col, rect)
-
-        hdr_h = 21.0
-        hdr_rect = Graphene.Rect.alloc()
-        hdr_rect.init(node.x, node.y, node.width, hdr_h)
-        snapshot.append_color(header_col, hdr_rect)
-
-        pt = Graphene.Point.alloc()
-        title_layout = self._get_pango_layout(node.title, size_pt=7, bold=True)
-        snapshot.save()
-        pt.init(node.x + 8.0, node.y + 3.5)
-        snapshot.translate(pt)
-        snapshot.append_layout(title_layout, TEXT_WHITE)
-        snapshot.restore()
-
-        rows = [
-            ("FMT", f_line, rgba(0.68, 0.94, 1.0, 1.0) if is_in else rgba(0.66, 0.98, 0.84, 1.0)),
-            ("RATE", r_line, TEXT_WHITE),
-            ("CH", c_line, rgba(0.82, 0.88, 0.96, 0.96)),
-        ]
-        ry = node.y + 24.5
-        pill_bg = rgba(0.14, 0.24, 0.34, 0.95) if is_in else rgba(0.12, 0.26, 0.22, 0.95)
-        pill_fg = rgba(0.56, 0.88, 1.0, 1.0) if is_in else rgba(0.56, 0.96, 0.78, 1.0)
-
-        for tag_txt, val_txt, val_col in rows:
-            tag_w = 28.0
-            tag_h = 13.5
-            t_rect = Graphene.Rect.alloc()
-            t_rect.init(node.x + 7.0, ry + 0.5, tag_w, tag_h)
-            t_rr = Gsk.RoundedRect()
-            t_rr.init_from_rect(t_rect, 3.0)
-            snapshot.push_rounded_clip(t_rr)
-            snapshot.append_color(pill_bg, t_rect)
-            snapshot.pop()
-
-            t_lyt = self._get_pango_layout(tag_txt, size_pt=5, bold=True)
-            snapshot.save()
-            pt.init(node.x + 9.5, ry + 2.0)
-            snapshot.translate(pt)
-            snapshot.append_layout(t_lyt, pill_fg)
-            snapshot.restore()
-
-            v_lyt = self._get_pango_layout(val_txt, size_pt=7, bold=(tag_txt in ("FMT", "RATE")))
-            snapshot.save()
-            pt.init(node.x + 39.0, ry + 0.5)
-            snapshot.translate(pt)
-            snapshot.append_layout(v_lyt, val_col)
-            snapshot.restore()
-            ry += 16.5
-
+        snapshot.append_color(tint_col, rect)
         snapshot.pop()
 
-        bcol = (
+        # Faint dashed callout perimeter (instead of solid node border)
+        dash_col = (
             NODE_BORDER_SELECTED
             if is_selected
-            else (rgba(0.26, 0.68, 0.92, 0.92) if is_in else rgba(0.26, 0.82, 0.62, 0.92))
+            else (rgba(0.32, 0.82, 0.96, 0.34) if is_in else rgba(0.98, 0.68, 0.26, 0.34))
         )
-        bw = 2.0 if is_selected else 1.3
-        snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
+        dash_pb = Gsk.PathBuilder.new()
+        dash_pb.add_rounded_rect(rrect)
+        dash_stroke = Gsk.Stroke.new(1.5 if is_selected else 1.0)
+        dash_stroke.set_dash([2.5, 3.0])
+        snapshot.append_stroke(dash_pb.to_path(), dash_stroke, dash_col)
 
-        for port in node.in_ports:
-            px = node.x + port.rel_x
-            py = node.y + port.rel_y
-            self._snapshot_port_circle(snapshot, px, py, PORT_IN_COLOR, radius=4.6)
-        for port in node.out_ports:
-            px = node.x + port.rel_x
-            py = node.y + port.rel_y
-            self._snapshot_port_circle(snapshot, px, py, PORT_OUT_COLOR, radius=4.6)
+        # Open schematic bracket spine [ ┐...┘ for Input on right edge, ┌...└ for Output on left edge ]
+        spine_col = (
+            NODE_BORDER_SELECTED
+            if is_selected
+            else (rgba(0.32, 0.82, 0.96, 0.92) if is_in else rgba(0.98, 0.68, 0.26, 0.92))
+        )
+        arm = 8.0
+        sy0 = node.y + 3.0
+        sy1 = node.y + node.height - 3.0
+        bracket_pb = Gsk.PathBuilder.new()
+        if is_in:
+            sx = node.x + node.width - 1.5
+            bracket_pb.move_to(sx - arm, sy0)
+            bracket_pb.line_to(sx, sy0)
+            bracket_pb.line_to(sx, sy1)
+            bracket_pb.line_to(sx - arm, sy1)
+        else:
+            sx = node.x + 1.5
+            bracket_pb.move_to(sx + arm, sy0)
+            bracket_pb.line_to(sx, sy0)
+            bracket_pb.line_to(sx, sy1)
+            bracket_pb.line_to(sx + arm, sy1)
+        snapshot.append_stroke(bracket_pb.to_path(), Gsk.Stroke.new(2.0), spine_col)
+
+        # Pin capability header label (no solid header bar) + subtle dotted underline
+        pt = Graphene.Point.alloc()
+        hdr_txt_col = rgba(0.48, 0.88, 1.0, 0.98) if is_in else rgba(1.0, 0.78, 0.38, 0.98)
+        title_layout = self._get_pango_layout(node.title, size_pt=6, bold=True)
+        snapshot.save()
+        pt.init(node.x + 7.0, node.y + 3.5)
+        snapshot.translate(pt)
+        snapshot.append_layout(title_layout, hdr_txt_col)
+        snapshot.restore()
+
+        sep_pb = Gsk.PathBuilder.new()
+        sep_pb.move_to(node.x + 7.0, node.y + 16.5)
+        sep_pb.line_to(node.x + node.width - 7.0, node.y + 16.5)
+        sep_stroke = Gsk.Stroke.new(0.8)
+        sep_stroke.set_dash([1.5, 2.0])
+        snapshot.append_stroke(sep_pb.to_path(), sep_stroke, dash_col)
+
+        # 3 compact datasheet capability lines (fmt / rate / ch)
+        rows = [
+            ("fmt:", f_line, rgba(0.76, 0.94, 1.0, 0.98) if is_in else rgba(1.0, 0.88, 0.64, 0.98)),
+            ("rate:", r_line, rgba(0.90, 0.94, 0.98, 0.95)),
+            ("ch:", c_line, rgba(0.74, 0.82, 0.90, 0.92)),
+        ]
+        ry = node.y + 19.0
+        key_col = rgba(0.56, 0.72, 0.86, 0.88) if is_in else rgba(0.86, 0.72, 0.52, 0.88)
+        for k_txt, v_txt, v_col in rows:
+            k_lyt = self._get_pango_layout(k_txt, size_pt=6, bold=False)
+            snapshot.save()
+            pt.init(node.x + 7.0, ry)
+            snapshot.translate(pt)
+            snapshot.append_layout(k_lyt, key_col)
+            snapshot.restore()
+
+            v_lyt = self._get_pango_layout(v_txt, size_pt=6, bold=(k_txt == "fmt:"))
+            snapshot.save()
+            pt.init(node.x + 33.0, ry)
+            snapshot.translate(pt)
+            snapshot.append_layout(v_lyt, v_col)
+            snapshot.restore()
+            ry += 14.0
 
     def _snapshot_port_circle(self, snapshot: Gtk.Snapshot, cx: float, cy: float, color: Gdk.RGBA, radius: float = 5.0) -> None:
         rect = Graphene.Rect.alloc()
@@ -2099,6 +2118,22 @@ class TopologyGraphCanvas(Gtk.Widget):
         y1 = u.y + u_port.rel_y
         x2 = v.x + v_port.rel_x
         y2 = v.y + v_port.rel_y
+
+        if u.class_category == "PinFormat" or v.class_category == "PinFormat":
+            is_in_cap = u.class_category == "PinFormat"
+            cap_col = (
+                EDGE_SELECTED_COLOR
+                if is_sel
+                else (rgba(0.32, 0.82, 0.96, 0.72) if is_in_cap else rgba(0.98, 0.68, 0.26, 0.72))
+            )
+            dx = max(6.0, abs(x2 - x1) * 0.4)
+            pb = Gsk.PathBuilder.new()
+            pb.move_to(x1, y1)
+            pb.cubic_to(x1 + dx, y1, x2 - dx, y2, x2, y2)
+            stroke = Gsk.Stroke.new(1.8 if is_sel else 1.15)
+            stroke.set_dash([2.0, 2.5])
+            snapshot.append_stroke(pb.to_path(), stroke, cap_col)
+            return
 
         is_diag = edge.id == self.diag_highlight_edge_id
         if is_diag:

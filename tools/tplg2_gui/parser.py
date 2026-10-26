@@ -3198,12 +3198,12 @@ class Topology2Workspace:
             if len(pin_indices) == 1:
                 pin_tag = f"{'in' if is_in else 'out'}.{p0}"
                 node_id = f"{main_node.id}.pin_{direction}.{p0}"
-                title = f"{'IN' if is_in else 'OUT'} Pin {p0} ({pin_tag})"
+                title = f"▸ {pin_tag} {'accepts' if is_in else 'outputs'}:"
             else:
                 p_last = pin_indices[-1]
                 pin_tag = f"{'in' if is_in else 'out'}.{p0}..{p_last}"
                 node_id = f"{main_node.id}.pin_{direction}.all"
-                title = f"{'IN' if is_in else 'OUT'} Pins {p0}–{p_last} ({len(pin_indices)}×)"
+                title = f"▸ {pin_tag} ({len(pin_indices)} pins):"
 
             cfg_key = (
                 f"Object.Base.input_audio_format ({pin_tag})"

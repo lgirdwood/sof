@@ -24,9 +24,9 @@ CTRL_GROUP_HDR = 15.0
 TB_IO_WIDTH = 224.0
 TB_IO_HEIGHT = 98.0
 TB_IO_GAP = 48.0
-PIN_FMT_WIDTH = 160.0
-PIN_FMT_HEIGHT = 76.0
-PIN_FMT_GAP = 32.0
+PIN_FMT_WIDTH = 146.0
+PIN_FMT_HEIGHT = 64.0
+PIN_FMT_GAP = 22.0
 H_GAP = 72.0
 V_GAP = 28.0
 CONTAINER_PAD_X = 26.0
@@ -239,13 +239,13 @@ def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
         f_line = str(node.config.get_scalar("formats_line", ""))
         r_line = str(node.config.get_scalar("rates_line", ""))
         c_line = str(node.config.get_scalar("channels_line", ""))
-        title_w = len(node.title) * 6.8 + 20.0
-        l1_w = len(f"Fmt: {f_line}") * 6.3 + 20.0
-        l2_w = len(f"Rate: {r_line}") * 6.3 + 20.0
-        l3_w = len(f"Ch: {c_line}") * 6.3 + 20.0
-        node.width = max(PIN_FMT_WIDTH, min(204.0, max(title_w, l1_w, l2_w, l3_w)))
+        title_w = len(node.title) * 6.2 + 16.0
+        l1_w = len(f"fmt: {f_line}") * 5.9 + 16.0
+        l2_w = len(f"rate: {r_line}") * 5.9 + 16.0
+        l3_w = len(f"ch: {c_line}") * 5.9 + 16.0
+        node.width = max(PIN_FMT_WIDTH, min(192.0, max(title_w, l1_w, l2_w, l3_w)))
         num_ports = max(len(node.in_ports), len(node.out_ports), 1)
-        node.height = max(PIN_FMT_HEIGHT, (34.0 + num_ports * 18.0) if num_ports > 2 else PIN_FMT_HEIGHT)
+        node.height = max(PIN_FMT_HEIGHT, (28.0 + num_ports * 16.0) if num_ports > 2 else PIN_FMT_HEIGHT)
         side = str(node.config.get_scalar("side", "left")).lower()
         port_x = 0.0 if side == "right" else node.width
         out_count = len(node.out_ports)
@@ -254,14 +254,14 @@ def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
             if out_count == 1:
                 port.rel_y = node.height / 2.0
             else:
-                port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / out_count)
+                port.rel_y = 24.0 + (i + 0.5) * ((node.height - 28.0) / out_count)
         in_count = len(node.in_ports)
         for i, port in enumerate(node.in_ports):
             port.rel_x = port_x
             if in_count == 1:
                 port.rel_y = node.height / 2.0
             else:
-                port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / in_count)
+                port.rel_y = 24.0 + (i + 0.5) * ((node.height - 28.0) / in_count)
         return
 
     if node.class_category == "Control":
