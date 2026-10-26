@@ -161,6 +161,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
             on_testbench_io_changed=self._on_canvas_testbench_io_changed,
             on_view_source_requested=self._on_view_source_requested,
+            on_violation_bang_clicked=self._on_canvas_violation_bang_clicked,
         )
 
         self._build_header_bar()
@@ -898,7 +899,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         sched_body_box.set_vexpand(True)
 
         self.sched_telemetry_widget = SchedulingTelemetryWidget(
-            on_zoom_changed=self._on_sched_zoom_changed
+            on_zoom_changed=self._on_sched_zoom_changed,
+            on_violation_clicked=self._on_sched_violation_clicked,
         )
         self.sched_telemetry_widget.set_size_request(-1, 185)
         sched_body_box.append(self.sched_telemetry_widget)
@@ -1239,6 +1241,46 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         ctl_scroll.set_child(ctl_box)
         self.right_notebook.append_page(ctl_scroll, Gtk.Label(label="Remote Control"))
+
+        # Right Notebook Tab 4: Telemetry Log View (Violation & Pin/Scheduler Log Inspector)
+        self.telemetry_log_page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.telemetry_log_page_box.set_margin_start(4)
+        self.telemetry_log_page_box.set_margin_end(4)
+        self.telemetry_log_page_box.set_margin_top(4)
+        self.telemetry_log_page_box.set_margin_bottom(4)
+
+        vlog_hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.telemetry_log_title_lbl = Gtk.Label(
+            label="Telemetry Log: Click any violation in Scheduling & Buffers to inspect detailed violation logs."
+        )
+        self.telemetry_log_title_lbl.set_xalign(0.0)
+        self.telemetry_log_title_lbl.set_hexpand(True)
+        self.telemetry_log_title_lbl.set_wrap(True)
+        self.telemetry_log_title_lbl.add_css_class("heading")
+        vlog_hdr_box.append(self.telemetry_log_title_lbl)
+
+        btn_vlog_all = Gtk.Button(label="Show All")
+        btn_vlog_all.set_tooltip_text("Show full telemetry & violation log across all modules")
+        btn_vlog_all.connect("clicked", lambda _b: self._populate_telemetry_log_view(self.last_telemetry, None))
+        vlog_hdr_box.append(btn_vlog_all)
+        self.telemetry_log_page_box.append(vlog_hdr_box)
+
+        vlog_scroll = Gtk.ScrolledWindow()
+        vlog_scroll.set_vexpand(True)
+        vlog_scroll.set_hexpand(True)
+        self.telemetry_log_view = Gtk.TextView()
+        self.telemetry_log_view.set_editable(False)
+        self.telemetry_log_view.set_monospace(True)
+        self.telemetry_log_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self._init_telemetry_log_tags()
+        vlog_scroll.set_child(self.telemetry_log_view)
+        self.telemetry_log_page_box.append(vlog_scroll)
+        self._focused_violation_info: Optional[Dict[str, Any]] = None
+
+        self.right_notebook.append_page(
+            self.telemetry_log_page_box,
+            Gtk.Label(label="Telemetry Log"),
+        )
 
         right_panel_frame = Gtk.Frame()
         right_panel_frame.add_css_class("high-level-panel")
@@ -1811,6 +1853,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_probe_tap_toggled=self._on_canvas_probe_tap_toggled,
             on_testbench_io_changed=self._on_canvas_testbench_io_changed,
             on_view_source_requested=self._on_view_source_requested,
+            on_violation_bang_clicked=self._on_canvas_violation_bang_clicked,
         )
         new_canvas.set_graph(vm, self.workspace)
 
@@ -2963,6 +3006,286 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if hasattr(self, "sched_telemetry_widget"):
             self.sched_telemetry_widget.set_expanded_tick_mode(btn.get_active())
 
+    def _init_telemetry_log_tags(self) -> None:
+        if not hasattr(self, "telemetry_log_view"):
+            return
+        buf = self.telemetry_log_view.get_buffer()
+        tt = buf.get_tag_table()
+        if tt.lookup("vlog_error") is not None:
+            return
+        buf.create_tag(
+            "vlog_error",
+            foreground="#ff6b6b",
+            background="#3b1d24",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "vlog_focus",
+            foreground="#ffffff",
+            background="#681826",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "vlog_warning",
+            foreground="#ffd166",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "vlog_header",
+            foreground="#7ec8ff",
+            weight=Pango.Weight.BOLD,
+        )
+        buf.create_tag(
+            "vlog_ok",
+            foreground="#5cd68d",
+        )
+        buf.create_tag(
+            "vlog_dim",
+            foreground="#94a3b8",
+        )
+
+    def _ensure_telemetry_log_page(self) -> int:
+        """Ensure the Telemetry Log page exists in self.right_notebook and switch to it."""
+        page_num = self.right_notebook.page_num(self.telemetry_log_page_box)
+        if page_num < 0:
+            page_num = self.right_notebook.append_page(
+                self.telemetry_log_page_box,
+                Gtk.Label(label="Telemetry Log"),
+            )
+            self.telemetry_log_page_box.set_visible(True)
+        self.right_notebook.set_current_page(page_num)
+        return page_num
+
+    def _on_canvas_violation_bang_clicked(self, node_id: str, telem_info: Dict[str, Any]) -> None:
+        """Called when the user clicks the red bang (!) badge on a violating module node in the topology graph."""
+        mod_obj = telem_info.get("mod_obj")
+        if mod_obj is not None and hasattr(self, "sched_telemetry_widget"):
+            v_list = self.sched_telemetry_widget._collect_module_violations(mod_obj)
+            if v_list:
+                self._on_sched_violation_clicked(v_list[0])
+                return
+        v_fallback = {
+            "v_key": f"mod:{telem_info.get('comp_id', 0)}:cpc",
+            "type": "CPC_VIOLATION",
+            "comp_id": telem_info.get("comp_id", 0),
+            "pipe_id": telem_info.get("pipeline_id", 1),
+            "core_id": telem_info.get("core_id", 0),
+            "widget_name": telem_info.get("widget_name", node_id),
+            "tick_idx": 0,
+            "summary": (
+                f"Violation on {node_id}: peak={telem_info.get('peak_cycles', 0)} cyc vs "
+                f"CPC={telem_info.get('effective_cpc', 0)} cyc (v={telem_info.get('violation_count', 1)})"
+            ),
+            "mod": mod_obj,
+        }
+        self._on_sched_violation_clicked(v_fallback)
+
+    def _on_sched_violation_clicked(self, violation_info: Dict[str, Any]) -> None:
+        """Switch to the Scheduling Graph timeline, zoom to the violation, and focus the Telemetry Log page."""
+        self._focused_violation_info = violation_info
+        # 1. Switch bottom waveform_notebook to the Scheduling & Buffers timeline page and zoom to the violation
+        if hasattr(self, "waveform_notebook"):
+            self.waveform_notebook.set_current_page(1)
+        if hasattr(self, "sched_telemetry_widget"):
+            self.sched_telemetry_widget.focus_and_zoom_to_violation(violation_info)
+
+        # 2. Select/highlight the violating module on the active Topology Graph Canvas if present
+        wname = violation_info.get("widget_name", "")
+        comp_id = violation_info.get("comp_id")
+        if self.canvas and self.canvas.vm:
+            for nid, gnode in self.canvas.vm.nodes.items():
+                nt = self.canvas.live_node_telemetry.get(nid, {})
+                if (comp_id and nt.get("comp_id") == comp_id) or (
+                    wname and (nid == wname or gnode.title == wname or wname in nid)
+                ):
+                    self.canvas.select_node(nid)
+                    break
+
+        # 3. Ensure Telemetry Log notebook page is open and scrolled to the violation
+        self._ensure_telemetry_log_page()
+        telem = (
+            self.sched_telemetry_widget.telemetry
+            if hasattr(self, "sched_telemetry_widget") and self.sched_telemetry_widget.telemetry
+            else self.last_telemetry
+        )
+        self._populate_telemetry_log_view(telem, violation_info)
+        vtype = violation_info.get("type", "VIOLATION")
+        summary = violation_info.get("summary", "")
+        self.status_lbl.set_text(
+            f"Zoomed Timeline & Telemetry Log → [{vtype}] {wname}: {summary}"
+        )
+
+    def _populate_telemetry_log_view(
+        self,
+        telem: Optional[TestbenchTelemetry],
+        focus_violation: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not hasattr(self, "telemetry_log_view"):
+            return
+        self._init_telemetry_log_tags()
+        buf = self.telemetry_log_view.get_buffer()
+        buf.set_text("")
+
+        def append_tagged(line_str: str, tag_name: Optional[str] = None) -> int:
+            end_it = buf.get_end_iter()
+            start_off = end_it.get_offset()
+            buf.insert(end_it, line_str + "\n")
+            if tag_name:
+                s_it = buf.get_iter_at_offset(start_off)
+                e_it = buf.get_iter_at_offset(start_off + len(line_str))
+                buf.apply_tag_by_name(tag_name, s_it, e_it)
+            return start_off
+
+        if telem is None:
+            self.telemetry_log_title_lbl.set_text(
+                "Telemetry Log: No telemetry data yet — run Testbench to inspect scheduling & pin buffer violations."
+            )
+            append_tagged("No telemetry data collected yet. Click [▶ Run in Testbench] to populate.", "vlog_dim")
+            return
+
+        focus_cid = focus_violation.get("comp_id") if focus_violation else None
+        focus_vtype = focus_violation.get("type", "") if focus_violation else ""
+        focus_wname = focus_violation.get("widget_name", "") if focus_violation else ""
+        focus_summary = focus_violation.get("summary", "") if focus_violation else ""
+        scroll_target_offset: Optional[int] = None
+
+        if focus_violation:
+            self.telemetry_log_title_lbl.set_text(
+                f"⚠ Telemetry Log — [{focus_vtype}] {focus_wname}: {focus_summary}"
+            )
+        else:
+            total_cpc_v = sum(c.cpc_violations for c in telem.components)
+            self.telemetry_log_title_lbl.set_text(
+                f"Telemetry Log — {len(telem.components)} Modules | Total CPC Violations: {total_cpc_v} | LL Ticks: {telem.total_ll_ticks}"
+            )
+
+        # 1. Focused Violation Diagnostic Section
+        if focus_violation:
+            scroll_target_offset = append_tagged(
+                "================================================================================",
+                "vlog_focus",
+            )
+            append_tagged(
+                f">>> FOCUSED VIOLATION: [{focus_vtype}] {focus_wname} (comp_id=0x{int(focus_cid or 0):06x}) <<<",
+                "vlog_focus",
+            )
+            append_tagged(f"  Summary : {focus_summary}", "vlog_focus")
+            mod_obj: Optional[ComponentPerfItem] = focus_violation.get("mod")
+            if mod_obj is None and focus_cid is not None:
+                mod_obj = next((c for c in telem.components if c.comp_id == focus_cid), None)
+            if mod_obj is not None:
+                m_us = mod_obj.exec_avg_us if mod_obj.exec_avg_us > 0 else (mod_obj.avg_cycles / 393.216)
+                m_pk_us = mod_obj.exec_peak_us if mod_obj.exec_peak_us > 0 else (mod_obj.peak_cycles / 393.216)
+                append_tagged(
+                    f"  Location: Pipeline {mod_obj.pipeline_id} | Core {mod_obj.core_id} | Domain={mod_obj.domain} | Mem={mod_obj.mem_type}",
+                    "vlog_error",
+                )
+                append_tagged(
+                    f"  Timing  : avg={m_us:.3f} µs / peak={m_pk_us:.3f} µs | Cycles avg={mod_obj.avg_cycles} / peak={mod_obj.peak_cycles} | "
+                    f"KCPS avg={mod_obj.avg_kcps} / peak={mod_obj.peak_kcps}",
+                    "vlog_error",
+                )
+                append_tagged(
+                    f"  Budget  : Effective CPC={mod_obj.effective_cpc} cyc | CPC Violations={mod_obj.cpc_violations} / {mod_obj.iterations} iters | "
+                    f"IBS={mod_obj.ibs}B OBS={mod_obj.obs}B",
+                    "vlog_error",
+                )
+                for p_in in mod_obj.in_pins:
+                    append_tagged(
+                        f"  Pin IN[{p_in.pin_index}] : buf={p_in.buf_id} peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}) "
+                        f"LL={p_in.ll_entry_avail}->{p_in.ll_exit_avail}/{p_in.buf_size}B "
+                        f"xfer={p_in.last_bytes_transferred}B (tot={p_in.total_bytes_transferred:,}B) rms={p_in.entry_rms_db:+.1f}dB",
+                        "vlog_warning",
+                    )
+                for p_out in mod_obj.out_pins:
+                    append_tagged(
+                        f"  Pin OUT[{p_out.pin_index}]: buf={p_out.buf_id} peer=0x{p_out.peer_comp_id:x} ({p_out.peer_widget_name or 'dai'}) "
+                        f"LL={p_out.ll_entry_avail}->{p_out.ll_exit_avail}/{p_out.buf_size}B "
+                        f"xfer={p_out.last_bytes_transferred}B (tot={p_out.total_bytes_transferred:,}B) rms={p_out.exit_rms_db:+.1f}dB",
+                        "vlog_warning",
+                    )
+            append_tagged(
+                "================================================================================",
+                "vlog_focus",
+            )
+            append_tagged("")
+
+        # 2. All Module Violations & Pin Buffer Telemetry Log
+        append_tagged("=== MODULE CPC VIOLATION & PIN BUFFER TELEMETRY LOG ===", "vlog_header")
+        active_mods = [
+            c for c in telem.components if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        for m in active_mods:
+            has_v = m.cpc_violations > 0 or (m.effective_cpc > 0 and m.peak_cycles > m.effective_cpc)
+            is_target = focus_cid is not None and m.comp_id == focus_cid
+            m_tag = "vlog_focus" if is_target else ("vlog_error" if has_v else "vlog_ok")
+            status_str = f"VIOLATION (v={m.cpc_violations})" if has_v else "OK (v=0)"
+            m_us = m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216)
+            m_pk_us = m.exec_peak_us if m.exec_peak_us > 0 else (m.peak_cycles / 393.216)
+            off = append_tagged(
+                f"[{status_str}] [P{m.pipeline_id}•C{m.core_id}•{m.domain}•{m.mem_type}] "
+                f"{m.widget_name or m.module_name} (0x{m.comp_id:06x})  "
+                f"cyc={m.avg_cycles}/{m.peak_cycles}  CPC={m.effective_cpc}  "
+                f"exec={m_us:.2f}/{m_pk_us:.2f}µs  kcps={m.avg_kcps}/{m.peak_kcps}  iters={m.iterations}",
+                m_tag,
+            )
+            if is_target and scroll_target_offset is None:
+                scroll_target_offset = off
+            if has_v and hasattr(self, "sched_telemetry_widget"):
+                for v_grp in self.sched_telemetry_widget._collect_module_violations(m):
+                    append_tagged(f"  ├─ ⚠ [{v_grp['type']}] {v_grp['summary']}", "vlog_error")
+                    for ev in v_grp.get("children", []):
+                        ev_tag = (
+                            "vlog_focus"
+                            if (focus_violation and focus_violation.get("v_key") == ev.get("v_key"))
+                            else "vlog_error"
+                        )
+                        ev_off = append_tagged(f"  │  └─ • {ev['summary']}", ev_tag)
+                        if focus_violation and focus_violation.get("v_key") == ev.get("v_key"):
+                            scroll_target_offset = ev_off
+            for p_in in m.in_pins:
+                append_tagged(
+                    f"  IN[{p_in.pin_index}]  buf={p_in.buf_id}: {p_in.ll_entry_avail}->{p_in.ll_exit_avail}/{p_in.buf_size}B "
+                    f"xfer={p_in.last_bytes_transferred}B (tot={p_in.total_bytes_transferred:,}B) rms={p_in.entry_rms_db:+.1f}dBFS",
+                    "vlog_dim",
+                )
+            for p_out in m.out_pins:
+                append_tagged(
+                    f"  OUT[{p_out.pin_index}] buf={p_out.buf_id}: {p_out.ll_entry_avail}->{p_out.ll_exit_avail}/{p_out.buf_size}B "
+                    f"xfer={p_out.last_bytes_transferred}B (tot={p_out.total_bytes_transferred:,}B) rms={p_out.exit_rms_db:+.1f}dBFS",
+                    "vlog_dim",
+                )
+
+        # 3. Raw Testbench Scheduler & Buffer Shell Logs
+        if telem.shell_sched_telem:
+            append_tagged("")
+            append_tagged("=== RAW SCHEDULER TELEMETRY LOG (sched-telem) ===", "vlog_header")
+            for raw_ln in telem.shell_sched_telem.splitlines():
+                ln_tag: Optional[str] = None
+                if focus_cid is not None and f"0x{int(focus_cid):x}" in raw_ln.lower():
+                    ln_tag = "vlog_focus"
+                elif "cpc_v=" in raw_ln and not raw_ln.endswith("cpc_v=0") and "cpc_v=0 " not in raw_ln:
+                    ln_tag = "vlog_error"
+                elif "xruns=" in raw_ln and "xruns=0" not in raw_ln:
+                    ln_tag = "vlog_error"
+                append_tagged(raw_ln, ln_tag)
+
+        if telem.shell_mod_buffers:
+            append_tagged("")
+            append_tagged("=== RAW MODULE PIN BUFFER LOG (mod-buffers) ===", "vlog_header")
+            for raw_ln in telem.shell_mod_buffers.splitlines():
+                ln_tag = (
+                    "vlog_focus"
+                    if (focus_cid is not None and f"0x{int(focus_cid):x}" in raw_ln.lower())
+                    else None
+                )
+                append_tagged(raw_ln, ln_tag)
+
+        if scroll_target_offset is not None:
+            target_it = buf.get_iter_at_offset(scroll_target_offset)
+            mark = buf.create_mark("vlog_focus_mark", target_it, True)
+            self.telemetry_log_view.scroll_to_mark(mark, 0.1, True, 0.0, 0.15)
+
     def _update_sched_status_label(self, telem: Optional[TestbenchTelemetry]) -> None:
         if not hasattr(self, "sched_status_lbl"):
             return
@@ -3031,10 +3354,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             return True
 
         self._rt_poll_busy = True
+        self._rt_telem_tick_cnt = getattr(self, "_rt_telem_tick_cnt", 0) + 1
+        fetch_telem = (self._rt_telem_tick_cnt % 4) == 1
 
         def poll_worker() -> None:
             res_tuple = self.tb_runner.poll_live_waveforms(window_frames=3600) if self.tb_runner else None
-            GLib.idle_add(self._apply_realtime_waveform_poll, res_tuple)
+            live_telem = None
+            if fetch_telem and self.tb_runner and self.tb_runner.live_client:
+                try:
+                    with self.tb_runner._ipc_lock:
+                        if self.tb_runner.live_client:
+                            live_telem = self.tb_runner.live_client.collect_full_telemetry()
+                except Exception:
+                    live_telem = None
+            GLib.idle_add(self._apply_realtime_waveform_poll, res_tuple, live_telem)
 
         threading.Thread(target=poll_worker, daemon=True).start()
         return True
@@ -3042,8 +3375,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _apply_realtime_waveform_poll(
         self,
         res_tuple: Optional[tuple],
+        live_telem: Optional[TestbenchTelemetry] = None,
     ) -> bool:
         self._rt_poll_busy = False
+        if live_telem is not None:
+            self._apply_telemetry_to_ui(live_telem)
         if not res_tuple:
             if self.rt_waveform_btn.get_active():
                 self.wf_status_lbl.set_text("Waveforms [Disconnected]")
@@ -3484,6 +3820,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         )
         tbuf = self.telem_view.get_buffer()
         tbuf.set_text(telem.format_report())
+        if hasattr(self, "telemetry_log_view"):
+            self._populate_telemetry_log_view(telem, getattr(self, "_focused_violation_info", None))
 
         self._discovered_kcontrols = list(telem.kcontrols)
         # Sync live telemetry kcontrol values onto matching graph Control nodes

@@ -251,6 +251,10 @@ class CoreTelemetry:
     def avg_cycles(self) -> int:
         return self.ll_avg_cycles or self.last_time_elapsed_cyc
 
+    @property
+    def peak_cycles(self) -> int:
+        return self.ll_peak_cycles or self.max_time_elapsed_cyc
+
 
 @dataclass
 class PipelineSchedTelemetry:
@@ -3260,6 +3264,7 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.time_zoom: float = 1.0  # 1.0x = 600 samples (~12.5 ms @ 48 kHz)
         self.amp_zoom: float = 1.0   # 1.0x = [-1.0, +1.0] full scale
         self.pan_offset: int = 0     # Starting sample index
+        self._pan_offset_f: float = 0.0  # Sub-sample floating-point pan offset for drift-free cursor zoom
 
         # Vertical scroll state for multi-PCM stacked waveforms (bound to external Gtk.Scrollbar slider)
         self.v_scroll_offset: float = 0.0
@@ -3401,10 +3406,20 @@ class WaveformSnapshotWidget(Gtk.Widget):
         dur_ms = (vis / float(max(1, self.sample_rate))) * 1000.0
         return f"Time: {self.time_zoom:.2g}× ({dur_ms:.2f} ms / {vis} smp)  |  Amp: {self.amp_zoom:.2g}×"
 
-    def zoom_in_time(self, factor: float = 1.5, anchor_ratio: float = 0.5) -> None:
+    def _get_pointer_anchor_ratio(self) -> float:
+        """Return normalized [0.0, 1.0] horizontal mouse pointer position within the waveform plot."""
+        w = max(1.0, float(self.get_width()) or 920.0)
+        left_gutter = 62.0
+        right_pad = 8.0
+        plot_w = max(20.0, w - left_gutter - right_pad)
+        if self._hover_x is not None and self._hover_x >= 0.0:
+            return max(0.0, min(1.0, (self._hover_x - left_gutter) / plot_w))
+        return 0.5
+
+    def zoom_in_time(self, factor: float = 1.5, anchor_ratio: Optional[float] = None) -> None:
         self._set_time_zoom(self.time_zoom * factor, anchor_ratio)
 
-    def zoom_out_time(self, factor: float = 1.5, anchor_ratio: float = 0.5) -> None:
+    def zoom_out_time(self, factor: float = 1.5, anchor_ratio: Optional[float] = None) -> None:
         self._set_time_zoom(self.time_zoom / factor, anchor_ratio)
 
     def zoom_in_amp(self, factor: float = 1.4142) -> None:
@@ -3423,30 +3438,35 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.time_zoom = 1.0
         self.amp_zoom = 1.0
         self.pan_offset = 0
+        self._pan_offset_f = 0.0
         if self.on_zoom_changed:
             self.on_zoom_changed()
         self.queue_draw()
 
-    def _set_time_zoom(self, new_zoom: float, anchor_ratio: float = 0.5) -> None:
+    def _set_time_zoom(self, new_zoom: float, anchor_ratio: Optional[float] = None) -> None:
+        if anchor_ratio is None:
+            anchor_ratio = self._get_pointer_anchor_ratio()
+        r = max(0.0, min(1.0, float(anchor_ratio)))
         total = max(self.total_samples(), self.BASE_VISIBLE_SAMPLES)
         min_zoom = max(0.05, float(self.BASE_VISIBLE_SAMPLES) / float(max(1, total)))
         max_zoom = 37.5  # down to 16 samples
         old_vis = self.visible_sample_count()
-        anchor_sample = self.pan_offset + int(old_vis * max(0.0, min(1.0, anchor_ratio)))
+        anchor_sample_f = self._pan_offset_f + r * float(max(1, old_vis - 1))
 
         self.time_zoom = max(min_zoom, min(max_zoom, new_zoom))
         new_vis = self.visible_sample_count()
-        self.pan_offset = anchor_sample - int(new_vis * max(0.0, min(1.0, anchor_ratio)))
+        self._pan_offset_f = anchor_sample_f - r * float(max(1, new_vis - 1))
         self._clamp_pan()
         if self.on_zoom_changed:
             self.on_zoom_changed()
         self.queue_draw()
 
     def _clamp_pan(self) -> None:
-        total = self.total_samples()
+        total = max(self.total_samples(), self.BASE_VISIBLE_SAMPLES)
         vis = self.visible_sample_count()
         max_pan = max(0, total - vis)
-        self.pan_offset = max(0, min(max_pan, self.pan_offset))
+        self._pan_offset_f = max(0.0, min(float(max_pan), self._pan_offset_f))
+        self.pan_offset = int(round(self._pan_offset_f))
 
     def _on_v_adj_value_changed(self, adj: Gtk.Adjustment) -> None:
         if self._updating_v_adj:
@@ -3536,41 +3556,38 @@ class WaveformSnapshotWidget(Gtk.Widget):
 
         if shift_held or (abs(dx) > abs(dy) and abs(dx) > 0.01):
             delta = dx if abs(dx) > abs(dy) else dy
-            step = max(1, int(self.visible_sample_count() * 0.12))
-            self.pan_offset += int(math.copysign(step, delta))
+            step = max(1.0, float(self.visible_sample_count()) * 0.12)
+            self._pan_offset_f += math.copysign(step, delta)
             self._clamp_pan()
             self.queue_draw()
             return True
 
-        # When multiple stacked waveforms exceed the viewport height, plain vertical wheel
-        # scrolls vertically through the streams (hold Alt + Wheel or use toolbar buttons to zoom time)
-        if self._max_v_scroll > 0.5 and not alt_held and abs(dy) > 0.01:
+        # Scroll vertically through stacked lanes only when Alt is held or pointer is over the left gutter
+        left_gutter = 62.0
+        in_left_gutter = self._hover_x is not None and self._hover_x < left_gutter
+        if self._max_v_scroll > 0.5 and (alt_held or in_left_gutter) and abs(dy) > 0.01:
             self.set_v_scroll(self.v_scroll_offset + dy * 48.0)
             return True
 
-        w = max(1.0, float(self.get_width()))
-        left_gutter = 62.0
-        plot_w = max(10.0, w - left_gutter - 10.0)
-        anchor = 0.5
-        if self._hover_x is not None and self._hover_x >= left_gutter:
-            anchor = max(0.0, min(1.0, (self._hover_x - left_gutter) / plot_w))
-
+        anchor = self._get_pointer_anchor_ratio()
         if dy < 0:
             self.zoom_in_time(1.25, anchor_ratio=anchor)
         elif dy > 0:
             self.zoom_out_time(1.25, anchor_ratio=anchor)
         return True
 
-    def _on_drag_begin(self, _gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
+    def _on_drag_begin(self, _gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
+        self._hover_x = start_x
+        self._hover_y = start_y
         self._drag_start_pan = self.pan_offset
         self._drag_start_v_scroll = self.v_scroll_offset
 
     def _on_drag_update(self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
-        w = max(1.0, float(self.get_width()))
-        plot_w = max(10.0, w - 72.0)
+        w = max(1.0, float(self.get_width()) or 920.0)
+        plot_w = max(20.0, w - 70.0)
         vis = self.visible_sample_count()
-        delta_samples = int(round((-offset_x / plot_w) * vis))
-        self.pan_offset = self._drag_start_pan + delta_samples
+        delta_samples = (-offset_x / plot_w) * float(max(1, vis - 1))
+        self._pan_offset_f = float(self._drag_start_pan) + delta_samples
         self._clamp_pan()
         if self._max_v_scroll > 0.5 and abs(offset_y) > 2.0:
             self.set_v_scroll(self._drag_start_v_scroll - offset_y)
@@ -3662,7 +3679,7 @@ class WaveformSnapshotWidget(Gtk.Widget):
         total = self.total_samples()
         vis = self.visible_sample_count()
         trig_shift = 0
-        if self.is_realtime and self.trigger_lock and self.pan_offset == 0:
+        if self.is_realtime and self.trigger_lock:
             ref = self.out_samples if self.out_samples else self.in_samples
             if ref:
                 trig_shift = self._find_rising_zero_crossing(ref, max_search=min(240, max(1, len(ref) - vis)))
@@ -4198,7 +4215,11 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         (0.82, 0.68, 0.26),
     ]
 
-    def __init__(self, on_zoom_changed: Optional[Callable[[], None]] = None):
+    def __init__(
+        self,
+        on_zoom_changed: Optional[Callable[[], None]] = None,
+        on_violation_clicked: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         super().__init__()
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -4206,12 +4227,24 @@ class SchedulingTelemetryWidget(Gtk.Widget):
 
         self.telemetry: Optional[TestbenchTelemetry] = None
         self.on_zoom_changed = on_zoom_changed
+        self.on_violation_clicked = on_violation_clicked
+
+        # Expandable violation tree state in Module Buffer Stats & Pin Telemetry
+        self._expanded_violation_mods: Set[int] = set()
+        self._collapsed_violation_groups: Set[str] = set()
+        self._selected_violation_key: Optional[str] = None
+        self._focused_violation_slice: Optional[Dict[str, Any]] = None
 
         # Time axis zoom & pan state
-        self.time_zoom: float = 1.0          # 1.0x = show ~12 LL ticks across viewport, up to 32.0x
+        self.time_zoom: float = 1.0          # 1.0x = show ~12 LL ticks across viewport, up to 64.0x
         self.pan_offset_ms: float = 0.0      # Horizontal scroll offset in milliseconds
         self.expanded_tick_mode: bool = True # Magnify sub-ms execution blocks within each 1ms tick for readability
         self.show_all_cores: bool = True     # Show Cores 0..3 on Y axis
+
+        # Pin buffer sample sparkline zoom & pan state (for 64-sample buffer taps)
+        self.buf_spark_zoom: float = 1.0
+        self.buf_spark_pan_f: float = 0.0
+        self._spark_hit_boxes: List[Dict[str, Any]] = []
 
         # Vertical scroll adjustment for the Module Buffer Stats section
         self.v_scroll_offset: float = 0.0
@@ -4311,22 +4344,165 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         self._notify_zoom()
         self.queue_draw()
 
-    def zoom_in_time(self, factor: float = 1.4) -> None:
-        self.time_zoom = min(32.0, self.time_zoom * factor)
+    def _get_pointer_anchor_ratio(self) -> float:
+        """Return normalized [0.0, 1.0] horizontal mouse pointer position within the schedule timeline."""
+        w = max(1.0, float(self.get_width()) or 920.0)
+        gutter_w = 156.0
+        right_pad = 10.0
+        plot_w = max(80.0, w - gutter_w - right_pad)
+        if self._hover_x >= 0.0:
+            return max(0.0, min(1.0, (self._hover_x - gutter_w) / plot_w))
+        return 0.5
+
+    def _get_hovered_spark_anchor_ratio(self) -> Optional[float]:
+        """If the mouse pointer is inside a buffer sample sparkline, return its [0.0, 1.0] ratio."""
+        if self._hover_x < 0.0 or self._hover_y < 0.0:
+            return None
+        for sb in self._spark_hit_boxes:
+            if sb["x"] <= self._hover_x <= sb["x"] + sb["w"] and sb["y"] <= self._hover_y <= sb["y"] + sb["h"]:
+                return max(0.0, min(1.0, (self._hover_x - sb["x"]) / max(1.0, sb["w"])))
+        return None
+
+    def _set_spark_zoom(self, new_zoom: float, anchor_ratio: float = 0.5, total_pts: int = 64) -> None:
+        r = max(0.0, min(1.0, float(anchor_ratio)))
+        old_vis = max(8.0, float(total_pts) / max(1.0, self.buf_spark_zoom))
+        anchor_smp = self.buf_spark_pan_f + r * max(1.0, old_vis - 1.0)
+        self.buf_spark_zoom = max(1.0, min(8.0, float(new_zoom)))
+        new_vis = max(8.0, float(total_pts) / max(1.0, self.buf_spark_zoom))
+        max_pan = max(0.0, float(total_pts) - new_vis)
+        self.buf_spark_pan_f = max(0.0, min(max_pan, anchor_smp - r * max(1.0, new_vis - 1.0)))
+
+    def _set_time_zoom(self, new_zoom: float, anchor_ratio: Optional[float] = None) -> None:
+        if anchor_ratio is None:
+            anchor_ratio = self._get_pointer_anchor_ratio()
+        r = max(0.0, min(1.0, float(anchor_ratio)))
+        total_ms = self._get_total_duration_ms()
+        base_win = min(total_ms, 12.0)
+        min_zoom = max(0.05, base_win / max(0.1, total_ms))
+        max_zoom = max(64.0, base_win / 0.05)
+
+        old_vis_ms = self._get_visible_window_ms()
+        anchor_time_ms = self.pan_offset_ms + r * old_vis_ms
+
+        self.time_zoom = max(min_zoom, min(max_zoom, float(new_zoom)))
+        new_vis_ms = self._get_visible_window_ms()
+        self.pan_offset_ms = anchor_time_ms - r * new_vis_ms
         self._clamp_pan()
         self._notify_zoom()
         self.queue_draw()
 
-    def zoom_out_time(self, factor: float = 1.4) -> None:
-        self.time_zoom = max(0.25, self.time_zoom / factor)
-        self._clamp_pan()
-        self._notify_zoom()
-        self.queue_draw()
+    def zoom_in_time(self, factor: float = 1.4, anchor_ratio: Optional[float] = None) -> None:
+        self._set_time_zoom(self.time_zoom * factor, anchor_ratio)
+
+    def zoom_out_time(self, factor: float = 1.4, anchor_ratio: Optional[float] = None) -> None:
+        self._set_time_zoom(self.time_zoom / factor, anchor_ratio)
 
     def reset_zoom(self) -> None:
         self.time_zoom = 1.0
         self.pan_offset_ms = 0.0
         self.v_scroll_offset = 0.0
+        self.buf_spark_zoom = 1.0
+        self.buf_spark_pan_f = 0.0
+        self._focused_violation_slice = None
+        self._notify_zoom()
+        self.queue_draw()
+
+    def focus_and_zoom_to_violation(self, violation_info: Dict[str, Any]) -> None:
+        """Zoom and pan the Core Schedule Timeline directly onto the violating module and tick slice."""
+        telem = self.telemetry
+        if not telem:
+            return
+        comp_id = violation_info.get("comp_id")
+        pipe_id = violation_info.get("pipe_id")
+        core_id = int(violation_info.get("core_id", 0) or 0)
+        tick_idx = int(violation_info.get("tick_idx", 0) or 0)
+
+        period_us = 1000
+        if telem.pipelines:
+            period_us = max(250, max((p.period_us for p in telem.pipelines if p.period_us > 0), default=1000))
+        period_ms = period_us / 1000.0
+
+        active_mods = [
+            c for c in telem.components
+            if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        active_mods.sort(key=lambda c: (c.core_id, c.pipeline_id, c.comp_id))
+
+        target_mod = next((m for m in active_mods if m.comp_id == comp_id), None)
+        if target_mod is not None:
+            core_id = target_mod.core_id
+            pipe_id = target_mod.pipeline_id
+            self._expanded_violation_mods.add(target_mod.comp_id)
+
+        if violation_info.get("v_key"):
+            self._selected_violation_key = str(violation_info["v_key"])
+
+        ll_mods = [
+            m for m in active_mods
+            if m.core_id == core_id and m.domain.upper() != "DP" and tick_idx < max(1, m.iterations)
+        ]
+        tot_m_us = (
+            sum(
+                max(0.05, m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216))
+                for m in ll_mods
+            )
+            or 1.0
+        )
+        c_info = next((c for c in telem.cores if c.core_id == core_id), None)
+        core_ll_us = (
+            c_info.ll_exec_avg_us
+            if (c_info and c_info.ll_exec_avg_us > 0)
+            else tot_m_us
+        )
+        core_ll_us = max(core_ll_us, tot_m_us, 0.2)
+
+        if self.expanded_tick_mode:
+            span_frac = min(0.84, max(0.58, (core_ll_us / float(period_us)) * 18.0))
+        else:
+            span_frac = min(0.98, max(0.004, core_ll_us / float(period_us)))
+
+        mod_start_frac = 0.0
+        mod_dur_frac = span_frac
+        if target_mod is not None and ll_mods:
+            cum_frac = 0.0
+            for m in ll_mods:
+                m_us = max(
+                    0.05,
+                    m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216),
+                )
+                mf = m_us / tot_m_us
+                if m.comp_id == target_mod.comp_id:
+                    mod_start_frac = cum_frac * span_frac
+                    mod_dur_frac = max(0.04, mf * span_frac)
+                    break
+                cum_frac += mf
+
+        tick_start_ms = float(tick_idx) * period_ms
+        slice_start_ms = tick_start_ms + mod_start_frac * period_ms
+        slice_dur_ms = max(0.04, mod_dur_frac * period_ms)
+        slice_center_ms = slice_start_ms + slice_dur_ms * 0.5
+
+        total_ms = self._get_total_duration_ms()
+        base_win = min(total_ms, 12.0)
+        target_vis_ms = max(0.45, min(period_ms * 1.35, slice_dur_ms * 4.5))
+        desired_zoom = base_win / max(0.05, target_vis_ms)
+        min_zoom = max(0.05, base_win / max(0.1, total_ms))
+        max_zoom = max(64.0, base_win / 0.05)
+
+        self.time_zoom = max(min_zoom, min(max_zoom, desired_zoom))
+        vis_ms = self._get_visible_window_ms()
+        self.pan_offset_ms = slice_center_ms - 0.5 * vis_ms
+        self._clamp_pan()
+
+        self._focused_violation_slice = {
+            **violation_info,
+            "comp_id": comp_id,
+            "pipe_id": pipe_id,
+            "core_id": core_id,
+            "tick_idx": tick_idx,
+        }
+        self._hovered_comp_id = comp_id
+        self._hovered_pipe_id = pipe_id
         self._notify_zoom()
         self.queue_draw()
 
@@ -4346,7 +4522,7 @@ class SchedulingTelemetryWidget(Gtk.Widget):
     def _get_visible_window_ms(self) -> float:
         total_ms = self._get_total_duration_ms()
         base_win = min(total_ms, 12.0)
-        return max(0.5, min(total_ms, base_win / max(0.25, self.time_zoom)))
+        return max(0.05, min(total_ms, base_win / max(0.05, self.time_zoom)))
 
     def _clamp_pan(self) -> None:
         total_ms = self._get_total_duration_ms()
@@ -4372,35 +4548,37 @@ class SchedulingTelemetryWidget(Gtk.Widget):
     ) -> bool:
         state = ctrl.get_current_event_state()
         shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
-        ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
 
-        # If scrolling over the bottom buffer stats area without Ctrl/Shift, scroll buffer rows vertically
-        if not ctrl_held and not shift_held and self._hover_y >= self._last_buf_area_y:
+        # Scroll buffer rows vertically only when Alt is held or pointer is in the left gutter
+        in_left_gutter = 0.0 <= self._hover_x < 156.0
+        max_v = max(0.0, self.v_adj.get_upper() - self.v_adj.get_page_size())
+        if max_v > 0.5 and (alt_held or (in_left_gutter and self._hover_y >= self._last_buf_area_y)) and abs(dy) > 0.01:
             step = 34.0
-            self.v_adj.set_value(
-                max(
-                    0.0,
-                    min(
-                        self.v_adj.get_upper() - self.v_adj.get_page_size(),
-                        self.v_adj.get_value() + dy * step,
-                    ),
-                )
-            )
+            self.v_adj.set_value(max(0.0, min(max_v, self.v_adj.get_value() + dy * step)))
             return True
 
-        if shift_held or abs(dx) > abs(dy):
+        if shift_held or (abs(dx) > abs(dy) and abs(dx) > 0.01):
             delta = dx if abs(dx) > abs(dy) else dy
             vis_ms = self._get_visible_window_ms()
-            self.pan_offset_ms += delta * max(0.25, vis_ms * 0.12)
+            self.pan_offset_ms += delta * max(0.05, vis_ms * 0.12)
             self._clamp_pan()
             self._notify_zoom()
             self.queue_draw()
             return True
 
+        spark_anchor = self._get_hovered_spark_anchor_ratio()
+        if spark_anchor is not None:
+            if dy < 0:
+                self._set_spark_zoom(self.buf_spark_zoom * 1.25, anchor_ratio=spark_anchor)
+            elif dy > 0:
+                self._set_spark_zoom(self.buf_spark_zoom / 1.25, anchor_ratio=spark_anchor)
+
+        anchor = self._get_pointer_anchor_ratio()
         if dy < 0:
-            self.zoom_in_time(1.25)
+            self.zoom_in_time(1.25, anchor_ratio=anchor)
         elif dy > 0:
-            self.zoom_out_time(1.25)
+            self.zoom_out_time(1.25, anchor_ratio=anchor)
         return True
 
     def _on_drag_begin(self, _gesture: Gtk.GestureDrag, start_x: float, start_y: float) -> None:
@@ -4420,15 +4598,332 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         self._notify_zoom()
         self.queue_draw()
 
+    def _collect_module_violations(self, m_obj: ComponentPerfItem) -> List[Dict[str, Any]]:
+        """Collect structured violation tree nodes (and their expandable child events) for a module."""
+        violations: List[Dict[str, Any]] = []
+        telem = self.telemetry
+        wname = m_obj.widget_name or m_obj.module_name or f"0x{m_obj.comp_id:x}"
+        m_us = m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216)
+        m_pk_us = m_obj.exec_peak_us if m_obj.exec_peak_us > 0 else (m_obj.peak_cycles / 393.216)
+
+        # 1. CPC Budget Violations
+        has_cpc_v = m_obj.cpc_violations > 0 or (
+            m_obj.effective_cpc > 0 and m_obj.peak_cycles > m_obj.effective_cpc
+        )
+        if has_cpc_v:
+            v_cnt = max(1, m_obj.cpc_violations)
+            cpc_bud = max(1, m_obj.effective_cpc or m_obj.avg_cycles)
+            over_peak = max(0, m_obj.peak_cycles - cpc_bud)
+            over_avg = max(0, m_obj.avg_cycles - cpc_bud)
+            pct_peak = (m_obj.peak_cycles / float(cpc_bud)) * 100.0
+            gkey = f"mod:{m_obj.comp_id}:cpc"
+            children: List[Dict[str, Any]] = []
+            max_events = min(v_cnt, 5)
+            in_b = m_obj.in_pins[0].ll_entry_avail if m_obj.in_pins else m_obj.ibs
+            out_b = m_obj.out_pins[0].ll_exit_avail if m_obj.out_pins else m_obj.obs
+            for ev_i in range(max_events):
+                ev_cyc = m_obj.peak_cycles if ev_i == 0 else max(cpc_bud + 1, m_obj.avg_cycles)
+                ev_over = max(1, ev_cyc - cpc_bud)
+                ev_us = m_pk_us if ev_i == 0 else m_us
+                ev_key = f"{gkey}:ev:{ev_i}"
+                children.append(
+                    {
+                        "v_key": ev_key,
+                        "type": "CPC_VIOLATION_EVENT",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "tick_idx": ev_i,
+                        "time_ms": float(ev_i),
+                        "cycles": ev_cyc,
+                        "effective_cpc": cpc_bud,
+                        "over_cycles": ev_over,
+                        "exec_us": ev_us,
+                        "count": v_cnt,
+                        "summary": (
+                            f"Tick #{ev_i} ({float(ev_i):.2f} ms): cyc={ev_cyc} > CPC={cpc_bud} "
+                            f"(+{ev_over} cyc, {ev_us:.2f} µs) | mem={m_obj.mem_type} IN={in_b}B OUT={out_b}B"
+                        ),
+                        "mod": m_obj,
+                    }
+                )
+            if v_cnt > max_events:
+                children.append(
+                    {
+                        "v_key": f"{gkey}:ev:more",
+                        "type": "CPC_VIOLATION_SUMMARY",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "cycles": m_obj.avg_cycles,
+                        "effective_cpc": cpc_bud,
+                        "over_cycles": over_avg,
+                        "exec_us": m_us,
+                        "count": v_cnt - max_events,
+                        "summary": (
+                            f"+{v_cnt - max_events} additional CPC violations across {m_obj.iterations} LL ticks "
+                            f"(avg={m_obj.avg_cycles} cyc, peak={m_obj.peak_cycles} cyc, budget={cpc_bud} cyc)"
+                        ),
+                        "mod": m_obj,
+                    }
+                )
+            violations.append(
+                {
+                    "v_key": gkey,
+                    "type": "CPC_VIOLATION",
+                    "comp_id": m_obj.comp_id,
+                    "pipe_id": m_obj.pipeline_id,
+                    "core_id": m_obj.core_id,
+                    "widget_name": wname,
+                    "count": v_cnt,
+                    "cycles": m_obj.peak_cycles,
+                    "effective_cpc": cpc_bud,
+                    "over_cycles": over_peak,
+                    "exec_us": m_pk_us,
+                    "summary": (
+                        f"CPC Budget Exceeded ({v_cnt}×): peak={m_obj.peak_cycles} cyc > CPC={cpc_bud} cyc "
+                        f"(+{over_peak} cyc, {pct_peak:.1f}% of budget, peak={m_pk_us:.2f} µs)"
+                    ),
+                    "children": children,
+                    "mod": m_obj,
+                }
+            )
+
+        # 2. Pipeline XRUN / Period Overrun Violations
+        if telem and telem.pipelines:
+            pipe = next((p for p in telem.pipelines if p.pipeline_id == m_obj.pipeline_id), None)
+            if pipe and (pipe.xruns > 0 or (pipe.period_us > 0 and pipe.exec_peak_us > pipe.period_us)):
+                gkey = f"mod:{m_obj.comp_id}:pipe_xrun"
+                x_cnt = max(1, pipe.xruns)
+                violations.append(
+                    {
+                        "v_key": gkey,
+                        "type": "PIPELINE_XRUN",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "count": x_cnt,
+                        "cycles": pipe.peak_cycles,
+                        "effective_cpc": 0,
+                        "over_cycles": 0,
+                        "exec_us": pipe.exec_peak_us,
+                        "summary": (
+                            f"Pipeline {pipe.pipeline_id} XRUN / Period Overrun ({x_cnt}×): "
+                            f"pipe_peak={pipe.exec_peak_us:.2f} µs vs period={pipe.period_us} µs"
+                        ),
+                        "children": [
+                            {
+                                "v_key": f"{gkey}:ev:0",
+                                "type": "PIPELINE_XRUN_EVENT",
+                                "comp_id": m_obj.comp_id,
+                                "pipe_id": m_obj.pipeline_id,
+                                "core_id": m_obj.core_id,
+                                "widget_name": wname,
+                                "count": x_cnt,
+                                "exec_us": pipe.exec_peak_us,
+                                "summary": (
+                                    f"Pipe {pipe.pipeline_id} on Core {pipe.core_id}: xruns={pipe.xruns}, "
+                                    f"avg={pipe.exec_avg_us:.2f} µs / peak={pipe.exec_peak_us:.2f} µs ({pipe.avg_kcps} kcps)"
+                                ),
+                                "mod": m_obj,
+                            }
+                        ],
+                        "mod": m_obj,
+                    }
+                )
+
+        # 3. Core LL Deadline Violations
+        if telem and telem.cores:
+            core = next((c for c in telem.cores if c.core_id == m_obj.core_id), None)
+            if core and core.overruns > 0:
+                gkey = f"mod:{m_obj.comp_id}:core_overrun"
+                violations.append(
+                    {
+                        "v_key": gkey,
+                        "type": "CORE_OVERRUN",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "count": core.overruns,
+                        "cycles": core.peak_cycles,
+                        "effective_cpc": 0,
+                        "over_cycles": 0,
+                        "exec_us": core.last_time_elapsed_us,
+                        "summary": (
+                            f"Core {core.core_id} LL Deadline Overrun ({core.overruns}×): "
+                            f"max={core.max_time_elapsed_cyc} cyc, load={core.cpu_load_pct:.1f}%"
+                        ),
+                        "children": [
+                            {
+                                "v_key": f"{gkey}:ev:0",
+                                "type": "CORE_OVERRUN_EVENT",
+                                "comp_id": m_obj.comp_id,
+                                "pipe_id": m_obj.pipeline_id,
+                                "core_id": m_obj.core_id,
+                                "widget_name": wname,
+                                "count": core.overruns,
+                                "summary": (
+                                    f"Core {core.core_id} @ {core.freq_hz // 1000000} MHz: "
+                                    f"overruns={core.overruns}, ticks={core.tick_count}, peak={core.peak_kcps} kcps"
+                                ),
+                                "mod": m_obj,
+                            }
+                        ],
+                        "mod": m_obj,
+                    }
+                )
+
+        # 4. Pin Buffer Starvation / Stall Violations
+        for p_in in m_obj.in_pins:
+            if p_in.buf_size > 0 and m_obj.iterations > 0 and p_in.total_bytes_transferred == 0 and m_obj.ibs > 0:
+                gkey = f"mod:{m_obj.comp_id}:pin_in:{p_in.pin_index}"
+                violations.append(
+                    {
+                        "v_key": gkey,
+                        "type": "PIN_BUFFER_UNDERRUN",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "count": 1,
+                        "summary": (
+                            f"IN[{p_in.pin_index}] Buffer Starvation (buf={p_in.buf_id}): "
+                            f"0 B transferred over {m_obj.iterations} ticks (IBS={m_obj.ibs}B, size={p_in.buf_size}B)"
+                        ),
+                        "children": [
+                            {
+                                "v_key": f"{gkey}:ev:0",
+                                "type": "PIN_BUFFER_EVENT",
+                                "comp_id": m_obj.comp_id,
+                                "pipe_id": m_obj.pipeline_id,
+                                "core_id": m_obj.core_id,
+                                "widget_name": wname,
+                                "count": 1,
+                                "summary": (
+                                    f"IN[{p_in.pin_index}] peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}): "
+                                    f"entry_avail={p_in.ll_entry_avail}B, exit_avail={p_in.ll_exit_avail}B, free={p_in.ll_exit_free}B"
+                                ),
+                                "mod": m_obj,
+                            }
+                        ],
+                        "mod": m_obj,
+                    }
+                )
+        return violations
+
+    def _scroll_to_expanded_module(self, comp_id: int) -> None:
+        """Scroll the Module Buffer Stats section so that `comp_id` and its expanded violation tree are visible."""
+        telem = self.telemetry
+        if not telem:
+            return
+        active_mods = [
+            c for c in telem.components
+            if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        active_mods.sort(key=lambda c: (c.core_id, c.pipeline_id, c.comp_id))
+        row_h = 30.0
+        v_grp_row_h = 21.0
+        v_ev_row_h = 19.0
+        y_off = 0.0
+        for m_obj in active_mods:
+            if m_obj.comp_id == comp_id:
+                self.v_scroll_offset = max(0.0, y_off)
+                break
+            y_off += row_h
+            if m_obj.comp_id in self._expanded_violation_mods:
+                for v_grp in self._collect_module_violations(m_obj):
+                    y_off += v_grp_row_h
+                    if v_grp["v_key"] not in self._collapsed_violation_groups:
+                        y_off += len(v_grp.get("children", [])) * v_ev_row_h
+
     def _on_click_pressed(
         self,
         _gesture: Gtk.GestureClick,
         n_press: int,
-        _x: float,
-        _y: float,
+        x: float,
+        y: float,
     ) -> None:
         if n_press == 2:
             self.reset_zoom()
+            return
+        if n_press != 1:
+            return
+
+        # Hit-test interactive violation tree nodes in reverse draw order
+        for hb in reversed(self._hit_boxes):
+            if not (hb["x"] <= x <= hb["x"] + hb["w"] and hb["y"] <= y <= hb["y"] + hb["h"]):
+                continue
+            kind = hb.get("kind", "")
+            if kind == "violation_header_badge":
+                viol_mods = hb.get("viol_comp_ids", [])
+                exp_x_end = hb.get("expander_x_end", hb["x"] + 22.0)
+                all_expanded = bool(viol_mods) and all(cid in self._expanded_violation_mods for cid in viol_mods)
+                if x <= exp_x_end:
+                    if all_expanded:
+                        for cid in viol_mods:
+                            self._expanded_violation_mods.discard(cid)
+                    else:
+                        for cid in viol_mods:
+                            self._expanded_violation_mods.add(cid)
+                        if viol_mods:
+                            self._scroll_to_expanded_module(viol_mods[0])
+                    self.queue_draw()
+                else:
+                    for cid in viol_mods:
+                        self._expanded_violation_mods.add(cid)
+                    if viol_mods:
+                        self._scroll_to_expanded_module(viol_mods[0])
+                    self._selected_violation_key = "summary:all_violations"
+                    self.queue_draw()
+                    if self.on_violation_clicked and hb.get("violation"):
+                        self.on_violation_clicked(hb["violation"])
+                return
+
+            if kind == "violation_node":
+                cid = hb["comp_id"]
+                exp_x_end = hb.get("expander_x_end", hb["x"] + 20.0)
+                if x <= exp_x_end:
+                    if cid in self._expanded_violation_mods:
+                        self._expanded_violation_mods.remove(cid)
+                    else:
+                        self._expanded_violation_mods.add(cid)
+                        self._scroll_to_expanded_module(cid)
+                    self.queue_draw()
+                else:
+                    self._expanded_violation_mods.add(cid)
+                    self._scroll_to_expanded_module(cid)
+                    self._selected_violation_key = hb.get("v_key")
+                    self.queue_draw()
+                    if self.on_violation_clicked and hb.get("violation"):
+                        self.on_violation_clicked(hb["violation"])
+                return
+
+            if kind == "violation_tree_group":
+                gkey = hb["v_key"]
+                exp_x_end = hb.get("expander_x_end", hb["x"] + 34.0)
+                if x <= exp_x_end:
+                    if gkey in self._collapsed_violation_groups:
+                        self._collapsed_violation_groups.remove(gkey)
+                    else:
+                        self._collapsed_violation_groups.add(gkey)
+                    self.queue_draw()
+                else:
+                    self._selected_violation_key = gkey
+                    self.queue_draw()
+                    if self.on_violation_clicked and hb.get("violation"):
+                        self.on_violation_clicked(hb["violation"])
+                return
+
+            if kind == "violation_tree_item":
+                self._selected_violation_key = hb.get("v_key")
+                self.queue_draw()
+                if self.on_violation_clicked and hb.get("violation"):
+                    self.on_violation_clicked(hb["violation"])
+                return
 
     def _on_motion(self, _ctrl: Gtk.EventControllerMotion, x: float, y: float) -> None:
         self._hover_x = x
@@ -4522,6 +5017,7 @@ class SchedulingTelemetryWidget(Gtk.Widget):
             w, h = 920.0, 240.0
 
         self._hit_boxes = []
+        self._spark_hit_boxes = []
 
         # Overall dark background
         bg_rect = Graphene.Rect.alloc()
@@ -4885,13 +5381,12 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                 if self.expanded_tick_mode:
                     # Keep proportional differences between cores while ensuring readability
                     busy_frac = min(0.84, max(0.58, (core_ll_us / float(period_us)) * 18.0))
-                    active_span_px = max(12.0, tick_px_w * busy_frac)
+                    active_span_px = tick_px_w * busy_frac
                 else:
                     true_frac = min(0.98, max(0.004, core_ll_us / float(period_us)))
-                    active_span_px = max(3.0, tick_px_w * true_frac)
+                    active_span_px = tick_px_w * true_frac
 
                 # 2a. Draw Pipeline Execution Spans in the top band of Core `cid`
-                cur_px = tick_x + 1.0
                 pipes_for_tick = [p for p in core_pipes if tick_idx < max(1, p.copies)]
                 if not pipes_for_tick and ll_mods:
                     # Synthesize pipeline grouping from modules if pipeline list is empty
@@ -4904,8 +5399,8 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                             pipeline_id=pid,
                             core_id=cid,
                             period_us=period_us,
-                            copies=total_ticks,
-                            exec_avg_us=sum(
+                            copy_iterations=total_ticks,
+                            avg_exec_us=sum(
                                 max(0.05, m.exec_avg_us) for m in ll_mods if m.pipeline_id == pid
                             ),
                         )
@@ -4913,9 +5408,13 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                     ]
 
                 total_pipe_us = sum(max(0.05, p.exec_avg_us) for p in pipes_for_tick) or 1.0
+                p_cum_frac = 0.0
                 for p_obj in pipes_for_tick:
                     p_frac = max(0.05, p_obj.exec_avg_us) / total_pipe_us
-                    pw = max(4.0, active_span_px * p_frac - 1.0)
+                    cur_px = tick_x + 1.0 + p_cum_frac * active_span_px
+                    next_px = tick_x + 1.0 + (p_cum_frac + p_frac) * active_span_px
+                    pw = max(2.0, (next_px - cur_px) - 1.0)
+                    p_cum_frac += p_frac
                     pr, pg, pb_col = self._pipe_color(p_obj.pipeline_id)
                     is_p_hov = (
                         self._hovered_pipe_id == p_obj.pipeline_id and self._hovered_comp_id is None
@@ -4959,10 +5458,8 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                             "h": pipe_band_h,
                         }
                     )
-                    cur_px += pw + 1.0
 
                 # 2b. Draw sequential Module Execution Blocks inside Core `cid`
-                mod_x = tick_x + 1.0
                 mods_in_tick = [m for m in ll_mods if tick_idx < max(1, m.iterations)]
                 tot_m_us = (
                     sum(
@@ -4972,15 +5469,52 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                     or 1.0
                 )
                 cum_us = 0.0
+                m_cum_frac = 0.0
                 for m_obj in mods_in_tick:
                     m_us = max(
                         0.05,
                         m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216),
                     )
                     m_frac = m_us / tot_m_us
-                    mw = max(3.5, active_span_px * m_frac - 1.0)
+                    mod_x = tick_x + 1.0 + m_cum_frac * active_span_px
+                    next_mod_x = tick_x + 1.0 + (m_cum_frac + m_frac) * active_span_px
+                    mw = max(2.0, (next_mod_x - mod_x) - 1.0)
+                    m_cum_frac += m_frac
                     mr, mg, mb_col = self._mod_color(m_obj.comp_id, m_obj.pipeline_id)
                     is_hov = self._hovered_comp_id == m_obj.comp_id
+                    has_mod_v = m_obj.cpc_violations > 0 or (
+                        m_obj.effective_cpc > 0 and m_obj.peak_cycles > m_obj.effective_cpc
+                    )
+                    is_focused_v_slice = bool(
+                        self._focused_violation_slice
+                        and self._focused_violation_slice.get("comp_id") == m_obj.comp_id
+                        and int(self._focused_violation_slice.get("tick_idx", 0) or 0) == tick_idx
+                    )
+
+                    if is_focused_v_slice:
+                        # Vertical crimson cursor marker across all core lanes at the focused violation
+                        vcx = mod_x + mw * 0.5
+                        vpb = Gsk.PathBuilder.new()
+                        vpb.move_to(vcx, lanes_top_y)
+                        vpb.line_to(vcx, lanes_bot_y)
+                        vstroke = Gsk.Stroke.new(1.6)
+                        vstroke.set_dash([4.0, 2.5])
+                        snapshot.append_stroke(
+                            vpb.to_path(),
+                            vstroke,
+                            self._rgba(1.0, 0.25, 0.28, 0.96),
+                        )
+                        # Outer glowing focus frame around the violating timeline slice
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            mod_x - 2.0,
+                            mod_band_y - 2.0,
+                            mw + 4.0,
+                            mod_band_h + 4.0,
+                            self._rgba(0.96, 0.14, 0.20, 0.36),
+                            self._rgba(1.0, 0.85, 0.85, 1.0),
+                            2.0,
+                        )
 
                     self._draw_rect_fill_stroke(
                         snapshot,
@@ -4988,14 +5522,16 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                         mod_band_y,
                         mw,
                         mod_band_h,
-                        self._rgba(mr, mg, mb_col, 0.82 if is_hov else 0.56),
-                        self._rgba(
+                        self._rgba(mr, mg, mb_col, 0.88 if (is_hov or is_focused_v_slice) else 0.56),
+                        self._rgba(1.0, 0.28, 0.30, 1.0)
+                        if (has_mod_v or is_focused_v_slice)
+                        else self._rgba(
                             1.0 if is_hov else mr * 1.15,
                             0.92 if is_hov else mg * 1.15,
                             0.42 if is_hov else mb_col * 1.15,
                             1.0 if is_hov else 0.9,
                         ),
-                        1.5 if is_hov else 1.0,
+                        1.8 if (has_mod_v or is_hov or is_focused_v_slice) else 1.0,
                     )
 
                     # Mini buffer fill indicator bar along the bottom edge of the module block
@@ -5035,7 +5571,7 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                         )
 
                     if mw >= 22.0:
-                        short_name = m_obj.widget_name
+                        short_name = f"! {m_obj.widget_name}" if has_mod_v else m_obj.widget_name
                         lbl = (
                             f"{short_name} ({m_us:.2f}µs)"
                             if mw >= 78.0
@@ -5047,8 +5583,41 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                             mod_x + 2.5,
                             mod_band_y + 1.0,
                             "Monospace Bold 7",
-                            self._rgba(0.98, 0.99, 1.0, 1.0),
+                            self._rgba(1.0, 0.85, 0.85, 1.0)
+                            if has_mod_v
+                            else self._rgba(0.98, 0.99, 1.0, 1.0),
                             max_w=mw - 4.0,
+                        )
+
+                    if is_focused_v_slice:
+                        banner_txt = (
+                            f"! VIOLATION @ T{tick_idx}: {m_obj.widget_name} "
+                            f"({m_obj.peak_cycles}>{m_obj.effective_cpc} cyc)"
+                        )
+                        b_lyt = self.create_pango_layout(banner_txt)
+                        b_lyt.set_font_description(Pango.FontDescription.from_string("Monospace Bold 7"))
+                        btw, bth = b_lyt.get_pixel_size()
+                        bw_box = float(btw + 10)
+                        bh_box = float(bth + 4)
+                        bx_box = max(plot_x + 4.0, min(plot_x + plot_w - bw_box - 4.0, mod_x + mw * 0.5 - bw_box * 0.5))
+                        by_box = max(lanes_top_y + 1.0, mod_band_y - bh_box - 2.0)
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            bx_box,
+                            by_box,
+                            bw_box,
+                            bh_box,
+                            self._rgba(0.72, 0.10, 0.15, 0.96),
+                            self._rgba(1.0, 0.65, 0.65, 1.0),
+                            1.1,
+                        )
+                        self._draw_text(
+                            snapshot,
+                            banner_txt,
+                            bx_box + 5.0,
+                            by_box + 1.5,
+                            "Monospace Bold 7",
+                            self._rgba(1.0, 0.96, 0.96, 1.0),
                         )
 
                     self._hit_boxes.append(
@@ -5068,7 +5637,6 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                         }
                     )
                     cum_us += m_us
-                    mod_x += mw + 1.0
 
             # 2c. Draw DP Thread Execution Spans & LL-Sync markers if Core has DP modules
             if has_dp and dp_band_h >= 6.0:
@@ -5181,7 +5749,14 @@ class SchedulingTelemetryWidget(Gtk.Widget):
             + sum(p.total_bytes_transferred for p in m.out_pins)
             for m in active_mods
         )
+        mod_violations_map: Dict[int, List[Dict[str, Any]]] = {
+            m.comp_id: self._collect_module_violations(m) for m in active_mods
+        }
+        viol_comp_ids = [m.comp_id for m in active_mods if mod_violations_map.get(m.comp_id)]
         cpc_violations = sum(m.cpc_violations for m in active_mods)
+        total_violation_nodes = sum(len(vlist) for vlist in mod_violations_map.values())
+
+        hdr_badge_w = 235.0 if (cpc_violations > 0 or total_violation_nodes > 0) else 0.0
         self._draw_text(
             snapshot,
             f"MODULE BUFFER STATS & PIN TELEMETRY  —  {len(active_mods)} Modules  |  "
@@ -5190,13 +5765,70 @@ class SchedulingTelemetryWidget(Gtk.Widget):
             buf_section_y + 2.5,
             "Monospace Bold 8",
             self._rgba(0.84, 0.92, 0.98, 1.0),
-            max_w=w - 16.0,
+            max_w=max(120.0, w - hdr_badge_w - 20.0),
         )
+
+        if viol_comp_ids:
+            all_exp = all(cid in self._expanded_violation_mods for cid in viol_comp_ids)
+            hdr_arrow = "▾" if all_exp else "▸"
+            bx_hdr = max(240.0, w - hdr_badge_w - 6.0)
+            by_hdr = buf_section_y + 1.5
+            bh_hdr = buf_hdr_h - 3.0
+            self._draw_rect_fill_stroke(
+                snapshot,
+                bx_hdr,
+                by_hdr,
+                hdr_badge_w,
+                bh_hdr,
+                self._rgba(0.42, 0.10, 0.14, 0.95),
+                self._rgba(0.98, 0.42, 0.42, 0.95),
+                1.0,
+            )
+            first_v = mod_violations_map[viol_comp_ids[0]][0]
+            self._draw_text(
+                snapshot,
+                f"{hdr_arrow} ⚠ Violations ({cpc_violations or total_violation_nodes}) • Click → Log",
+                bx_hdr + 5.0,
+                by_hdr + 1.0,
+                "Monospace Bold 7.5",
+                self._rgba(1.0, 0.72, 0.72, 1.0),
+                max_w=hdr_badge_w - 8.0,
+            )
+            self._hit_boxes.append(
+                {
+                    "kind": "violation_header_badge",
+                    "viol_comp_ids": viol_comp_ids,
+                    "violation": {
+                        **first_v,
+                        "type": "ALL_VIOLATIONS",
+                        "v_key": "summary:all_violations",
+                        "summary": f"All Scheduling & Pin Buffer Violations ({cpc_violations} CPC violations across {len(viol_comp_ids)} modules)",
+                    },
+                    "x": bx_hdr,
+                    "y": by_hdr,
+                    "w": hdr_badge_w,
+                    "h": bh_hdr,
+                    "expander_x_end": bx_hdr + 22.0,
+                }
+            )
 
         rows_top_y = buf_section_y + buf_hdr_h
         rows_viewport_h = max(30.0, h - rows_top_y)
         row_h = 30.0
-        content_h = max(rows_viewport_h, len(active_mods) * row_h + 4.0)
+        v_grp_row_h = 21.0
+        v_ev_row_h = 19.0
+
+        # Calculate total scrollable content height including expanded violation tree rows
+        total_rows_h = 4.0
+        for m_obj in active_mods:
+            total_rows_h += row_h
+            m_vlist = mod_violations_map.get(m_obj.comp_id, [])
+            if m_vlist and m_obj.comp_id in self._expanded_violation_mods:
+                for v_grp in m_vlist:
+                    total_rows_h += v_grp_row_h
+                    if v_grp["v_key"] not in self._collapsed_violation_groups:
+                        total_rows_h += len(v_grp.get("children", [])) * v_ev_row_h
+        content_h = max(rows_viewport_h, total_rows_h)
         self._sync_v_adjustment(content_h, rows_viewport_h)
 
         rows_clip = Graphene.Rect.alloc()
@@ -5204,141 +5836,369 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         snapshot.push_clip(rows_clip)
 
         col_mod_w = min(230.0, max(165.0, w * 0.24))
-        col_exec_w = min(175.0, max(130.0, w * 0.18))
+        col_exec_w = min(185.0, max(135.0, w * 0.19))
         rem_w = max(160.0, w - col_mod_w - col_exec_w - 12.0)
         col_in_w = rem_w * 0.50
         col_out_w = rem_w * 0.50
 
+        cur_row_y = rows_top_y - self.v_scroll_offset
         for idx, m_obj in enumerate(active_mods):
-            ry = rows_top_y + idx * row_h - self.v_scroll_offset
-            if ry + row_h < rows_top_y or ry > rows_top_y + rows_viewport_h:
-                continue
+            ry = cur_row_y
+            cur_row_y += row_h
+            m_vlist = mod_violations_map.get(m_obj.comp_id, [])
+            is_mod_expanded = bool(m_vlist) and (m_obj.comp_id in self._expanded_violation_mods)
 
-            is_hov = self._hovered_comp_id == m_obj.comp_id
-            row_bg = (
-                self._rgba(0.16, 0.22, 0.32, 0.95)
-                if is_hov
-                else (
-                    self._rgba(0.085, 0.10, 0.145, 0.95)
-                    if (idx % 2 == 0)
-                    else self._rgba(0.075, 0.09, 0.13, 0.95)
+            if ry + row_h >= rows_top_y and ry <= rows_top_y + rows_viewport_h:
+                is_hov = self._hovered_comp_id == m_obj.comp_id
+                row_bg = (
+                    self._rgba(0.16, 0.22, 0.32, 0.95)
+                    if is_hov
+                    else (
+                        self._rgba(0.085, 0.10, 0.145, 0.95)
+                        if (idx % 2 == 0)
+                        else self._rgba(0.075, 0.09, 0.13, 0.95)
+                    )
                 )
-            )
-            self._draw_rect_fill_stroke(
-                snapshot,
-                0.0,
-                ry,
-                w,
-                row_h,
-                row_bg,
-                self._rgba(0.20, 0.25, 0.34, 0.75),
-                0.8,
-            )
+                self._draw_rect_fill_stroke(
+                    snapshot,
+                    0.0,
+                    ry,
+                    w,
+                    row_h,
+                    row_bg,
+                    self._rgba(0.20, 0.25, 0.34, 0.75),
+                    0.8,
+                )
 
-            # Color stripe on left matching module's timeline color
-            mr, mg, mb_col = self._mod_color(m_obj.comp_id, m_obj.pipeline_id)
-            self._draw_rect_fill_stroke(
-                snapshot,
-                0.0,
-                ry,
-                4.5,
-                row_h,
-                self._rgba(mr, mg, mb_col, 0.95),
-                None,
-            )
+                # Color stripe on left matching module's timeline color (or red accent if violation)
+                mr, mg, mb_col = self._mod_color(m_obj.comp_id, m_obj.pipeline_id)
+                self._draw_rect_fill_stroke(
+                    snapshot,
+                    0.0,
+                    ry,
+                    4.5,
+                    row_h,
+                    self._rgba(mr, mg, mb_col, 0.95),
+                    None,
+                )
 
-            # Column 1: Module Name, Pipe, Core, Domain, Memory
-            m_title = f"[P{m_obj.pipeline_id}•C{m_obj.core_id}•{m_obj.domain}] {m_obj.widget_name}"
-            self._draw_text(
-                snapshot,
-                m_title,
-                8.0,
-                ry + 2.0,
-                "Monospace Bold 8",
-                self._rgba(0.94, 0.97, 1.0, 1.0),
-                max_w=col_mod_w - 12.0,
-            )
-            m_sub = (
-                f"id=0x{m_obj.comp_id:x} {m_obj.mem_type} iters={m_obj.iterations} "
-                f"ibs={m_obj.ibs}B obs={m_obj.obs}B"
-            )
-            self._draw_text(
-                snapshot,
-                m_sub,
-                8.0,
-                ry + 15.0,
-                "Monospace 7",
-                self._rgba(0.68, 0.76, 0.86, 0.92),
-                max_w=col_mod_w - 12.0,
-            )
+                # Column 1: Module Name, Pipe, Core, Domain, Memory
+                tree_prefix = ("▾ " if is_mod_expanded else "▸ ") if m_vlist else ""
+                m_title = f"{tree_prefix}[P{m_obj.pipeline_id}•C{m_obj.core_id}•{m_obj.domain}] {m_obj.widget_name}"
+                self._draw_text(
+                    snapshot,
+                    m_title,
+                    8.0,
+                    ry + 2.0,
+                    "Monospace Bold 8",
+                    self._rgba(1.0, 0.80, 0.80, 1.0) if m_vlist else self._rgba(0.94, 0.97, 1.0, 1.0),
+                    max_w=col_mod_w - 12.0,
+                )
+                m_sub = (
+                    f"id=0x{m_obj.comp_id:x} {m_obj.mem_type} iters={m_obj.iterations} "
+                    f"ibs={m_obj.ibs}B obs={m_obj.obs}B"
+                )
+                self._draw_text(
+                    snapshot,
+                    m_sub,
+                    8.0,
+                    ry + 15.0,
+                    "Monospace 7",
+                    self._rgba(0.68, 0.76, 0.86, 0.92),
+                    max_w=col_mod_w - 12.0,
+                )
 
-            # Column 2: Execution Time, Cycles, KCPS, CPC
-            ex_x = col_mod_w + 4.0
-            m_us = m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216)
-            m_pk_us = m_obj.exec_peak_us if m_obj.exec_peak_us > 0 else (m_obj.peak_cycles / 393.216)
-            self._draw_text(
-                snapshot,
-                f"exec: {m_us:.2f}/{m_pk_us:.2f} µs ({m_obj.avg_kcps} kcps)",
-                ex_x,
-                ry + 2.0,
-                "Monospace Bold 7.5",
-                self._rgba(0.86, 0.92, 0.98, 0.95),
-                max_w=col_exec_w - 6.0,
-            )
-            cpc_col = (
-                self._rgba(0.98, 0.45, 0.45, 1.0)
-                if m_obj.cpc_violations > 0
-                else self._rgba(0.66, 0.78, 0.88, 0.9)
-            )
-            self._draw_text(
-                snapshot,
-                f"cyc: {m_obj.avg_cycles}/{m_obj.peak_cycles} | CPC:{m_obj.effective_cpc}(v={m_obj.cpc_violations})",
-                ex_x,
-                ry + 15.0,
-                "Monospace 7",
-                cpc_col,
-                max_w=col_exec_w - 6.0,
-            )
+                # Column 2: Execution Time, Cycles, KCPS, CPC & Expandable Red Violation Tree Badge
+                ex_x = col_mod_w + 4.0
+                m_us = m_obj.exec_avg_us if m_obj.exec_avg_us > 0 else (m_obj.avg_cycles / 393.216)
+                m_pk_us = m_obj.exec_peak_us if m_obj.exec_peak_us > 0 else (m_obj.peak_cycles / 393.216)
+                self._draw_text(
+                    snapshot,
+                    f"exec: {m_us:.2f}/{m_pk_us:.2f} µs ({m_obj.avg_kcps} kcps)",
+                    ex_x,
+                    ry + 2.0,
+                    "Monospace Bold 7.5",
+                    self._rgba(0.86, 0.92, 0.98, 0.95),
+                    max_w=col_exec_w - 6.0,
+                )
 
-            # Column 3: Input Pin Buffer Stats (IN[0..])
-            in_x = col_mod_w + col_exec_w + 6.0
-            self._draw_pin_buffer_cell(
-                snapshot,
-                m_obj.in_pins,
-                "IN",
-                in_x,
-                ry,
-                col_in_w - 6.0,
-                row_h,
-                is_input=True,
-            )
+                if m_vlist:
+                    exp_arrow = "▾" if is_mod_expanded else "▸"
+                    pill_x = ex_x - 2.0
+                    pill_y = ry + 14.0
+                    pill_w = col_exec_w - 4.0
+                    pill_h = 14.5
+                    is_v_sel = self._selected_violation_key == m_vlist[0]["v_key"]
+                    self._draw_rect_fill_stroke(
+                        snapshot,
+                        pill_x,
+                        pill_y,
+                        pill_w,
+                        pill_h,
+                        self._rgba(0.48, 0.12, 0.16, 0.96)
+                        if is_v_sel
+                        else self._rgba(0.36, 0.09, 0.13, 0.92),
+                        self._rgba(1.0, 0.45, 0.45, 0.98),
+                        1.0,
+                    )
+                    self._draw_text(
+                        snapshot,
+                        f"{exp_arrow} ⚠ cyc:{m_obj.avg_cycles}/{m_obj.peak_cycles}|CPC:{m_obj.effective_cpc}(v={m_obj.cpc_violations})",
+                        ex_x + 2.0,
+                        ry + 14.5,
+                        "Monospace Bold 7",
+                        self._rgba(1.0, 0.68, 0.68, 1.0),
+                        max_w=pill_w - 6.0,
+                    )
+                else:
+                    self._draw_text(
+                        snapshot,
+                        f"cyc: {m_obj.avg_cycles}/{m_obj.peak_cycles} | CPC:{m_obj.effective_cpc}(v={m_obj.cpc_violations})",
+                        ex_x,
+                        ry + 15.0,
+                        "Monospace 7",
+                        self._rgba(0.66, 0.78, 0.88, 0.9),
+                        max_w=col_exec_w - 6.0,
+                    )
 
-            # Column 4: Output Pin Buffer Stats (OUT[0..])
-            out_x = in_x + col_in_w
-            self._draw_pin_buffer_cell(
-                snapshot,
-                m_obj.out_pins,
-                "OUT",
-                out_x,
-                ry,
-                col_out_w - 6.0,
-                row_h,
-                is_input=False,
-            )
+                # Column 3: Input Pin Buffer Stats (IN[0..])
+                in_x = col_mod_w + col_exec_w + 6.0
+                self._draw_pin_buffer_cell(
+                    snapshot,
+                    m_obj.in_pins,
+                    "IN",
+                    in_x,
+                    ry,
+                    col_in_w - 6.0,
+                    row_h,
+                    is_input=True,
+                )
 
-            self._hit_boxes.append(
-                {
-                    "kind": "buffer_row",
-                    "comp_id": m_obj.comp_id,
-                    "pipe_id": m_obj.pipeline_id,
-                    "core_id": m_obj.core_id,
-                    "mod": m_obj,
-                    "x": 0.0,
-                    "y": ry,
-                    "w": w,
-                    "h": row_h,
-                }
-            )
+                # Column 4: Output Pin Buffer Stats (OUT[0..])
+                out_x = in_x + col_in_w
+                self._draw_pin_buffer_cell(
+                    snapshot,
+                    m_obj.out_pins,
+                    "OUT",
+                    out_x,
+                    ry,
+                    col_out_w - 6.0,
+                    row_h,
+                    is_input=False,
+                )
+
+                self._hit_boxes.append(
+                    {
+                        "kind": "buffer_row",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "mod": m_obj,
+                        "x": 0.0,
+                        "y": ry,
+                        "w": w,
+                        "h": row_h,
+                    }
+                )
+                if m_vlist:
+                    # Register violation tree hit-box on both the Column 1 tree arrow and the Column 2 red violation pill
+                    self._hit_boxes.append(
+                        {
+                            "kind": "violation_node",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "v_key": m_vlist[0]["v_key"],
+                            "violation": m_vlist[0],
+                            "mod": m_obj,
+                            "x": 6.0,
+                            "y": ry + 1.0,
+                            "w": 20.0,
+                            "h": 16.0,
+                            "expander_x_end": 26.0,
+                        }
+                    )
+                    self._hit_boxes.append(
+                        {
+                            "kind": "violation_node",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "v_key": m_vlist[0]["v_key"],
+                            "violation": m_vlist[0],
+                            "mod": m_obj,
+                            "x": ex_x - 2.0,
+                            "y": ry + 14.0,
+                            "w": col_exec_w - 4.0,
+                            "h": 14.5,
+                            "expander_x_end": ex_x + 16.0,
+                        }
+                    )
+
+            # Render expanded violation tree rows beneath the module row
+            if is_mod_expanded:
+                for g_idx, v_grp in enumerate(m_vlist):
+                    gy = cur_row_y
+                    cur_row_y += v_grp_row_h
+                    gkey = v_grp["v_key"]
+                    grp_expanded = gkey not in self._collapsed_violation_groups
+                    children = v_grp.get("children", [])
+                    is_last_grp = g_idx == len(m_vlist) - 1
+
+                    if gy + v_grp_row_h >= rows_top_y and gy <= rows_top_y + rows_viewport_h:
+                        is_grp_sel = self._selected_violation_key == gkey
+                        is_grp_hov = (
+                            self._hovered_hit_info is not None
+                            and self._hovered_hit_info.get("v_key") == gkey
+                        )
+                        grp_bg = (
+                            self._rgba(0.36, 0.11, 0.15, 0.96)
+                            if (is_grp_sel or is_grp_hov)
+                            else self._rgba(0.22, 0.08, 0.11, 0.94)
+                        )
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            0.0,
+                            gy,
+                            w,
+                            v_grp_row_h,
+                            grp_bg,
+                            self._rgba(0.65, 0.22, 0.26, 0.85),
+                            0.8,
+                        )
+                        # Red vertical tree bar on left
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            0.0,
+                            gy,
+                            4.5,
+                            v_grp_row_h,
+                            self._rgba(0.98, 0.35, 0.35, 1.0),
+                            None,
+                        )
+                        branch_chr = "└─" if (is_last_grp and not grp_expanded) else "├─"
+                        grp_arrow = "▾" if grp_expanded else "▸"
+                        grp_txt = f"  {branch_chr} {grp_arrow} ⚠ [{v_grp['type']}] {v_grp['summary']}"
+                        action_w = 135.0
+                        self._draw_text(
+                            snapshot,
+                            grp_txt,
+                            10.0,
+                            gy + 3.0,
+                            "Monospace Bold 7.5",
+                            self._rgba(1.0, 0.72, 0.72, 1.0),
+                            max_w=max(120.0, w - action_w - 20.0),
+                        )
+                        # Right-side action badge indicating click opens Telemetry Log notebook page
+                        act_x = max(140.0, w - action_w - 8.0)
+                        self._draw_rect_fill_stroke(
+                            snapshot,
+                            act_x,
+                            gy + 2.5,
+                            action_w,
+                            v_grp_row_h - 5.0,
+                            self._rgba(0.46, 0.14, 0.18, 0.95),
+                            self._rgba(0.98, 0.48, 0.48, 0.90),
+                            0.8,
+                        )
+                        self._draw_text(
+                            snapshot,
+                            "Telemetry Log →",
+                            act_x + 8.0,
+                            gy + 3.0,
+                            "Monospace Bold 7",
+                            self._rgba(1.0, 0.88, 0.88, 1.0),
+                            max_w=action_w - 10.0,
+                        )
+                        self._hit_boxes.append(
+                            {
+                                "kind": "violation_tree_group",
+                                "comp_id": m_obj.comp_id,
+                                "pipe_id": m_obj.pipeline_id,
+                                "core_id": m_obj.core_id,
+                                "v_key": gkey,
+                                "violation": v_grp,
+                                "mod": m_obj,
+                                "x": 0.0,
+                                "y": gy,
+                                "w": w,
+                                "h": v_grp_row_h,
+                                "expander_x_end": 48.0,
+                            }
+                        )
+
+                    if grp_expanded:
+                        for c_idx, ev_item in enumerate(children):
+                            ey = cur_row_y
+                            cur_row_y += v_ev_row_h
+                            ekey = ev_item["v_key"]
+                            is_last_ev = c_idx == len(children) - 1
+                            if ey + v_ev_row_h >= rows_top_y and ey <= rows_top_y + rows_viewport_h:
+                                is_ev_sel = self._selected_violation_key == ekey
+                                is_ev_hov = (
+                                    self._hovered_hit_info is not None
+                                    and self._hovered_hit_info.get("v_key") == ekey
+                                )
+                                ev_bg = (
+                                    self._rgba(0.32, 0.10, 0.14, 0.95)
+                                    if (is_ev_sel or is_ev_hov)
+                                    else self._rgba(0.16, 0.06, 0.09, 0.94)
+                                )
+                                self._draw_rect_fill_stroke(
+                                    snapshot,
+                                    0.0,
+                                    ey,
+                                    w,
+                                    v_ev_row_h,
+                                    ev_bg,
+                                    self._rgba(0.45, 0.16, 0.20, 0.75),
+                                    0.6,
+                                )
+                                self._draw_rect_fill_stroke(
+                                    snapshot,
+                                    0.0,
+                                    ey,
+                                    4.5,
+                                    v_ev_row_h,
+                                    self._rgba(0.92, 0.30, 0.30, 0.90),
+                                    None,
+                                )
+                                tree_stem = "   " if is_last_grp else "│  "
+                                ev_branch = "└─" if is_last_ev else "├─"
+                                ev_txt = f"  {tree_stem}{ev_branch} • {ev_item['summary']}"
+                                self._draw_text(
+                                    snapshot,
+                                    ev_txt,
+                                    14.0,
+                                    ey + 2.5,
+                                    "Monospace 7",
+                                    self._rgba(0.98, 0.62, 0.62, 0.98),
+                                    max_w=max(120.0, w - 125.0),
+                                )
+                                self._draw_text(
+                                    snapshot,
+                                    "[Inspect Log →]",
+                                    max(140.0, w - 108.0),
+                                    ey + 2.5,
+                                    "Monospace Bold 6.5",
+                                    self._rgba(1.0, 0.78, 0.78, 0.92),
+                                    max_w=100.0,
+                                )
+                                self._hit_boxes.append(
+                                    {
+                                        "kind": "violation_tree_item",
+                                        "comp_id": m_obj.comp_id,
+                                        "pipe_id": m_obj.pipeline_id,
+                                        "core_id": m_obj.core_id,
+                                        "v_key": ekey,
+                                        "violation": ev_item,
+                                        "mod": m_obj,
+                                        "x": 0.0,
+                                        "y": ey,
+                                        "w": w,
+                                        "h": v_ev_row_h,
+                                    }
+                                )
 
         snapshot.pop()
 
@@ -5453,11 +6313,12 @@ class SchedulingTelemetryWidget(Gtk.Widget):
             max_w=bar_w - 6.0,
         )
 
-        # Mini sample tap sparkline on the right of the cell
+        # Mini sample tap sparkline on the right of the cell (supports pointer-anchored zoom)
         if spark_w >= 28.0 and p0.samples:
             sx = x + text_w + 2.0
             sy = y + 3.0
             sh = h - 6.0
+            self._spark_hit_boxes.append({"x": sx, "y": sy, "w": spark_w, "h": sh})
             self._draw_rect_fill_stroke(
                 snapshot,
                 sx,
@@ -5469,11 +6330,15 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                 0.7,
             )
             smps = p0.samples
+            n_total = len(smps)
+            vis_cnt = max(8, int(round(float(n_total) / max(1.0, self.buf_spark_zoom))))
+            start_i = max(0, min(max(0, n_total - vis_cnt), int(round(self.buf_spark_pan_f))))
+            view_smps = smps[start_i : start_i + vis_cnt]
             peak_s = max((abs(v) for v in smps), default=1) or 1
             pb = Gsk.PathBuilder.new()
-            n_pts = len(smps)
+            n_pts = len(view_smps)
             mid_y = sy + sh * 0.5
-            for s_idx, val in enumerate(smps):
+            for s_idx, val in enumerate(view_smps):
                 px = sx + 1.0 + (s_idx / float(max(1, n_pts - 1))) * (spark_w - 2.0)
                 py = mid_y - (float(val) / float(peak_s)) * (sh * 0.42)
                 if s_idx == 0:
@@ -5494,7 +6359,24 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         hit: Dict[str, Any],
     ) -> None:
         lines: List[str] = []
-        if hit.get("kind") == "pipeline":
+        kind = hit.get("kind", "")
+        if kind == "violation_header_badge":
+            v = hit.get("violation", {})
+            lines.append(f"⚠ {v.get('summary', 'Scheduling & Buffer Violations')}")
+            lines.append("Click ▸/▾ arrow to expand/collapse all violation trees, or click badge to open Telemetry Log tab")
+        elif kind in ("violation_node", "violation_tree_group", "violation_tree_item"):
+            v = hit.get("violation", {})
+            m: Optional[ComponentPerfItem] = hit.get("mod") or v.get("mod")
+            lines.append(f"⚠ [{v.get('type', 'VIOLATION')}] {v.get('summary', '')}")
+            if m is not None:
+                lines.append(
+                    f"Module: {m.widget_name} (0x{m.comp_id:06x})  |  Pipe {m.pipeline_id}  |  Core {m.core_id} [{m.domain} • {m.mem_type}]"
+                )
+                lines.append(
+                    f"Cycles: avg={m.avg_cycles} / peak={m.peak_cycles}  |  Effective CPC={m.effective_cpc} (Violations={m.cpc_violations})"
+                )
+            lines.append("Click ▸/▾ to toggle violation tree  |  Click violation to open Telemetry Log in Attributes Notebook")
+        elif kind == "pipeline":
             p: PipelineSchedTelemetry = hit["pipe"]
             t_idx = hit.get("tick_idx", 0)
             lines.append(
@@ -5508,8 +6390,8 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                 f"Exec Time: avg={p.exec_avg_us:.3f} µs / peak={p.exec_peak_us:.3f} µs  |  "
                 f"Cycles: avg={p.avg_cycles} / peak={p.peak_cycles} ({p.avg_kcps} kcps)  |  Xruns: {p.xruns}"
             )
-        else:
-            m: ComponentPerfItem = hit["mod"]
+        elif "mod" in hit and hit["mod"] is not None:
+            m = hit["mod"]
             m_us = m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216)
             m_pk_us = m.exec_peak_us if m.exec_peak_us > 0 else (m.peak_cycles / 393.216)
             tick_str = (
@@ -5544,6 +6426,8 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                     f"produced={p_out.last_bytes_transferred}B(tot={p_out.total_bytes_transferred}B) "
                     f"rms={p_out.exit_rms_db:+.2f}dBFS(pk={p_out.exit_peak_db:+.2f}dB)"
                 )
+        else:
+            return
 
         tooltip_txt = "\n".join(lines)
         layout = self.create_pango_layout(tooltip_txt)

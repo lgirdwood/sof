@@ -149,6 +149,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         on_probe_tap_toggled: Optional[Callable[[Optional[str], int, str], None]] = None,
         on_testbench_io_changed: Optional[Callable[[List[int]], None]] = None,
         on_view_source_requested: Optional[Callable[[str, str, Optional[str], Optional[str]], None]] = None,
+        on_violation_bang_clicked: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         super().__init__()
         self.set_hexpand(True)
@@ -162,6 +163,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.on_probe_tap_toggled = on_probe_tap_toggled
         self.on_testbench_io_changed = on_testbench_io_changed
         self.on_view_source_requested = on_view_source_requested
+        self.on_violation_bang_clicked = on_violation_bang_clicked
         self._active_context_popover: Optional[Gtk.Popover] = None
         self.live_node_telemetry: Dict[str, Dict[str, Any]] = {}
         self.active_probe_node_id: Optional[str] = None
@@ -395,7 +397,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.queue_draw()
 
     def set_live_telemetry_overlay(self, telem: Optional[Any]) -> None:
-        """Populate live node telemetry and DAPM power badges from TestbenchTelemetry."""
+        """Populate live node telemetry, DAPM power badges, and violation status from TestbenchTelemetry."""
         self.live_node_telemetry.clear()
         if telem is None or not self.vm:
             self.queue_draw()
@@ -403,6 +405,10 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         comps = getattr(telem, "components", []) or []
         dapms = getattr(telem, "dapm_nodes", []) or []
+        pipes = getattr(telem, "pipelines", []) or []
+        cores = getattr(telem, "cores", []) or []
+        pipe_by_id = {int(getattr(p, "pipeline_id", -1)): p for p in pipes}
+        core_by_id = {int(getattr(c, "core_id", -1)): c for c in cores}
 
         for nid, node in self.vm.nodes.items():
             if node.class_category in ("Control", "TestbenchIO", "PinFormat"):
@@ -432,17 +438,56 @@ class TopologyGraphCanvas(Gtk.Widget):
                 d_nid = matched_dapm.get("node_id", 0) if isinstance(matched_dapm, dict) else getattr(matched_dapm, "node_id", 0)
                 d_name = matched_dapm.get("name", "") if isinstance(matched_dapm, dict) else getattr(matched_dapm, "name", "")
                 d_pwr = matched_dapm.get("power", 1) if isinstance(matched_dapm, dict) else getattr(matched_dapm, "power", 1)
+
+                cpc_v = int(getattr(matched_comp, "cpc_violations", 0) or 0) if matched_comp else 0
+                eff_cpc = int(getattr(matched_comp, "effective_cpc", 0) or 0) if matched_comp else 0
+                avg_cyc = int(getattr(matched_comp, "avg_cycles", 0) or 0) if matched_comp else 0
+                pk_cyc = int(getattr(matched_comp, "peak_cycles", 0) or 0) if matched_comp else 0
+                iters = int(getattr(matched_comp, "iterations", 0) or 0) if matched_comp else 0
+                ibs = int(getattr(matched_comp, "ibs", 0) or 0) if matched_comp else 0
+                pid_val = int(getattr(matched_comp, "pipeline_id", node.pipeline_id or 0)) if matched_comp else int(node.pipeline_id or 0)
+                cid_val = int(getattr(matched_comp, "core_id", 0)) if matched_comp else 0
+
+                p_obj = pipe_by_id.get(pid_val)
+                pipe_xruns = int(getattr(p_obj, "xruns", getattr(p_obj, "xrun_count", 0)) or 0) if p_obj else 0
+                c_obj = core_by_id.get(cid_val)
+                core_overruns = int(getattr(c_obj, "overruns", getattr(c_obj, "ll_deadline_violations", 0)) or 0) if c_obj else 0
+                in_pins = getattr(matched_comp, "in_pins", []) if matched_comp else []
+                pin_underrun = bool(
+                    any(
+                        getattr(p_in, "buf_size", 0) > 0
+                        and iters > 0
+                        and getattr(p_in, "total_bytes_transferred", 0) == 0
+                        and ibs > 0
+                        for p_in in in_pins
+                    )
+                )
+                has_cpc_over = cpc_v > 0 or (eff_cpc > 0 and pk_cyc > eff_cpc)
+                has_violation = bool(has_cpc_over or pipe_xruns > 0 or core_overruns > 0 or pin_underrun)
+                v_cnt = cpc_v if cpc_v > 0 else (pipe_xruns + core_overruns + (1 if pin_underrun else 0) + (1 if has_cpc_over else 0))
+
                 self.live_node_telemetry[nid] = {
                     "comp_id": int(getattr(matched_comp, "resource_id", getattr(matched_comp, "comp_id", 0))) if matched_comp else int(d_nid),
                     "widget_name": (getattr(matched_comp, "widget_name", "") if matched_comp else d_name) or nid,
+                    "pipeline_id": pid_val,
                     "avg_kcps": float(getattr(matched_comp, "avg_kcps", 0.0)) if matched_comp else 0.0,
                     "peak_kcps": float(getattr(matched_comp, "peak_kcps", 0.0)) if matched_comp else 0.0,
                     "domain": str(getattr(matched_comp, "domain", "LL")) if matched_comp else "LL",
                     "mem_domain": str(getattr(matched_comp, "mem_domain", "SRAM")) if matched_comp else "SRAM",
-                    "core_id": int(getattr(matched_comp, "core_id", 0)) if matched_comp else 0,
+                    "core_id": cid_val,
                     "in_rms_db": float(getattr(matched_comp, "in_rms_db", -120.0)) if matched_comp else -120.0,
                     "out_rms_db": float(getattr(matched_comp, "out_rms_db", -120.0)) if matched_comp else -120.0,
                     "powered": bool(d_pwr) if matched_dapm else True,
+                    "has_violation": has_violation,
+                    "violation_count": v_cnt,
+                    "cpc_violations": cpc_v,
+                    "effective_cpc": eff_cpc,
+                    "avg_cycles": avg_cyc,
+                    "peak_cycles": pk_cyc,
+                    "pipe_xruns": pipe_xruns,
+                    "core_overruns": core_overruns,
+                    "pin_underrun": pin_underrun,
+                    "mod_obj": matched_comp,
                 }
         self.queue_draw()
 
@@ -1390,11 +1435,28 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_color(header_col, hdr_rect)
         snapshot.pop()
 
-        # Node border (highlight in emerald when actively probed or DAPM powered)
+        # Node border (highlight in crimson if violating, emerald when actively probed or DAPM powered)
         telem_info = self.live_node_telemetry.get(node.id)
+        has_violation = bool(telem_info and telem_info.get("has_violation"))
         is_probed = self.active_probe_node_id == node.id
+
+        if has_violation:
+            # Outer red violation alert halo around the module card
+            v_rect = Graphene.Rect.alloc()
+            v_rect.init(node.x - 4.0, node.y - 4.0, node.width + 8.0, node.height + 8.0)
+            v_rr = Gsk.RoundedRect()
+            v_rr.init_from_rect(v_rect, 11.0)
+            snapshot.push_rounded_clip(v_rr)
+            snapshot.append_color(rgba(0.96, 0.16, 0.20, 0.24), v_rect)
+            snapshot.pop()
+            v_bcol = rgba(1.0, 0.28, 0.28, 0.96)
+            snapshot.append_border(v_rr, [2.2, 2.2, 2.2, 2.2], [v_bcol, v_bcol, v_bcol, v_bcol])
+
         if is_probed:
             bcol = NODE_BORDER_PROBED
+            bw = 2.4
+        elif has_violation:
+            bcol = rgba(1.0, 0.26, 0.28, 1.0)
             bw = 2.4
         elif is_selected:
             bcol = NODE_BORDER_SELECTED
@@ -1408,13 +1470,53 @@ class TopologyGraphCanvas(Gtk.Widget):
         snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
 
         # Node Title in header (full text, node width is sized to fit)
+        title_x = node.x + (26.0 if has_violation else 10.0)
         title_layout = self._get_pango_layout(node.title, size_pt=9, bold=True)
         snapshot.save()
         pt = Graphene.Point.alloc()
-        pt.init(node.x + 10.0, node.y + 5.0)
+        pt.init(title_x, node.y + 5.0)
         snapshot.translate(pt)
         snapshot.append_layout(title_layout, TEXT_WHITE)
         snapshot.restore()
+
+        # Red Bang (!) badge on violating module nodes
+        if has_violation and telem_info is not None:
+            # 1) Prominent circular red bang (!) icon in top-left of the module header
+            bang_cx = node.x + 14.0
+            bang_cy = node.y + 13.0
+            self._snapshot_port_circle(snapshot, bang_cx, bang_cy, rgba(1.0, 0.92, 0.92, 0.98), radius=8.5)
+            self._snapshot_port_circle(snapshot, bang_cx, bang_cy, rgba(0.92, 0.12, 0.16, 1.0), radius=7.0)
+            bang_lbl = self._get_pango_layout("!", size_pt=9, bold=True)
+            _, bang_ext = bang_lbl.get_pixel_extents()
+            snapshot.save()
+            pt.init(bang_cx - float(bang_ext.width) * 0.5, bang_cy - float(bang_ext.height) * 0.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(bang_lbl, TEXT_WHITE)
+            snapshot.restore()
+
+            # 2) Compact red [! v=N] violation pill next to the TAP pill in top-right of header
+            v_cnt = int(telem_info.get("violation_count", 1) or 1)
+            vpill_txt = f"! v={v_cnt}"
+            vpill_lbl = self._get_pango_layout(vpill_txt, size_pt=6, bold=True)
+            _, vpill_ext = vpill_lbl.get_pixel_extents()
+            vpill_w = max(32.0, float(vpill_ext.width) + 10.0)
+            vpill_h = 16.0
+            vpill_x = node.x + node.width - 38.0 - 6.0 - vpill_w - 4.0
+            vpill_y = node.y + 5.0
+            vpill_rect = Graphene.Rect.alloc()
+            vpill_rect.init(vpill_x, vpill_y, vpill_w, vpill_h)
+            vpill_rr = Gsk.RoundedRect()
+            vpill_rr.init_from_rect(vpill_rect, 4.0)
+            snapshot.push_rounded_clip(vpill_rr)
+            snapshot.append_color(rgba(0.86, 0.12, 0.16, 0.98), vpill_rect)
+            snapshot.pop()
+            vp_bcol = rgba(1.0, 0.72, 0.72, 0.95)
+            snapshot.append_border(vpill_rr, [1.0, 1.0, 1.0, 1.0], [vp_bcol, vp_bcol, vp_bcol, vp_bcol])
+            snapshot.save()
+            pt.init(vpill_x + 5.0, vpill_y + 2.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(vpill_lbl, TEXT_WHITE)
+            snapshot.restore()
 
         # Clickable Probe Tap pill in top-right of module header
         tap_w = 38.0
@@ -1443,11 +1545,19 @@ class TopologyGraphCanvas(Gtk.Widget):
             mem_dom = str(telem_info.get("mem_domain", "SRAM"))
             out_db = float(telem_info.get("out_rms_db", -120.0))
             pwr_str = "ON" if telem_info.get("powered", True) else "OFF"
-            if out_db > -115.0:
+            if has_violation:
+                v_cnt = int(telem_info.get("violation_count", 1) or 1)
+                pk_cyc = int(telem_info.get("peak_cycles", 0) or 0)
+                eff_cpc = int(telem_info.get("effective_cpc", 0) or 0)
+                cpc_tag = f" · CPC:{pk_cyc}/{eff_cpc}" if eff_cpc > 0 else ""
+                sub_text = f"! VIOLATION (v={v_cnt}){cpc_tag} · ⚡{kcps_val:.0f} KCPS · {mem_dom}"
+                sub_col = rgba(1.0, 0.52, 0.52, 1.0)
+            elif out_db > -115.0:
                 sub_text = f"⚡{kcps_val:.0f} KCPS · {mem_dom} · {out_db:.1f}dB [{pwr_str}]"
+                sub_col = TELEM_SUB_FG if telem_info.get("powered", True) else TEXT_MUTED
             else:
                 sub_text = f"⚡{kcps_val:.0f} KCPS · {mem_dom} · C{telem_info.get('core_id', 0)} [{pwr_str}]"
-            sub_col = TELEM_SUB_FG if telem_info.get("powered", True) else TEXT_MUTED
+                sub_col = TELEM_SUB_FG if telem_info.get("powered", True) else TEXT_MUTED
         sub_layout = self._get_pango_layout(sub_text, size_pt=8, bold=bool(telem_info))
         snapshot.save()
         pt.init(node.x + 10.0, node.y + 31.0)
@@ -2558,9 +2668,17 @@ class TopologyGraphCanvas(Gtk.Widget):
                         self._open_tb_file_chooser(node)
                     return
                 return
-            # Processing module node: check if user clicked the top-right [TAP] probe pill
+            # Processing module node: check if user clicked the top-right [TAP] probe pill or Red Bang (!) violation badge
             lx = wx - node.x
             ly = wy - node.y
+            telem_info = self.live_node_telemetry.get(nid)
+            has_v = bool(telem_info and telem_info.get("has_violation"))
+            if has_v and telem_info is not None and 0.0 <= ly <= 26.0:
+                if lx <= 26.0 or (node.width - 96.0 <= lx < node.width - 48.0):
+                    if self.on_violation_bang_clicked:
+                        self.on_violation_bang_clicked(nid, telem_info)
+                    self.queue_draw()
+                    return
             if 0.0 <= ly <= 26.0 and lx >= node.width - 48.0:
                 if self.active_probe_node_id == nid:
                     self.active_probe_node_id = None
