@@ -56,13 +56,16 @@ def layout_graph(vm: GraphViewModel) -> None:
     if not vm.nodes:
         return
 
-    # Propagate capture direction to any container that holds capture nodes
+    # Propagate capture direction to any container that holds capture nodes (unless explicitly playback)
     for node in vm.nodes.values():
         if node.pipeline_id is not None and node.pipeline_id in vm.containers:
+            cont = vm.containers[node.pipeline_id]
+            if "playback" in cont.class_name.lower():
+                continue
             wdir = str(node.config.get_scalar("direction", "")).lower()
             wtype = str(node.config.get_scalar("type", "")).lower()
             if "capture" in node.id.lower() or wdir == "capture" or wtype == "dai_out":
-                vm.containers[node.pipeline_id].direction = "capture"
+                cont.direction = "capture"
 
     # 1. Size each node and position its ports (Playback: in=left/out=right, Capture: in=right/out=left)
     for node in vm.nodes.values():
@@ -383,6 +386,8 @@ def _layout_flat_dag(
         main_ids = list(node_ids)
         ctrl_by_parent.clear()
 
+    has_host_in_group = any("host-copier" in vm.nodes[m].class_name for m in main_ids)
+
     # Keep host-copier on the left (rank 1) and dai-copier/alh-copier on the right (rank 4)
     def node_role_rank(nid: str) -> int:
         n = vm.nodes[nid]
@@ -393,7 +398,9 @@ def _layout_flat_dag(
         if n.class_name == "mixout":
             return 1
         if n.class_name == "module-copier":
-            return 1 if is_capture else 3
+            if is_capture:
+                return 3 if has_host_in_group else 1
+            return 3
         if n.class_name == "mixin":
             return 3
         if "dai-copier" in n.class_name or "alh-copier" in n.class_name:
@@ -411,6 +418,20 @@ def _layout_flat_dag(
     else:
         dag_edges = vm.edges
     layers = _compute_dag_layers(ordered_ids, dag_edges)
+    if len(layers) > 1 and len(layers[0]) > 1:
+        id_set_main = set(ordered_ids)
+        connected_in_group: Set[str] = set()
+        for e in dag_edges:
+            if e.source_node in id_set_main and e.sink_node in id_set_main and e.source_node != e.sink_node:
+                connected_in_group.add(e.source_node)
+                connected_in_group.add(e.sink_node)
+        right_isolated = [
+            nid for nid in layers[0]
+            if nid not in connected_in_group and node_role_rank(nid) >= 3
+        ]
+        if right_isolated and len(right_isolated) < len(layers[0]):
+            layers[0] = [nid for nid in layers[0] if nid not in right_isolated]
+            layers.append(right_isolated)
 
     def _measure_and_place_module_controls(
         ctrls: List[str],
@@ -537,18 +558,11 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     # Build inter-pipeline DAG to arrange FE (host-copier on left) and BE (dai/alh-copier on right) columns
     pipe_ids = sorted(vm.containers.keys())
     pipe_adj: Dict[int, Set[int]] = defaultdict(set)
-    undirected: Dict[int, Set[int]] = defaultdict(set)
+    same_dir_undirected: Dict[int, Set[int]] = defaultdict(set)
+    all_undirected: Dict[int, Set[int]] = defaultdict(set)
 
-    for e in vm.edges:
-        u_node = vm.nodes.get(e.source_node)
-        v_node = vm.nodes.get(e.sink_node)
-        if u_node and v_node and u_node.pipeline_id is not None and v_node.pipeline_id is not None:
-            up = u_node.pipeline_id
-            vp = v_node.pipeline_id
-            if up != vp and up in vm.containers and vp in vm.containers:
-                pipe_adj[up].add(vp)
-                undirected[up].add(vp)
-                undirected[vp].add(up)
+    def is_cap_pipe(pid: int) -> bool:
+        return "capture" in vm.containers[pid].direction.lower()
 
     def pipe_has_dai(pid: int) -> bool:
         return any(
@@ -559,50 +573,110 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     def pipe_has_host(pid: int) -> bool:
         return any("host-copier" in vm.nodes[nid].class_name for nid in by_pipe.get(pid, []))
 
-    visited_pipes: Set[int] = set()
+    def pipe_role(pid: int) -> int:
+        """0 = Host/FE (always left), 1 = Intermediate (middle), 2 = DAI/ALH BE (always right)."""
+        h = pipe_has_host(pid)
+        d = pipe_has_dai(pid)
+        cname = vm.containers[pid].class_name.lower()
+        if h and (not d or cname.startswith(("host-", "deepbuffer", "compr", "siggen"))):
+            return 0
+        if d and not h:
+            return 2
+        return 1
+
+    for e in vm.edges:
+        u_node = vm.nodes.get(e.source_node)
+        v_node = vm.nodes.get(e.sink_node)
+        if u_node and v_node and u_node.pipeline_id is not None and v_node.pipeline_id is not None:
+            up = u_node.pipeline_id
+            vp = v_node.pipeline_id
+            if up != vp and up in vm.containers and vp in vm.containers:
+                all_undirected[up].add(vp)
+                all_undirected[vp].add(up)
+                # Only connect pipelines of the same direction horizontally so cross-direction
+                # feedback/echo-ref links (e.g. smart_amp IV sense or echoref) do not invert FE/BE columns.
+                if is_cap_pipe(up) == is_cap_pipe(vp):
+                    pipe_adj[up].add(vp)
+                    same_dir_undirected[up].add(vp)
+                    same_dir_undirected[vp].add(up)
+
+    # Group into macro-components (keeping cross-direction linked playback/capture pairs adjacent vertically),
+    # then split each macro-component into same-direction horizontal components (Playback first, Capture second).
+    visited_macro: Set[int] = set()
     components: List[List[int]] = []
     for pid in pipe_ids:
-        if pid in visited_pipes:
+        if pid in visited_macro:
             continue
-        comp: List[int] = []
+        macro: List[int] = []
         dq = deque([pid])
-        visited_pipes.add(pid)
+        visited_macro.add(pid)
         while dq:
             cur = dq.popleft()
-            comp.append(cur)
-            for nb in sorted(undirected[cur]):
-                if nb not in visited_pipes:
-                    visited_pipes.add(nb)
+            macro.append(cur)
+            for nb in sorted(all_undirected[cur]):
+                if nb not in visited_macro:
+                    visited_macro.add(nb)
                     dq.append(nb)
-        components.append(sorted(comp))
 
-    # Compute left-to-right column index per component so Host pipelines are always on the left
-    # and DAI/ALH pipelines are always on the right (for both Playback and Capture).
+        visited_sub: Set[int] = set()
+        sub_comps: List[List[int]] = []
+        for mp in sorted(macro):
+            if mp in visited_sub:
+                continue
+            comp: List[int] = []
+            sdq = deque([mp])
+            visited_sub.add(mp)
+            while sdq:
+                cur = sdq.popleft()
+                comp.append(cur)
+                for nb in sorted(same_dir_undirected[cur]):
+                    if nb not in visited_sub:
+                        visited_sub.add(nb)
+                        sdq.append(nb)
+            sub_comps.append(sorted(comp))
+
+        sub_comps.sort(key=lambda c: (1 if any(is_cap_pipe(p) for p in c) else 0, c[0]))
+        components.extend(sub_comps)
+
+    # Compute left-to-right column index per component so Host pipelines are always on the left (column 0),
+    # intermediate pipelines are in the middle, and DAI/ALH pipelines are on the right.
     pipe_col: Dict[int, int] = {pid: 0 for pid in pipe_ids}
     for comp in components:
-        comp_is_cap = any("capture" in vm.containers[p].direction.lower() for p in comp)
+        comp_is_cap = any(is_cap_pipe(p) for p in comp)
         adj_in_comp: Dict[int, Set[int]] = defaultdict(set)
         in_deg: Dict[int, int] = {p: 0 for p in comp}
         for u in comp:
             for v in pipe_adj[u]:
                 if v in in_deg:
-                    if comp_is_cap:
-                        # Reverse capture inter-pipeline edge so Host (sink) is column 0 (left)
-                        # and DAI/ALH (source) is the rightmost column.
-                        adj_in_comp[v].add(u)
-                        in_deg[u] += 1
-                    else:
-                        adj_in_comp[u].add(v)
-                        in_deg[v] += 1
+                    # Reverse capture inter-pipeline edge so Host (sink) is column 0 (left)
+                    # and DAI/ALH (source) is the rightmost column.
+                    left_p, right_p = (v, u) if comp_is_cap else (u, v)
+                    # Ensure edges always flow from lower/equal role (Host=0 -> Mid=1 -> DAI=2)
+                    # so a Host pipeline is never pushed out of column 0.
+                    r_left = pipe_role(left_p)
+                    r_right = pipe_role(right_p)
+                    if r_left > r_right:
+                        left_p, right_p = right_p, left_p
+                    elif r_left == r_right and left_p in adj_in_comp[right_p]:
+                        continue
+                    if right_p not in adj_in_comp[left_p]:
+                        adj_in_comp[left_p].add(right_p)
+                        in_deg[right_p] += 1
 
         q = deque([p for p in comp if in_deg[p] == 0])
+        visited_in_comp: Set[int] = set()
         while q:
             u = q.popleft()
+            visited_in_comp.add(u)
             for v in sorted(adj_in_comp[u]):
                 pipe_col[v] = max(pipe_col[v], pipe_col[u] + 1)
                 in_deg[v] -= 1
                 if in_deg[v] == 0:
                     q.append(v)
+
+        for p in comp:
+            if p not in visited_in_comp:
+                pipe_col[p] = pipe_role(p)
 
         # Ensure standalone DAI/ALH-only pipelines sit on the right-hand column (column 1)
         if len(comp) == 1 and pipe_has_dai(comp[0]) and not pipe_has_host(comp[0]):
