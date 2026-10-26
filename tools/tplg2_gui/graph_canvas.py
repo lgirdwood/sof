@@ -2194,9 +2194,10 @@ class TopologyGraphCanvas(Gtk.Widget):
             if node.class_category == "TestbenchIO":
                 lx = wx - node.x
                 ly = wy - node.y
-                # Header / Radio button click -> enable this TestbenchIO pipeline chain
-                if 0.0 <= ly <= 26.0:
-                    self.select_testbench_io_radio(nid)
+                ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
+                # Header / Radio button click, footer click, or Ctrl+click anywhere on card -> enable/toggle this TestbenchIO pipeline chain
+                if 0.0 <= ly <= 26.0 or ly > 75.0 or ctrl_held:
+                    self.select_testbench_io_radio(nid, additive=ctrl_held)
                     return
                 # Row 1: I/O Mode Enum Control (File / ALSA PCM / Signal Generator)
                 if 30.0 <= ly <= 51.0 and 10.0 <= lx <= node.width - 10.0:
@@ -3578,20 +3579,59 @@ class TopologyGraphCanvas(Gtk.Widget):
     # Testbench IO Node Radio Selection & File / ALSA PCM Pickers
     # -------------------------------------------------------------------------
 
-    def select_testbench_io_radio(self, active_nid: str) -> None:
-        """Select a TestbenchIO node in the radio group to enable its downstream/upstream pipelines."""
+    def select_testbench_io_radio(self, active_nid: str, additive: bool = False) -> None:
+        """Select a TestbenchIO node to enable its downstream/upstream pipelines.
+
+        When `additive=False`, acts as an exclusive radio selection on that side.
+        When `additive=True` (Ctrl+click), toggles/adds `active_nid` so multiple PCMs
+        can run simultaneously in the testbench.
+        """
         if not self.vm or active_nid not in self.vm.nodes:
             return
         active_node = self.vm.nodes[active_nid]
         active_side = str(active_node.config.get_scalar("side", "left")).lower()
-        active_pids = self._parse_pipe_ids(str(active_node.config.get_scalar("target_pipelines", "")))
 
-        # 1. Enable only active_nid on active_side
-        for nid, n in self.vm.nodes.items():
-            if n.class_category == "TestbenchIO" and str(n.config.get_scalar("side", "left")).lower() == active_side:
+        side_nodes = [
+            (nid, n)
+            for nid, n in self.vm.nodes.items()
+            if n.class_category == "TestbenchIO"
+            and str(n.config.get_scalar("side", "left")).lower() == active_side
+        ]
+        # Order top-to-bottom by vertical position in the Main Graph so waveforms align vertically with PCMs
+        side_nodes.sort(key=lambda item: (item[1].y, item[1].x))
+
+        if not additive:
+            # Exclusive radio selection on active_side
+            for nid, n in side_nodes:
                 n.config.set_scalar("enabled", "true" if nid == active_nid else "false", origin="instance")
+        else:
+            # Ctrl+click multi-selection: toggle active_nid while keeping at least one enabled
+            cur_enabled = str(active_node.config.get_scalar("enabled", "false")).lower() == "true"
+            other_enabled_cnt = sum(
+                1
+                for nid, n in side_nodes
+                if nid != active_nid and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+            )
+            if cur_enabled and other_enabled_cnt > 0:
+                active_node.config.set_scalar("enabled", "false", origin="instance")
+            else:
+                active_node.config.set_scalar("enabled", "true", origin="instance")
 
-        # 2. Synchronize connected TestbenchIO endpoint(s) on the opposite side
+        # Collect ordered, deduplicated pipeline IDs across all enabled TestbenchIO nodes on active_side
+        combined_pids: List[int] = []
+        enabled_titles: List[str] = []
+        for nid, n in side_nodes:
+            if str(n.config.get_scalar("enabled", "false")).lower() == "true":
+                enabled_titles.append(n.title)
+                tp_str = str(n.config.get_scalar("target_pipelines", "")).strip()
+                for token in tp_str.replace("→", " ").replace(",", " ").split():
+                    if token.lstrip("-").isdigit():
+                        pid = int(token)
+                        if pid not in combined_pids:
+                            combined_pids.append(pid)
+        active_pids_set = set(combined_pids)
+
+        # Synchronize connected TestbenchIO endpoint(s) on the opposite side
         opp_side = "right" if active_side == "left" else "left"
         opp_nodes = [
             n for n in self.vm.nodes.values()
@@ -3601,19 +3641,26 @@ class TopologyGraphCanvas(Gtk.Widget):
         for n in opp_nodes:
             parent = self.vm.nodes.get(n.parent_node_id or "")
             parent_pid = parent.pipeline_id if parent else None
-            is_connected = parent_pid in active_pids if parent_pid is not None else bool(
-                self._parse_pipe_ids(str(n.config.get_scalar("target_pipelines", ""))) & active_pids
+            is_connected = parent_pid in active_pids_set if parent_pid is not None else bool(
+                self._parse_pipe_ids(str(n.config.get_scalar("target_pipelines", ""))) & active_pids_set
             )
             n.config.set_scalar("enabled", "true" if is_connected else "false", origin="instance")
 
-        self.select_node(active_nid)
+        self.select_node(active_nid, additive=additive)
+        if additive:
+            for nid, n in side_nodes:
+                if str(n.config.get_scalar("enabled", "false")).lower() == "true":
+                    self.selected_node_ids.add(nid)
+                else:
+                    self.selected_node_ids.discard(nid)
+
         debug_log_action(
-            "CANVAS-TB-RADIO",
-            f"Enabled TestbenchIO {active_node.title} ({active_nid})",
-            f"side={active_side} target_pipelines={sorted(active_pids)}",
+            "CANVAS-TB-MULTI" if additive else "CANVAS-TB-RADIO",
+            f"Enabled TestbenchIO {enabled_titles}",
+            f"clicked={active_nid} side={active_side} additive={additive} target_pipelines={combined_pids}",
         )
         if self.on_testbench_io_changed:
-            self.on_testbench_io_changed(sorted(active_pids))
+            self.on_testbench_io_changed(list(combined_pids))
         self.queue_draw()
 
     @staticmethod

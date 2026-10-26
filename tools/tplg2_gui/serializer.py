@@ -64,19 +64,27 @@ def serialize_config_node(node: ConfigNode, indent: int = 0) -> str:
 
 
 def _extract_active_pipeline_ids(vm: GraphViewModel) -> List[int]:
-    """Return the active testbench pipeline IDs from the enabled TestbenchIO node or containers."""
-    for target_cls in ("testbench-source", "testbench-sink"):
-        for node in vm.nodes.values():
-            if (
-                node.class_category == "TestbenchIO"
-                and node.class_name == target_cls
-                and str(node.config.get_scalar("enabled", "false")).lower() == "true"
-            ):
-                tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
-                if tp_str:
-                    pids = [int(m) for m in re.findall(r"\d+", tp_str)]
-                    if pids:
-                        return pids
+    """Return the ordered union of active testbench pipeline IDs from all enabled TestbenchIO nodes,
+    ordered top-to-bottom by the vertical (y) positions of the PCMs in the Main Graph.
+    """
+    collected: List[int] = []
+    for target_side in ("left", "right"):
+        side_enabled = [
+            node
+            for node in vm.nodes.values()
+            if node.class_category == "TestbenchIO"
+            and str(node.config.get_scalar("side", "left")).lower() == target_side
+            and str(node.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        side_enabled.sort(key=lambda n: (n.y, n.x))
+        for node in side_enabled:
+            tp_str = str(node.config.get_scalar("target_pipelines", "")).strip()
+            for m in re.findall(r"\d+", tp_str):
+                pid = int(m)
+                if pid not in collected:
+                    collected.append(pid)
+        if collected:
+            return collected
 
     pipe_ids = sorted(vm.containers.keys())
     if 1 in pipe_ids and 2 in pipe_ids:

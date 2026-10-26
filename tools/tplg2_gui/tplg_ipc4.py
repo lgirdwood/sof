@@ -444,6 +444,8 @@ class TplgIpc4Plan:
     routes: List[IpcRouteBindOp] = field(default_factory=list)
     steps: List[IpcPipelineStepOp] = field(default_factory=list)
     kcontrols: List[TplgKcontrolDesc] = field(default_factory=list)
+    input_widgets: List[str] = field(default_factory=list)
+    output_widgets: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1378,18 +1380,26 @@ def build_ipc4_plan(
     frame_fmt, valid_bits = _format_name_to_sof_frame(frame_fmt_name)
     period_frames = max(1, fs_in // 1000)
 
-    # Assign 1-based file slots for enabled AIF/DAI file widgets in widget order
+    # Assign 1-based file slots for enabled AIF/DAI file widgets in selected_pipeline_ids order
     in_slot = 1
     out_slot = 1
-    for w in tplg.widgets:
-        if w.pipeline_id not in enabled_set:
-            continue
-        if w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_IN, SND_SOC_TPLG_DAPM_DAI_OUT):
-            w.file_slot_1based = in_slot
-            in_slot += 1
-        elif w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_OUT, SND_SOC_TPLG_DAPM_DAI_IN):
-            w.file_slot_1based = out_slot
-            out_slot += 1
+    ordered_pids: List[int] = []
+    for p in selected_pipeline_ids:
+        ip = int(p)
+        if ip in enabled_set and ip not in ordered_pids:
+            ordered_pids.append(ip)
+    for pid in ordered_pids:
+        for w in tplg.widgets:
+            if w.pipeline_id != pid:
+                continue
+            if w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_IN, SND_SOC_TPLG_DAPM_DAI_OUT):
+                w.file_slot_1based = min(16, in_slot)
+                plan.input_widgets.append(w.name)
+                in_slot += 1
+            elif w.dapm_type in (SND_SOC_TPLG_DAPM_AIF_OUT, SND_SOC_TPLG_DAPM_DAI_IN):
+                w.file_slot_1based = min(16, out_slot)
+                plan.output_widgets.append(w.name)
+                out_slot += 1
 
     # Track per-pipeline mem_usage and direction
     pipe_mem: Dict[int, int] = {pid: 0 for pid in enabled_set}

@@ -38,6 +38,7 @@ from .model import (
 from .parser import Topology2Workspace
 from .right_inspector import RightAttributeInspector
 from .serializer import (
+    _extract_active_pipeline_ids,
     generate_compilable_conf,
     get_editable_conf_text_for_vm,
     serialize_graph_for_save,
@@ -781,9 +782,22 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         wf_pane_box.append(wf_toolbar)
 
+        wf_body_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        wf_body_box.set_hexpand(True)
+        wf_body_box.set_vexpand(True)
+
         self.waveform_widget = WaveformSnapshotWidget(on_zoom_changed=self._on_waveform_zoom_changed)
         self.waveform_widget.set_size_request(-1, 185)
-        wf_pane_box.append(self.waveform_widget)
+        wf_body_box.append(self.waveform_widget)
+
+        self.wf_vscrollbar = Gtk.Scrollbar.new(Gtk.Orientation.VERTICAL, self.waveform_widget.v_adj)
+        self.wf_vscrollbar.set_vexpand(True)
+        self.wf_vscrollbar.set_tooltip_text(
+            "Scroll vertically through stacked PCM stream waveforms (or use Mouse Wheel)"
+        )
+        wf_body_box.append(self.wf_vscrollbar)
+
+        wf_pane_box.append(wf_body_box)
 
         wf_frame = Gtk.Frame()
         wf_frame.add_css_class("sub-panel-frame")
@@ -1885,6 +1899,69 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.canvas.delete_selected()
         self._update_active_tab_header()
 
+    def _get_ordered_enabled_tb_io_nodes(self) -> Tuple[List[GraphNode], List[GraphNode]]:
+        """Return (enabled_sources, enabled_sinks) ordered by their connected copier's position
+        in _extract_active_pipeline_ids(vm) so Stream 1..N match testbench file slots 1..N.
+        """
+        vm = self.canvas.vm
+        if not vm:
+            return ([], [])
+        active_pids = _extract_active_pipeline_ids(vm)
+        pid_rank = {pid: idx for idx, pid in enumerate(active_pids)}
+
+        def _node_sort_key(idx_and_node: Tuple[int, GraphNode]) -> Tuple[int, float, float, int]:
+            orig_idx, n = idx_and_node
+            pnode = vm.nodes.get(n.parent_node_id or "") if n.parent_node_id else None
+            if pnode and pnode.pipeline_id is not None and pnode.pipeline_id in pid_rank:
+                return (pid_rank[pnode.pipeline_id], n.y, n.x, orig_idx)
+            t_str = str(n.config.get_scalar("target_pipelines", ""))
+            for tok in t_str.replace("→", ",").replace("->", ",").split(","):
+                tok = tok.strip()
+                if tok.isdigit() and int(tok) in pid_rank:
+                    return (pid_rank[int(tok)], n.y, n.x, orig_idx)
+            return (999999, n.y, n.x, orig_idx)
+
+        raw_sources = [
+            (i, n)
+            for i, n in enumerate(vm.nodes.values())
+            if n.class_category == "TestbenchIO"
+            and n.class_name == "testbench-source"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        raw_sinks = [
+            (i, n)
+            for i, n in enumerate(vm.nodes.values())
+            if n.class_category == "TestbenchIO"
+            and n.class_name == "testbench-sink"
+            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+        ]
+        raw_sources.sort(key=_node_sort_key)
+        raw_sinks.sort(key=_node_sort_key)
+        return ([n for _, n in raw_sources], [n for _, n in raw_sinks])
+
+    @staticmethod
+    def _describe_tb_source_signal(snode: GraphNode) -> Tuple[str, str, str]:
+        """Return (sig_kind, wav_src, sig_label) for a testbench-source node."""
+        sig_kind = "sine_997"
+        wav_src = ""
+        sig_label = "Sine 997 Hz"
+        io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
+        if io_mode == "sig_gen":
+            sig_kind = str(snode.config.get_scalar("signal_type", "sine_997")).strip().lower() or "sine_997"
+            sig_label = TopologyGraphCanvas.get_signal_type_short_label(sig_kind)
+        elif io_mode == "alsa_pcm":
+            apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
+            sig_label = f"ALSA {apcm}"
+        else:
+            fpath = str(snode.config.get_scalar("file_path", "")).strip()
+            if fpath and os.path.isfile(fpath):
+                sig_kind = "wav_file"
+                wav_src = fpath
+                sig_label = os.path.basename(fpath)
+            else:
+                sig_label = os.path.basename(fpath) if fpath else "Audio File"
+        return (sig_kind, wav_src, sig_label)
+
     def _extract_graph_stream_params(self) -> Tuple[str, str, str, int, int, int]:
         """Extract (sig_kind, wav_src, sig_label, rate, channels, bits) from the active Main Graph panel."""
         sig_kind = "sine_997"
@@ -1898,29 +1975,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not vm:
             return (sig_kind, wav_src, sig_label, rate, channels, bits)
 
-        enabled_sources = [
-            n for n in vm.nodes.values()
-            if n.class_category == "TestbenchIO"
-            and n.class_name == "testbench-source"
-            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
-        ]
+        enabled_sources, _ = self._get_ordered_enabled_tb_io_nodes()
         snode = enabled_sources[0] if enabled_sources else None
         if snode is not None:
-            io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
-            if io_mode == "sig_gen":
-                sig_kind = str(snode.config.get_scalar("signal_type", "sine_997")).strip().lower() or "sine_997"
-                sig_label = TopologyGraphCanvas.get_signal_type_short_label(sig_kind)
-            elif io_mode == "alsa_pcm":
-                apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
-                sig_label = f"ALSA {apcm}"
-            else:
-                fpath = str(snode.config.get_scalar("file_path", "")).strip()
-                if fpath and os.path.isfile(fpath):
-                    sig_kind = "wav_file"
-                    wav_src = fpath
-                    sig_label = os.path.basename(fpath)
-                else:
-                    sig_label = os.path.basename(fpath) if fpath else "Audio File"
+            sig_kind, wav_src, sig_label = self._describe_tb_source_signal(snode)
 
         # Inspect connected host/dai copier or first active pipeline module for audio format (rate, channels, bit depth)
         fmt_candidates: List[GraphNode] = []
@@ -1963,30 +2021,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not vm:
             return (rate_out, ch_out, extra_in_wavs, num_outputs)
 
-        # Collect any additional testbench-source nodes with valid WAV files
-        source_nodes = [
-            n for n in vm.nodes.values()
-            if n.class_category == "TestbenchIO" and n.class_name == "testbench-source"
-        ]
-        enabled_sources = [
-            n for n in source_nodes
-            if str(n.config.get_scalar("enabled", "false")).lower() == "true"
-        ]
-        primary_src = enabled_sources[0] if enabled_sources else None
-        for sn in source_nodes:
-            if sn is primary_src:
-                continue
-            if str(sn.config.get_scalar("enabled", "false")).lower() == "true":
+        # Collect any additional enabled testbench-source nodes in pipeline slot order
+        enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes()
+        for sn in enabled_sources[1:]:
+            io_mode = str(sn.config.get_scalar("io_type", "sig_gen")).strip().lower()
+            if io_mode == "sig_gen":
+                stype = str(sn.config.get_scalar("signal_type", "sine_997")).strip().lower() or "sine_997"
+                extra_in_wavs.append(f"sig_gen:{stype}")
+            else:
                 fp = str(sn.config.get_scalar("file_path", "")).strip()
                 if fp and os.path.isfile(fp):
                     extra_in_wavs.append(fp)
+                else:
+                    extra_in_wavs.append("sig_gen:sine_997")
 
-        enabled_sinks = [
-            n for n in vm.nodes.values()
-            if n.class_category == "TestbenchIO"
-            and n.class_name == "testbench-sink"
-            and str(n.config.get_scalar("enabled", "false")).lower() == "true"
-        ]
         if len(enabled_sinks) > 1:
             num_outputs = len(enabled_sinks)
 
@@ -2018,36 +2066,56 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         in_lbl = "INPUT PCM: Source (Host/DAI)"
         out_lbl = "OUTPUT PCM: Sink (DAI/Host)"
+        multi_in_labels: List[str] = []
+        multi_out_labels: List[str] = []
+        multi_sig_labels: List[str] = []
+
         vm = self.canvas.vm
         if vm:
-            enabled_sources = [
-                n for n in vm.nodes.values()
-                if n.class_category == "TestbenchIO"
-                and n.class_name == "testbench-source"
-                and str(n.config.get_scalar("enabled", "false")).lower() == "true"
-            ]
-            enabled_sinks = [
-                n for n in vm.nodes.values()
-                if n.class_category == "TestbenchIO"
-                and n.class_name == "testbench-sink"
-                and str(n.config.get_scalar("enabled", "false")).lower() == "true"
-            ]
-            if enabled_sources:
-                snode = enabled_sources[0]
-                target_p = snode.config.get_scalar("target_pipelines", "")
+            enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes()
+            is_multi = len(enabled_sources) > 1 or len(enabled_sinks) > 1
+
+            for idx, snode in enumerate(enabled_sources):
+                target_p = str(snode.config.get_scalar("target_pipelines", "")).strip()
                 p_badge = f" (Pipes: {target_p})" if target_p else ""
-                io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
-                if io_mode == "sig_gen":
-                    stype = str(snode.config.get_scalar("signal_type", "sine_997")).strip().lower()
-                    sig_label = TopologyGraphCanvas.get_signal_type_short_label(stype)
-                    in_lbl = f"INPUT PCM: {snode.title} [SigGen: {sig_label}]{p_badge}"
-                elif io_mode == "alsa_pcm":
-                    apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
-                    in_lbl = f"INPUT PCM: {snode.title} [ALSA: {apcm}]{p_badge}"
+                _sk, _ws, s_lbl = self._describe_tb_source_signal(snode)
+                multi_sig_labels.append(s_lbl)
+                if is_multi:
+                    multi_in_labels.append(
+                        f"S{idx + 1} IN: {snode.title}{f' ({target_p})' if target_p else ''}"
+                    )
                 else:
-                    fpath = str(snode.config.get_scalar("file_path", "")).strip()
-                    fname = os.path.basename(fpath) if fpath else "audio.wav"
-                    in_lbl = f"INPUT PCM: {snode.title} [File: {fname}]{p_badge}"
+                    io_mode = str(snode.config.get_scalar("io_type", "sig_gen")).strip().lower()
+                    if io_mode == "sig_gen":
+                        multi_in_labels.append(f"INPUT PCM: {snode.title} [SigGen: {s_lbl}]{p_badge}")
+                    elif io_mode == "alsa_pcm":
+                        apcm = str(snode.config.get_scalar("alsa_pcm", "default")).strip()
+                        multi_in_labels.append(f"INPUT PCM: {snode.title} [ALSA: {apcm}]{p_badge}")
+                    else:
+                        fpath = str(snode.config.get_scalar("file_path", "")).strip()
+                        fname = os.path.basename(fpath) if fpath else "audio.wav"
+                        multi_in_labels.append(f"INPUT PCM: {snode.title} [File: {fname}]{p_badge}")
+
+            for idx, knode in enumerate(enabled_sinks):
+                target_p = str(knode.config.get_scalar("target_pipelines", "")).strip()
+                if is_multi:
+                    multi_out_labels.append(
+                        f"S{idx + 1} OUT: {knode.title}{f' ({target_p})' if target_p else ''}"
+                    )
+                else:
+                    multi_out_labels.append(f"OUTPUT PCM: {knode.title} ({knode.subtitle})")
+
+            if len(enabled_sources) > 1:
+                src_titles = " + ".join(n.title for n in enabled_sources)
+                pipes_list = [
+                    str(n.config.get_scalar("target_pipelines", "")).strip()
+                    for n in enabled_sources
+                    if str(n.config.get_scalar("target_pipelines", "")).strip()
+                ]
+                p_badge = f" (Pipes: {', '.join(pipes_list)})" if pipes_list else ""
+                in_lbl = f"INPUT PCM ({len(enabled_sources)}x): {src_titles}{p_badge}"
+            elif multi_in_labels:
+                in_lbl = multi_in_labels[0]
             else:
                 host_in = [
                     n for n in vm.nodes.values()
@@ -2060,9 +2128,12 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 pnode = vm.nodes[self.canvas.active_probe_node_id]
                 cid = self.canvas.live_node_telemetry.get(pnode.id, {}).get("comp_id", 0)
                 out_lbl = f"PROBE TAP: {pnode.title} (comp_id={cid})"
-            elif enabled_sinks:
-                knode = enabled_sinks[0]
-                out_lbl = f"OUTPUT PCM: {knode.title} ({knode.subtitle})"
+                multi_out_labels = [out_lbl]
+            elif len(enabled_sinks) > 1:
+                snk_titles = " + ".join(n.title for n in enabled_sinks)
+                out_lbl = f"OUTPUT PCM ({len(enabled_sinks)}x): {snk_titles}"
+            elif multi_out_labels:
+                out_lbl = multi_out_labels[0]
             else:
                 dai_out = [
                     n for n in vm.nodes.values()
@@ -2078,6 +2149,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             rate=rate,
             channels=channels,
             bits=bits,
+            multi_in_labels=multi_in_labels or [in_lbl],
+            multi_out_labels=multi_out_labels or [out_lbl],
+            multi_signal_labels=multi_sig_labels or [sig_label],
         )
 
     def _on_waveform_zoom_changed(self) -> None:
@@ -2415,6 +2489,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self._sync_selected_pipelines_to_testbench(force_recreate=True)
             return False
 
+        # Supersede any pending background pipeline sync worker before running testbench
+        self._pipeline_sync_seq += 1
+
         # Resolve testbench signal, format, and pipeline IDs from the active Main Graph panel
         sig_kind, wav_src, _sig_lbl, rate, channels, bits = self._extract_graph_stream_params()
         rate_out, ch_out, extra_in_wavs, num_outputs = self._extract_graph_io_config()
@@ -2491,13 +2568,21 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             tb_res.out_samples,
             tb_res.summary_text,
             is_realtime=live_active,
+            multi_in_samples=tb_res.multi_in_samples,
+            multi_out_samples=tb_res.multi_out_samples,
         )
+        n_streams = max(1, len(tb_res.multi_in_samples), len(tb_res.multi_out_samples))
+        has_any_out = bool(tb_res.out_samples or any(len(s) > 0 for s in tb_res.multi_out_samples))
         if live_active:
-            self.wf_status_lbl.set_text("Waveforms [● LIVE D0]")
+            self.wf_status_lbl.set_text(
+                f"Waveforms [● LIVE D0 — {n_streams} Streams]" if n_streams > 1 else "Waveforms [● LIVE D0]"
+            )
             self._start_realtime_waveform_timer()
         else:
             self.wf_status_lbl.set_text(
-                "Waveforms [SNAPSHOT]" if tb_res.out_samples else "Waveforms [FAILED]"
+                (f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]")
+                if has_any_out
+                else "Waveforms [FAILED]"
             )
 
         if tb_res.telemetry:
@@ -2618,11 +2703,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 platform_preset=target_plat,
                 force_recreate=force_recreate,
             )
-            telem = (
-                self.tb_runner.live_client.collect_full_telemetry()
-                if (ok and self.tb_runner.live_client)
-                else None
-            )
+            if seq != self._pipeline_sync_seq:
+                return
+            telem = None
+            if ok and self.tb_runner.live_client:
+                with self.tb_runner._ipc_lock:
+                    if seq == self._pipeline_sync_seq and self.tb_runner.live_client:
+                        telem = self.tb_runner.live_client.collect_full_telemetry()
 
             def apply_on_main() -> bool:
                 if seq != self._pipeline_sync_seq:

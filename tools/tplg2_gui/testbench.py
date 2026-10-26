@@ -396,6 +396,9 @@ class TestbenchRunResult:
     out_wav_path: str
     in_samples: List[float] = field(default_factory=list)
     out_samples: List[float] = field(default_factory=list)
+    multi_in_samples: List[List[float]] = field(default_factory=list)
+    multi_out_samples: List[List[float]] = field(default_factory=list)
+    multi_out_wav_paths: List[str] = field(default_factory=list)
     in_peak_db: float = -120.0
     out_peak_db: float = -120.0
     in_rms_db: float = -120.0
@@ -417,6 +420,7 @@ class TestbenchRemoteClient:
         self.port = port
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
+        self._rpc_lock = threading.RLock()
         self.req_id: int = 1
         self.protocol_log: List[str] = []
         self.cached_modules: Dict[int, str] = dict(WELL_KNOWN_IPC4_MODULES)
@@ -430,24 +434,26 @@ class TestbenchRemoteClient:
         debug_log_line("SOFR", msg)
 
     def connect(self) -> bool:
-        self.close()
-        try:
-            s = socket.create_connection((self.host, self.port), timeout=self.timeout)
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(self.timeout)
-            self.sock = s
-            return True
-        except Exception:
-            self.sock = None
-            return False
+        with self._rpc_lock:
+            self.close()
+            try:
+                s = socket.create_connection((self.host, self.port), timeout=self.timeout)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(self.timeout)
+                self.sock = s
+                return True
+            except Exception:
+                self.sock = None
+                return False
 
     def close(self) -> None:
-        if self.sock is not None:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
-            self.sock = None
+        with self._rpc_lock:
+            if self.sock is not None:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
 
     def _recv_exact(self, n: int) -> bytes:
         if self.sock is None:
@@ -461,31 +467,32 @@ class TestbenchRemoteClient:
         return bytes(buf)
 
     def rpc(self, opcode: int, payload: bytes = b"") -> Tuple[int, bytes]:
-        if self.sock is None and not self.connect():
-            return (-107, b"")
-        rid = self.req_id
-        self.req_id += 1
-        hdr = struct.pack(
-            "<IHHIIi",
-            SOF_NET_MAGIC,
-            SOF_NET_VERSION,
-            opcode,
-            rid,
-            len(payload),
-            0,
-        )
-        try:
-            assert self.sock is not None
-            self.sock.sendall(hdr + payload)
-            rhdr = self._recv_exact(20)
-            magic, ver, rop, rrid, plen, status = struct.unpack("<IHHIIi", rhdr)
-            if magic != SOF_NET_MAGIC or ver != SOF_NET_VERSION:
-                raise ConnectionError(f"Invalid SOFR header magic=0x{magic:08x} ver={ver}")
-            rdata = self._recv_exact(plen) if plen > 0 else b""
-            return (status, rdata)
-        except Exception:
-            self.close()
-            return (-104, b"")
+        with self._rpc_lock:
+            if self.sock is None and not self.connect():
+                return (-107, b"")
+            rid = self.req_id
+            self.req_id += 1
+            hdr = struct.pack(
+                "<IHHIIi",
+                SOF_NET_MAGIC,
+                SOF_NET_VERSION,
+                opcode,
+                rid,
+                len(payload),
+                0,
+            )
+            try:
+                assert self.sock is not None
+                self.sock.sendall(hdr + payload)
+                rhdr = self._recv_exact(20)
+                magic, ver, rop, rrid, plen, status = struct.unpack("<IHHIIi", rhdr)
+                if magic != SOF_NET_MAGIC or ver != SOF_NET_VERSION:
+                    raise ConnectionError(f"Invalid SOFR header magic=0x{magic:08x} ver={ver}")
+                rdata = self._recv_exact(plen) if plen > 0 else b""
+                return (status, rdata)
+            except Exception:
+                self.close()
+                return (-104, b"")
 
     def ping(self) -> bool:
         st, data = self.rpc(SOF_NET_OP_PING)
@@ -1642,10 +1649,11 @@ class TestbenchRunner:
         bits: int,
         duration_sec: float = 0.15,
         wav_source: str = "",
+        stem: str = "tb_input",
     ) -> Tuple[str, str, List[float]]:
         """Create input .raw and .wav files and return (raw_path, wav_path, normalized_mono_samples)."""
-        in_raw = os.path.join(self.work_dir, "tb_input.raw")
-        in_wav = os.path.join(self.work_dir, "tb_input.wav")
+        in_raw = os.path.join(self.work_dir, f"{stem}.raw")
+        in_wav = os.path.join(self.work_dir, f"{stem}.wav")
         n_frames = max(256, int(rate * duration_sec))
 
         frames_ch0: List[float] = []
@@ -1824,6 +1832,20 @@ class TestbenchRunner:
                     log_callback(f"[ERROR] Failed to start interactive sof-testbench4: {exc}")
                 return False
 
+            # Continuously drain proc.stdout in a daemon thread so the 64 KB OS pipe buffer
+            # never fills up and blocks sof-testbench4 on trace write() calls during multi-PCM IPC syncs.
+            def _drain_proc_stdout(p: subprocess.Popen) -> None:
+                stream = p.stdout
+                if stream is None:
+                    return
+                try:
+                    for _line in stream:
+                        pass
+                except Exception:
+                    pass
+
+            threading.Thread(target=_drain_proc_stdout, args=(proc,), daemon=True).start()
+
             client = TestbenchRemoteClient("127.0.0.1", port, timeout=3.0)
             connected = False
             deadline = time.monotonic() + 4.0
@@ -1879,9 +1901,9 @@ class TestbenchRunner:
             self.active_pipeline_ids = []
             return logs
 
-        client.exec_shell("pause")
+        st_p, _ = client.exec_shell("pause")
         all_pipes = list(plan.playback_pipelines) + list(plan.capture_pipelines)
-        if not all_pipes:
+        if not all_pipes or st_p < 0:
             self.active_ipc_plan = None
             self.active_pipeline_ids = []
             return logs
@@ -1891,6 +1913,7 @@ class TestbenchRunner:
         if log_callback:
             log_callback(header)
 
+        transport_err = False
         # 1. Transition active pipelines to PAUSED
         for pop in all_pipes:
             pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_PAUSED)
@@ -1901,44 +1924,58 @@ class TestbenchRunner:
             logs.append(line)
             if log_callback:
                 log_callback(line)
+            if st < 0:
+                transport_err = True
+                break
 
         # 2. Unbind cross-pipeline modules (SOF_IPC4_MOD_UNBIND)
-        for rop in plan.routes:
-            if rop.is_inter_pipeline:
-                desc = (
-                    f"MOD_UNBIND({rop.src_name} [0x{rop.src_module_id:x}:{rop.src_instance_id} q{rop.src_queue}] "
-                    f"-> {rop.sink_name} [0x{rop.dst_module_id:x}:{rop.dst_instance_id} q{rop.dst_queue}])"
-                )
-                st, rdict, _ = client.send_ipc4_tx(
-                    rop.unbind_primary, rop.unbind_extension, description=desc
-                )
+        if not transport_err:
+            for rop in plan.routes:
+                if rop.is_inter_pipeline:
+                    desc = (
+                        f"MOD_UNBIND({rop.src_name} [0x{rop.src_module_id:x}:{rop.src_instance_id} q{rop.src_queue}] "
+                        f"-> {rop.sink_name} [0x{rop.dst_module_id:x}:{rop.dst_instance_id} q{rop.dst_queue}])"
+                    )
+                    st, rdict, _ = client.send_ipc4_tx(
+                        rop.unbind_primary, rop.unbind_extension, description=desc
+                    )
+                    ipc_st = rdict.get("ipc_status", st)
+                    line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+                    logs.append(line)
+                    if log_callback:
+                        log_callback(line)
+                    if st < 0:
+                        transport_err = True
+                        break
+
+        # 3. Transition active pipelines to RESET
+        if not transport_err:
+            for pop in all_pipes:
+                pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RESET)
+                desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RESET)"
+                st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                 ipc_st = rdict.get("ipc_status", st)
                 line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
                 logs.append(line)
                 if log_callback:
                     log_callback(line)
-
-        # 3. Transition active pipelines to RESET
-        for pop in all_pipes:
-            pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RESET)
-            desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RESET)"
-            st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
-            ipc_st = rdict.get("ipc_status", st)
-            line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
-            logs.append(line)
-            if log_callback:
-                log_callback(line)
+                if st < 0:
+                    transport_err = True
+                    break
 
         # 4. Delete pipelines (SOF_IPC4_GLB_DELETE_PIPELINE)
-        for pop in all_pipes:
-            pri, ext = encode_delete_pipeline(pop.instance_id)
-            desc = f"DELETE_PIPELINE(ppl={pop.instance_id} '{pop.name}')"
-            st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
-            ipc_st = rdict.get("ipc_status", st)
-            line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
-            logs.append(line)
-            if log_callback:
-                log_callback(line)
+        if not transport_err:
+            for pop in all_pipes:
+                pri, ext = encode_delete_pipeline(pop.instance_id)
+                desc = f"DELETE_PIPELINE(ppl={pop.instance_id} '{pop.name}')"
+                st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
+                ipc_st = rdict.get("ipc_status", st)
+                line = f"  [IPC4-TX] {desc} -> status={ipc_st}"
+                logs.append(line)
+                if log_callback:
+                    log_callback(line)
+                if st < 0:
+                    break
 
         self.active_ipc_plan = None
         self.active_pipeline_ids = []
@@ -2002,29 +2039,10 @@ class TestbenchRunner:
             if self.active_ipc_plan is not None:
                 logs.extend(self._destroy_active_pipelines_unlocked(log_callback=log_callback))
 
-            # 2. Ensure input/output raw file paths exist and configure io-cfg on server
-            if not in_raw_paths:
-                default_in = os.path.join(self.work_dir, "tb_input.raw")
-                if not os.path.isfile(default_in):
-                    self.generate_input_signal("sine_997", rate, channels, bits, duration_sec=0.15)
-                in_raw_paths = [default_in]
-            if not out_raw_paths:
-                default_out = os.path.join(self.work_dir, "tb_output.raw")
-                out_raw_paths = [default_out]
-
             pipe_arg = ",".join(str(p) for p in norm_pipes)
             fmt_arg = f"S{bits}_LE"
-            in_arg = ",".join(in_raw_paths)
-            out_arg = ",".join(out_raw_paths)
 
-            client.exec_shell("pause")
-            io_cmd = (
-                f"io-cfg -i {in_arg} -o {out_arg} -p {pipe_arg} "
-                f"-r {rate} -R {eff_rate_out} -c {channels} -n {eff_ch_out} -b {fmt_arg}"
-            )
-            client.exec_shell(io_cmd)
-
-            # 3. Parse compiled .tplg and build the IPC4 creation & binding plan for norm_pipes
+            # 2. Parse compiled .tplg and build the IPC4 creation & binding plan for norm_pipes
             try:
                 parsed_tplg = TplgIpc4Parser.parse_file(tplg_path)
                 plan = build_ipc4_plan(
@@ -2043,9 +2061,44 @@ class TestbenchRunner:
                     log_callback(err_line)
                 return (False, logs)
 
+            # 3. Ensure enough input/output raw file slots exist for all simultaneous PCMs in plan (up to 16)
+            req_inputs = max(1, min(16, len(plan.input_widgets)))
+            req_outputs = max(1, min(16, len(plan.output_widgets)))
+
+            eff_in_paths = list(in_raw_paths) if in_raw_paths else []
+            if not eff_in_paths:
+                default_in = os.path.join(self.work_dir, "tb_input.raw")
+                if not os.path.isfile(default_in):
+                    self.generate_input_signal("sine_997", rate, channels, bits, duration_sec=0.15)
+                eff_in_paths.append(default_in)
+            while len(eff_in_paths) < req_inputs:
+                idx = len(eff_in_paths) + 1
+                ex_in = os.path.join(self.work_dir, f"tb_input_{idx}.raw")
+                if not os.path.isfile(ex_in) and os.path.isfile(eff_in_paths[0]):
+                    shutil.copyfile(eff_in_paths[0], ex_in)
+                eff_in_paths.append(ex_in)
+
+            eff_out_paths = list(out_raw_paths) if out_raw_paths else []
+            if not eff_out_paths:
+                eff_out_paths.append(os.path.join(self.work_dir, "tb_output.raw"))
+            while len(eff_out_paths) < req_outputs:
+                idx = len(eff_out_paths) + 1
+                eff_out_paths.append(os.path.join(self.work_dir, f"tb_output_{idx}.raw"))
+
+            in_arg = ",".join(eff_in_paths[:16])
+            out_arg = ",".join(eff_out_paths[:16])
+
+            client.exec_shell("pause")
+            io_cmd = (
+                f"io-cfg -i {in_arg} -o {out_arg} -p {pipe_arg} "
+                f"-r {rate} -R {eff_rate_out} -c {channels} -n {eff_ch_out} -b {fmt_arg}"
+            )
+            client.exec_shell(io_cmd)
+
             create_hdr = (
                 f"[IPC4] Creating selected pipelines {norm_pipes} from {os.path.basename(tplg_path)} "
-                f"({len(plan.pipelines_by_id)} pipelines, {len(plan.widgets)} modules, {len(plan.routes)} bindings)…"
+                f"({len(plan.pipelines_by_id)} pipelines, {len(plan.widgets)} modules, {len(plan.routes)} bindings, "
+                f"inputs={len(plan.input_widgets)}, outputs={len(plan.output_widgets)})…"
             )
             logs.append(create_hdr)
             if log_callback:
@@ -2277,12 +2330,25 @@ class TestbenchRunner:
             wav_source=wav_source,
         )
 
-        # Support multiple comma-separated input raw files (-i in1,in2,...) up to 4
+        # Support multiple comma-separated input raw files (-i in1,in2,...) up to 16
+        target_in_frames = max(256, int(rate * duration_sec))
         in_raw_list = [in_raw]
+        multi_in_samples: List[List[float]] = [list(in_norm)]
         if extra_in_wavs:
-            for idx, ex_wav in enumerate(extra_in_wavs[:3], start=2):
+            for idx, ex_wav in enumerate(extra_in_wavs[:15], start=2):
                 ex_raw = os.path.join(self.work_dir, f"tb_input_{idx}.raw")
-                if ex_wav and os.path.isfile(ex_wav) and shutil.which("sox"):
+                ex_norm: List[float] = []
+                if ex_wav and ex_wav.startswith("sig_gen:"):
+                    ex_sig = ex_wav.split(":", 1)[1].strip() or signal_kind
+                    ex_raw, _ex_w, ex_norm = self.generate_input_signal(
+                        signal_kind=ex_sig,
+                        rate=rate,
+                        channels=channels,
+                        bits=bits,
+                        duration_sec=duration_sec,
+                        stem=f"tb_input_{idx}",
+                    )
+                elif ex_wav and os.path.isfile(ex_wav) and shutil.which("sox"):
                     subprocess.run(
                         [
                             "sox",
@@ -2304,21 +2370,27 @@ class TestbenchRunner:
                         check=False,
                         capture_output=True,
                     )
+                    if os.path.isfile(ex_raw) and os.path.getsize(ex_raw) > 0:
+                        ex_norm = self._read_raw_head_normalized(ex_raw, channels, bits, target_in_frames)
                 else:
                     shutil.copyfile(in_raw, ex_raw)
+                    ex_norm = list(in_norm)
                 in_raw_list.append(ex_raw)
+                multi_in_samples.append(ex_norm if ex_norm else list(in_norm))
 
-        # Support multiple comma-separated output raw files (-o out1,out2,...) up to 4
+        # Support multiple comma-separated output raw files (-o out1,out2,...) up to 16
         out_raw = os.path.join(self.work_dir, "tb_output.raw")
         out_wav = os.path.join(self.work_dir, "tb_output.wav")
         out_raw_list = [out_raw]
-        for idx in range(2, min(4, max(1, num_outputs)) + 1):
+        for idx in range(2, min(16, max(1, num_outputs)) + 1):
             out_raw_list.append(os.path.join(self.work_dir, f"tb_output_{idx}.raw"))
-        for opath in out_raw_list:
-            if os.path.exists(opath):
-                os.remove(opath)
+        for idx in range(1, 17):
+            cand_out = os.path.join(self.work_dir, "tb_output.raw" if idx == 1 else f"tb_output_{idx}.raw")
+            if os.path.exists(cand_out):
+                os.remove(cand_out)
 
         self.last_in_samples = list(in_norm)
+        self.last_multi_in_samples = list(multi_in_samples)
         self.last_out_raw_path = out_raw
         self.last_rate = rate
         self.last_rate_out = eff_rate_out
@@ -2399,11 +2471,15 @@ class TestbenchRunner:
                     desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
                     st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                     ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                    if st < 0:
+                        break
                 for pop in plan.playback_pipelines:
                     pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RUNNING)
                     desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RUNNING)"
                     st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                     ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                    if st < 0:
+                        break
 
                 # Capture pipelines transition in reverse order (sink to source) matching utils_ipc4.c
                 for pop in reversed(plan.capture_pipelines):
@@ -2411,11 +2487,15 @@ class TestbenchRunner:
                     desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
                     st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                     ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                    if st < 0:
+                        break
                 for pop in reversed(plan.capture_pipelines):
                     pri, ext = encode_set_pipeline_state(pop.instance_id, SOF_IPC4_PIPELINE_STATE_RUNNING)
                     desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', RUNNING)"
                     st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                     ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                    if st < 0:
+                        break
 
                 # Step DSP scheduler on IPC-created pipelines until input EOF
                 _st_run, run_out = client.exec_shell("run-ipc", timeout_ms=8000)
@@ -2429,17 +2509,44 @@ class TestbenchRunner:
                     desc = f"SET_PIPELINE_STATE(ppl={pop.instance_id} '{pop.name}', PAUSED)"
                     st, rdict, _ = client.send_ipc4_tx(pri, ext, description=desc)
                     ipc_logs.append(f"  [IPC4-TX] {desc} -> status={rdict.get('ipc_status', st)}")
+                    if st < 0:
+                        break
 
-            out_norm: List[float] = []
-            if os.path.isfile(out_raw) and os.path.getsize(out_raw) > 0:
-                out_norm = self._read_raw_head_normalized(out_raw, eff_ch_out, bits, target_frames)
+            num_in_slots = max(1, min(16, len(plan.input_widgets)))
+            while len(multi_in_samples) < num_in_slots:
+                idx = len(multi_in_samples) + 1
+                cand_in = os.path.join(self.work_dir, f"tb_input_{idx}.raw")
+                if os.path.isfile(cand_in) and os.path.getsize(cand_in) > 0:
+                    multi_in_samples.append(self._read_raw_head_normalized(cand_in, channels, bits, target_in_frames))
+                else:
+                    multi_in_samples.append(list(in_norm))
+            self.last_multi_in_samples = list(multi_in_samples)
+
+            num_out_slots = max(1, min(16, max(num_outputs, len(plan.output_widgets))))
+            multi_out_samples: List[List[float]] = []
+            multi_out_wav_paths: List[str] = []
+            for idx in range(1, num_out_slots + 1):
+                cand_out = os.path.join(self.work_dir, "tb_output.raw" if idx == 1 else f"tb_output_{idx}.raw")
+                cand_wav = os.path.join(self.work_dir, "tb_output.wav" if idx == 1 else f"tb_output_{idx}.wav")
+                slot_norm: List[float] = []
+                if os.path.isfile(cand_out) and os.path.getsize(cand_out) > 0:
+                    slot_norm = self._read_raw_head_normalized(cand_out, eff_ch_out, bits, target_frames)
+                    if slot_norm:
+                        self._write_wav_from_normalized(cand_wav, slot_norm, eff_rate_out)
+                        multi_out_wav_paths.append(cand_wav)
+                multi_out_samples.append(slot_norm)
+
+            out_norm = multi_out_samples[0] if multi_out_samples else []
+            if not out_norm:
+                for cand_s in multi_out_samples[1:]:
+                    if cand_s:
+                        out_norm = cand_s
+                        break
 
             if on_live_waveform is not None and out_norm:
                 on_live_waveform(in_norm[: len(out_norm)], out_norm, len(out_norm))
 
-            ok = bool(len(out_norm) > 0 or (telemetry and telemetry.total_ll_ticks > 0))
-            if ok and out_norm:
-                self._write_wav_from_normalized(out_wav, out_norm, eff_rate_out)
+            ok = bool(any(len(s) > 0 for s in multi_out_samples) or (telemetry and telemetry.total_ll_ticks > 0))
 
             in_peak, in_rms = self._compute_metrics(in_norm)
             out_peak, out_rms = self._compute_metrics(out_norm)
@@ -2453,10 +2560,19 @@ class TestbenchRunner:
                     f"DAPM={telemetry.dapm_powered_nodes}/{telemetry.dapm_total_nodes}"
                 )
 
+            if len(multi_out_samples) > 1:
+                out_parts = []
+                for idx, s_out in enumerate(multi_out_samples, start=1):
+                    pk_i, rms_i = self._compute_metrics(s_out)
+                    out_parts.append(f"Out{idx}: {len(s_out)}f ({pk_i:.1f}/{rms_i:.1f} dBFS)")
+                out_summary_str = " | ".join(out_parts)
+            else:
+                out_summary_str = f"Out: {len(out_norm)}f (Peak {out_peak:.1f}, RMS {out_rms:.1f} dBFS)"
+
             summary = (
                 f"Status: {'PASS' if ok else 'FAIL'} (IPC4)  |  Pipelines: -p {pipe_arg}  |  "
                 f"In: {len(in_norm)}f (Peak {in_peak:.1f}, RMS {in_rms:.1f} dBFS) → "
-                f"Out: {len(out_norm)}f (Peak {out_peak:.1f}, RMS {out_rms:.1f} dBFS)"
+                f"{out_summary_str}"
                 f"{telem_badge}"
             )
             stdout_str = "\n".join(ipc_logs) + ("\n" + run_out.strip() if run_out.strip() else "")
@@ -2467,7 +2583,8 @@ class TestbenchRunner:
                 stdout=stdout_str,
                 stderr="",
                 extra=(
-                    f"{summary} | in[:6]={[round(x, 4) for x in in_norm[:6]]} "
+                    f"{summary} | streams={len(multi_in_samples)}->{len(multi_out_samples)} "
+                    f"in[:6]={[round(x, 4) for x in in_norm[:6]]} "
                     f"out[:6]={[round(x, 4) for x in out_norm[:6]]}"
                 ),
             )
@@ -2478,6 +2595,9 @@ class TestbenchRunner:
                 out_wav_path=out_wav if (ok and out_norm) else "",
                 in_samples=in_norm,
                 out_samples=out_norm,
+                multi_in_samples=multi_in_samples,
+                multi_out_samples=multi_out_samples,
+                multi_out_wav_paths=multi_out_wav_paths,
                 in_peak_db=in_peak,
                 out_peak_db=out_peak,
                 in_rms_db=in_rms,
@@ -2757,12 +2877,17 @@ class WaveformSnapshotWidget(Gtk.Widget):
         # Waveform sample buffers & stream metadata
         self.in_samples: List[float] = []
         self.out_samples: List[float] = []
+        self.multi_in_samples: List[List[float]] = []
+        self.multi_out_samples: List[List[float]] = []
         self.sample_rate: int = 48000
         self.channels: int = 2
         self.bits: int = 32
         self.in_label: str = "INPUT PCM: Source (Host/DAI)"
         self.out_label: str = "OUTPUT PCM: Sink (DAI/Host)"
         self.signal_label: str = "Sine 997 Hz"
+        self.multi_in_labels: List[str] = []
+        self.multi_out_labels: List[str] = []
+        self.multi_signal_labels: List[str] = []
         self.in_peak_db: float = -120.0
         self.in_rms_db: float = -120.0
         self.out_peak_db: float = -120.0
@@ -2780,10 +2905,18 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.amp_zoom: float = 1.0   # 1.0x = [-1.0, +1.0] full scale
         self.pan_offset: int = 0     # Starting sample index
 
+        # Vertical scroll state for multi-PCM stacked waveforms (bound to external Gtk.Scrollbar slider)
+        self.v_scroll_offset: float = 0.0
+        self._max_v_scroll: float = 0.0
+        self._updating_v_adj: bool = False
+        self.v_adj: Gtk.Adjustment = Gtk.Adjustment.new(0.0, 0.0, 185.0, 36.0, 120.0, 185.0)
+        self.v_adj.connect("value-changed", self._on_v_adj_value_changed)
+
         # Mouse interaction state
         self._hover_x: Optional[float] = None
         self._hover_y: Optional[float] = None
         self._drag_start_pan: int = 0
+        self._drag_start_v_scroll: float = 0.0
 
         self._setup_controllers()
 
@@ -2826,11 +2959,24 @@ class WaveformSnapshotWidget(Gtk.Widget):
         rate: int = 48000,
         channels: int = 2,
         bits: int = 32,
+        multi_in_labels: Optional[List[str]] = None,
+        multi_out_labels: Optional[List[str]] = None,
+        multi_signal_labels: Optional[List[str]] = None,
     ) -> None:
         self.in_label = in_label
         self.out_label = out_label
         if signal_label:
             self.signal_label = signal_label
+        self.multi_in_labels = list(multi_in_labels) if multi_in_labels else [in_label]
+        self.multi_out_labels = list(multi_out_labels) if multi_out_labels else [out_label]
+        self.multi_signal_labels = (
+            list(multi_signal_labels) if multi_signal_labels else [self.signal_label]
+        )
+        expected_streams = max(1, len(self.multi_in_labels), len(self.multi_out_labels))
+        if len(self.multi_in_samples) > expected_streams:
+            self.multi_in_samples = self.multi_in_samples[:expected_streams]
+        if len(self.multi_out_samples) > expected_streams:
+            self.multi_out_samples = self.multi_out_samples[:expected_streams]
         self.sample_rate = max(1000, rate)
         self.channels = max(1, channels)
         self.bits = bits
@@ -2844,9 +2990,25 @@ class WaveformSnapshotWidget(Gtk.Widget):
         is_realtime: bool = False,
         frames_played: int = 0,
         dsp_active: bool = True,
+        multi_in_samples: Optional[List[List[float]]] = None,
+        multi_out_samples: Optional[List[List[float]]] = None,
     ) -> None:
         self.in_samples = in_samples
         self.out_samples = out_samples
+        if multi_in_samples is not None:
+            self.multi_in_samples = [list(s) for s in multi_in_samples]
+        elif not self.multi_in_samples or len(self.multi_in_samples) <= 1:
+            self.multi_in_samples = [list(in_samples)] if in_samples else []
+        else:
+            self.multi_in_samples[0] = list(in_samples)
+
+        if multi_out_samples is not None:
+            self.multi_out_samples = [list(s) for s in multi_out_samples]
+        elif not self.multi_out_samples or len(self.multi_out_samples) <= 1:
+            self.multi_out_samples = [list(out_samples)] if out_samples else []
+        else:
+            self.multi_out_samples[0] = list(out_samples)
+
         self.in_peak_db, self.in_rms_db = TestbenchRunner._compute_metrics(in_samples)
         self.out_peak_db, self.out_rms_db = TestbenchRunner._compute_metrics(out_samples)
         if summary:
@@ -2861,7 +3023,14 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.queue_draw()
 
     def total_samples(self) -> int:
-        return max(len(self.in_samples), len(self.out_samples), 0)
+        best = max(len(self.in_samples), len(self.out_samples), 0)
+        for s in self.multi_in_samples:
+            if len(s) > best:
+                best = len(s)
+        for s in self.multi_out_samples:
+            if len(s) > best:
+                best = len(s)
+        return best
 
     def visible_sample_count(self) -> int:
         total = max(self.total_samples(), self.BASE_VISIBLE_SAMPLES)
@@ -2920,6 +3089,46 @@ class WaveformSnapshotWidget(Gtk.Widget):
         max_pan = max(0, total - vis)
         self.pan_offset = max(0, min(max_pan, self.pan_offset))
 
+    def _on_v_adj_value_changed(self, adj: Gtk.Adjustment) -> None:
+        if self._updating_v_adj:
+            return
+        self.v_scroll_offset = max(0.0, min(self._max_v_scroll, float(adj.get_value())))
+        self.queue_draw()
+
+    def set_v_scroll(self, new_offset: float) -> None:
+        clamped = max(0.0, min(self._max_v_scroll, float(new_offset)))
+        if abs(clamped - self.v_scroll_offset) < 0.1:
+            return
+        self.v_scroll_offset = clamped
+        self._updating_v_adj = True
+        try:
+            self.v_adj.set_value(self.v_scroll_offset)
+        finally:
+            self._updating_v_adj = False
+        self.queue_draw()
+
+    def _sync_v_adj(self, viewport_h: float, virtual_h: float) -> None:
+        eff_upper = max(viewport_h, virtual_h)
+        self._max_v_scroll = max(0.0, eff_upper - viewport_h)
+        self.v_scroll_offset = max(0.0, min(self._max_v_scroll, self.v_scroll_offset))
+        if (
+            abs(self.v_adj.get_upper() - eff_upper) > 0.5
+            or abs(self.v_adj.get_page_size() - viewport_h) > 0.5
+            or abs(self.v_adj.get_value() - self.v_scroll_offset) > 0.5
+        ):
+            self._updating_v_adj = True
+            try:
+                self.v_adj.configure(
+                    self.v_scroll_offset,
+                    0.0,
+                    eff_upper,
+                    40.0,
+                    max(80.0, viewport_h * 0.75),
+                    viewport_h,
+                )
+            finally:
+                self._updating_v_adj = False
+
     @staticmethod
     def _find_rising_zero_crossing(samples: List[float], max_search: int = 240) -> int:
         """Find first rising zero-crossing index for stable real-time oscilloscope triggering."""
@@ -2942,6 +3151,7 @@ class WaveformSnapshotWidget(Gtk.Widget):
         state = ctrl.get_current_event_state()
         ctrl_held = bool(state & Gdk.ModifierType.CONTROL_MASK)
         shift_held = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        alt_held = bool(state & Gdk.ModifierType.ALT_MASK)
 
         if ctrl_held:
             if dy < 0:
@@ -2956,6 +3166,12 @@ class WaveformSnapshotWidget(Gtk.Widget):
             self.pan_offset += int(math.copysign(step, delta))
             self._clamp_pan()
             self.queue_draw()
+            return True
+
+        # When multiple stacked waveforms exceed the viewport height, plain vertical wheel
+        # scrolls vertically through the streams (hold Alt + Wheel or use toolbar buttons to zoom time)
+        if self._max_v_scroll > 0.5 and not alt_held and abs(dy) > 0.01:
+            self.set_v_scroll(self.v_scroll_offset + dy * 48.0)
             return True
 
         w = max(1.0, float(self.get_width()))
@@ -2973,14 +3189,17 @@ class WaveformSnapshotWidget(Gtk.Widget):
 
     def _on_drag_begin(self, _gesture: Gtk.GestureDrag, _x: float, _y: float) -> None:
         self._drag_start_pan = self.pan_offset
+        self._drag_start_v_scroll = self.v_scroll_offset
 
-    def _on_drag_update(self, _gesture: Gtk.GestureDrag, offset_x: float, _offset_y: float) -> None:
+    def _on_drag_update(self, _gesture: Gtk.GestureDrag, offset_x: float, offset_y: float) -> None:
         w = max(1.0, float(self.get_width()))
         plot_w = max(10.0, w - 72.0)
         vis = self.visible_sample_count()
         delta_samples = int(round((-offset_x / plot_w) * vis))
         self.pan_offset = self._drag_start_pan + delta_samples
         self._clamp_pan()
+        if self._max_v_scroll > 0.5 and abs(offset_y) > 2.0:
+            self.set_v_scroll(self._drag_start_v_scroll - offset_y)
         self.queue_draw()
 
     def _on_pressed(self, _gesture: Gtk.GestureClick, n_press: int, _x: float, _y: float) -> None:
@@ -3038,20 +3257,37 @@ class WaveformSnapshotWidget(Gtk.Widget):
         bounds.init(0.0, 0.0, w, h)
         snapshot.append_color(self._rgba(0.06, 0.07, 0.10, 1.0), bounds)
 
+        num_streams = max(
+            1,
+            len(self.multi_in_samples),
+            len(self.multi_out_samples),
+            len(self.multi_in_labels),
+            len(self.multi_out_labels),
+        )
+        num_streams = min(16, num_streams)
+
         left_gutter = 62.0
         right_pad = 8.0
         top_pad = 4.0
         bottom_ruler_h = 22.0
-        lane_gap = 6.0
+        intra_pair_gap = 3.0 if num_streams >= 2 else 6.0
+        inter_stream_gap = 7.0 if num_streams >= 2 else 0.0
 
         plot_x = left_gutter
         plot_w = max(20.0, w - left_gutter - right_pad)
-        avail_h = max(40.0, h - top_pad - bottom_ruler_h - lane_gap)
-        lane_h = avail_h * 0.5
-
-        in_lane_y = top_pad
-        out_lane_y = top_pad + lane_h + lane_gap
-        ruler_y = out_lane_y + lane_h + 2.0
+        total_gaps = num_streams * intra_pair_gap + max(0, num_streams - 1) * inter_stream_gap
+        viewport_lanes_h = max(32.0, h - top_pad - bottom_ruler_h)
+        natural_lane_h = max(16.0, (viewport_lanes_h - total_gaps) / float(2 * num_streams))
+        min_lane_h = 66.0 if num_streams > 1 else 24.0
+        lane_h = max(min_lane_h, natural_lane_h)
+        stream_block_h = 2.0 * lane_h + intra_pair_gap
+        virtual_lanes_h = (
+            num_streams * stream_block_h
+            + max(0, num_streams - 1) * inter_stream_gap
+        )
+        self._sync_v_adj(viewport_lanes_h, virtual_lanes_h)
+        all_lanes_bot_y = top_pad + min(viewport_lanes_h, virtual_lanes_h)
+        ruler_y = top_pad + viewport_lanes_h + 2.0
 
         # Determine sample slice to display
         total = self.total_samples()
@@ -3063,61 +3299,129 @@ class WaveformSnapshotWidget(Gtk.Widget):
                 trig_shift = self._find_rising_zero_crossing(ref, max_search=min(240, max(1, len(ref) - vis)))
         start_idx = min(max(0, total - vis), self.pan_offset + trig_shift) if total > vis else 0
 
-        # Draw Lane 1: INPUT WAVEFORM
-        in_fmt_str = f"{self.signal_label} @ {self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
-        in_dur_ms = (len(self.in_samples) / float(max(1, self.sample_rate))) * 1000.0
-        in_metrics = (
-            f"Peak: {self.in_peak_db:+.1f} dBFS  |  RMS: {self.in_rms_db:+.1f} dBFS  |  "
-            f"{len(self.in_samples)} smp ({in_dur_ms:.1f} ms)"
-            if self.in_samples
-            else "No input signal loaded"
-        )
-        self._draw_waveform_lane(
-            snapshot=snapshot,
-            lane_x=plot_x,
-            lane_y=in_lane_y,
-            lane_w=plot_w,
-            lane_h=lane_h,
-            left_gutter=left_gutter,
-            title_badge=f"● {self.in_label}   [{in_fmt_str}]",
-            metrics_badge=in_metrics,
-            samples=self.in_samples,
-            start_idx=start_idx,
-            vis_count=vis,
-            trace_color=self._rgba(0.28, 0.80, 0.98, 0.96),
-            fill_color=self._rgba(0.28, 0.80, 0.98, 0.13),
-            header_bg=self._rgba(0.10, 0.16, 0.24, 0.95),
-            accent_color=self._rgba(0.35, 0.85, 1.0, 1.0),
-        )
+        # Color palettes per vertically stacked stream (Input trace/fill/hdr/accent, Output trace/fill/hdr/accent)
+        in_palettes = [
+            (self._rgba(0.28, 0.80, 0.98, 0.96), self._rgba(0.28, 0.80, 0.98, 0.13), self._rgba(0.10, 0.16, 0.24, 0.95), self._rgba(0.35, 0.85, 1.0, 1.0)),
+            (self._rgba(0.98, 0.76, 0.24, 0.96), self._rgba(0.98, 0.76, 0.24, 0.13), self._rgba(0.22, 0.17, 0.08, 0.95), self._rgba(1.0, 0.82, 0.35, 1.0)),
+            (self._rgba(0.98, 0.52, 0.34, 0.96), self._rgba(0.98, 0.52, 0.34, 0.13), self._rgba(0.24, 0.12, 0.09, 0.95), self._rgba(1.0, 0.62, 0.44, 1.0)),
+            (self._rgba(0.68, 0.95, 0.30, 0.96), self._rgba(0.68, 0.95, 0.30, 0.13), self._rgba(0.14, 0.22, 0.08, 0.95), self._rgba(0.75, 1.0, 0.40, 1.0)),
+            (self._rgba(0.45, 0.65, 1.0, 0.96), self._rgba(0.45, 0.65, 1.0, 0.13), self._rgba(0.11, 0.14, 0.26, 0.95), self._rgba(0.58, 0.76, 1.0, 1.0)),
+        ]
+        out_palettes = [
+            (self._rgba(0.24, 0.92, 0.58, 0.96), self._rgba(0.24, 0.92, 0.58, 0.13), self._rgba(0.09, 0.20, 0.16, 0.95), self._rgba(0.30, 0.96, 0.64, 1.0)),
+            (self._rgba(0.76, 0.48, 1.0, 0.96), self._rgba(0.76, 0.48, 1.0, 0.13), self._rgba(0.18, 0.11, 0.25, 0.95), self._rgba(0.84, 0.62, 1.0, 1.0)),
+            (self._rgba(0.20, 0.90, 0.84, 0.96), self._rgba(0.20, 0.90, 0.84, 0.13), self._rgba(0.08, 0.20, 0.20, 0.95), self._rgba(0.32, 0.98, 0.92, 1.0)),
+            (self._rgba(0.98, 0.45, 0.72, 0.96), self._rgba(0.98, 0.45, 0.72, 0.13), self._rgba(0.24, 0.10, 0.18, 0.95), self._rgba(1.0, 0.58, 0.80, 1.0)),
+            (self._rgba(0.95, 0.88, 0.32, 0.96), self._rgba(0.95, 0.88, 0.32, 0.13), self._rgba(0.22, 0.20, 0.08, 0.95), self._rgba(1.0, 0.94, 0.45, 1.0)),
+        ]
 
-        # Draw Lane 2: OUTPUT WAVEFORM
-        out_fmt_str = f"{self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
-        out_dur_ms = (len(self.out_samples) / float(max(1, self.sample_rate))) * 1000.0
-        out_metrics = (
-            f"Peak: {self.out_peak_db:+.1f} dBFS  |  RMS: {self.out_rms_db:+.1f} dBFS  |  "
-            f"{len(self.out_samples)} smp ({out_dur_ms:.1f} ms)"
-            if self.out_samples
-            else "No output captured yet"
-        )
-        self._draw_waveform_lane(
-            snapshot=snapshot,
-            lane_x=plot_x,
-            lane_y=out_lane_y,
-            lane_w=plot_w,
-            lane_h=lane_h,
-            left_gutter=left_gutter,
-            title_badge=f"● {self.out_label}   [{out_fmt_str}]",
-            metrics_badge=out_metrics,
-            samples=self.out_samples,
-            start_idx=start_idx,
-            vis_count=vis,
-            trace_color=self._rgba(0.24, 0.92, 0.58, 0.96),
-            fill_color=self._rgba(0.24, 0.92, 0.58, 0.13),
-            header_bg=self._rgba(0.09, 0.20, 0.16, 0.95),
-            accent_color=self._rgba(0.30, 0.96, 0.64, 1.0),
-        )
+        resolved_streams: List[Tuple[List[float], List[float], float, float]] = []
 
-        # Draw Bottom Time-Axis Ruler & Mini Viewport Scrollbar
+        lanes_clip = Graphene.Rect.alloc()
+        lanes_clip.init(0.0, top_pad, w, viewport_lanes_h)
+        snapshot.push_clip(lanes_clip)
+
+        for s_idx in range(num_streams):
+            in_lane_y = top_pad + s_idx * (stream_block_h + inter_stream_gap) - self.v_scroll_offset
+            out_lane_y = in_lane_y + lane_h + intra_pair_gap
+
+            if s_idx < len(self.multi_in_samples):
+                s_in = self.multi_in_samples[s_idx]
+            elif s_idx == 0:
+                s_in = self.in_samples
+            else:
+                s_in = []
+
+            if s_idx < len(self.multi_out_samples):
+                s_out = self.multi_out_samples[s_idx]
+            elif len(self.multi_out_samples) == 1:
+                s_out = self.multi_out_samples[0]
+            elif s_idx == 0:
+                s_out = self.out_samples
+            else:
+                s_out = []
+
+            resolved_streams.append((s_in, s_out, in_lane_y, out_lane_y + lane_h))
+            if out_lane_y + lane_h < top_pad or in_lane_y > top_pad + viewport_lanes_h:
+                continue
+
+            s_in_lbl = (
+                self.multi_in_labels[s_idx]
+                if s_idx < len(self.multi_in_labels)
+                else (f"STREAM {s_idx + 1} IN" if num_streams > 1 else self.in_label)
+            )
+            s_out_lbl = (
+                self.multi_out_labels[s_idx]
+                if s_idx < len(self.multi_out_labels)
+                else (
+                    self.multi_out_labels[0]
+                    if self.multi_out_labels
+                    else (f"STREAM {s_idx + 1} OUT" if num_streams > 1 else self.out_label)
+                )
+            )
+            s_sig_lbl = (
+                self.multi_signal_labels[s_idx]
+                if s_idx < len(self.multi_signal_labels)
+                else self.signal_label
+            )
+
+            in_pk, in_rms = TestbenchRunner._compute_metrics(s_in)
+            out_pk, out_rms = TestbenchRunner._compute_metrics(s_out)
+
+            in_fmt_str = f"{s_sig_lbl} @ {self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+            in_dur_ms = (len(s_in) / float(max(1, self.sample_rate))) * 1000.0
+            in_metrics = (
+                f"Peak: {in_pk:+.1f} dBFS  |  RMS: {in_rms:+.1f} dBFS  |  {len(s_in)} smp ({in_dur_ms:.1f} ms)"
+                if s_in
+                else "No input signal loaded"
+            )
+            in_tr, in_fl, in_hb, in_ac = in_palettes[s_idx % len(in_palettes)]
+            self._draw_waveform_lane(
+                snapshot=snapshot,
+                lane_x=plot_x,
+                lane_y=in_lane_y,
+                lane_w=plot_w,
+                lane_h=lane_h,
+                left_gutter=left_gutter,
+                title_badge=f"● {s_in_lbl}  [{in_fmt_str}]",
+                metrics_badge=in_metrics,
+                samples=s_in,
+                start_idx=start_idx,
+                vis_count=vis,
+                trace_color=in_tr,
+                fill_color=in_fl,
+                header_bg=in_hb,
+                accent_color=in_ac,
+            )
+
+            out_fmt_str = f"{self.sample_rate / 1000.0:.1f}kHz S{self.bits}_LE {self.channels}ch"
+            out_dur_ms = (len(s_out) / float(max(1, self.sample_rate))) * 1000.0
+            out_metrics = (
+                f"Peak: {out_pk:+.1f} dBFS  |  RMS: {out_rms:+.1f} dBFS  |  {len(s_out)} smp ({out_dur_ms:.1f} ms)"
+                if s_out
+                else "No output captured yet"
+            )
+            out_tr, out_fl, out_hb, out_ac = out_palettes[s_idx % len(out_palettes)]
+            self._draw_waveform_lane(
+                snapshot=snapshot,
+                lane_x=plot_x,
+                lane_y=out_lane_y,
+                lane_w=plot_w,
+                lane_h=lane_h,
+                left_gutter=left_gutter,
+                title_badge=f"● {s_out_lbl}  [{out_fmt_str}]",
+                metrics_badge=out_metrics,
+                samples=s_out,
+                start_idx=start_idx,
+                vis_count=vis,
+                trace_color=out_tr,
+                fill_color=out_fl,
+                header_bg=out_hb,
+                accent_color=out_ac,
+            )
+
+        snapshot.pop()
+
         self._draw_time_ruler(
             snapshot=snapshot,
             plot_x=plot_x,
@@ -3127,24 +3431,35 @@ class WaveformSnapshotWidget(Gtk.Widget):
             start_idx=start_idx,
             vis_count=vis,
             total_count=total,
+            left_gutter=left_gutter,
         )
 
-        # Draw Interactive Crosshair Cursor & Sample Value Tooltip on Hover
         if (
             self._hover_x is not None
             and self._hover_y is not None
             and plot_x <= self._hover_x <= plot_x + plot_w
-            and in_lane_y <= self._hover_y <= out_lane_y + lane_h
+            and top_pad <= self._hover_y <= all_lanes_bot_y
+            and resolved_streams
         ):
+            hov_idx = 0
+            for idx, (_sin, _sout, sy0, sy1) in enumerate(resolved_streams):
+                if sy0 <= self._hover_y <= sy1:
+                    hov_idx = idx
+                    break
+            h_in, h_out, _hy0, _hy1 = resolved_streams[hov_idx]
             self._draw_hover_crosshair(
                 snapshot=snapshot,
                 hx=self._hover_x,
+                hy=self._hover_y,
                 plot_x=plot_x,
                 plot_w=plot_w,
-                top_y=in_lane_y,
-                bot_y=out_lane_y + lane_h,
+                top_y=top_pad,
+                bot_y=all_lanes_bot_y,
                 start_idx=start_idx,
                 vis_count=vis,
+                in_samples_col=h_in,
+                out_samples_col=h_out,
+                stream_idx=(hov_idx + 1) if num_streams > 1 else None,
             )
 
     def _draw_waveform_lane(
@@ -3165,9 +3480,9 @@ class WaveformSnapshotWidget(Gtk.Widget):
         header_bg: Gdk.RGBA,
         accent_color: Gdk.RGBA,
     ) -> None:
-        hdr_h = min(19.0, max(15.0, lane_h * 0.24))
+        hdr_h = min(19.0, max(13.0, lane_h * 0.25))
         body_y = lane_y + hdr_h
-        body_h = max(16.0, lane_h - hdr_h)
+        body_h = max(12.0, lane_h - hdr_h)
         mid_y = body_y + body_h * 0.5
         amp_px = (body_h * 0.44)
 
@@ -3181,8 +3496,9 @@ class WaveformSnapshotWidget(Gtk.Widget):
         snapshot.append_color(header_bg, hdr_rect)
 
         # Left gutter background for this lane
+        gut_x = max(2.0, lane_x - left_gutter + 2.0)
         gut_rect = Graphene.Rect.alloc()
-        gut_rect.init(2.0, lane_y, left_gutter - 4.0, lane_h)
+        gut_rect.init(gut_x, lane_y, left_gutter - 4.0, lane_h)
         snapshot.append_color(self._rgba(0.07, 0.08, 0.12, 1.0), gut_rect)
 
         # Y-axis scale labels in left gutter
@@ -3191,27 +3507,29 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self._draw_text(
             snapshot,
             f"+{full_scale_val:.2g}",
-            6.0,
+            gut_x + 4.0,
             body_y + 1.0,
             "Monospace 7.5",
             axis_col,
         )
-        self._draw_text(
-            snapshot,
-            " 0.0",
-            6.0,
-            mid_y - 6.0,
-            "Monospace 7.5",
-            axis_col,
-        )
-        self._draw_text(
-            snapshot,
-            f"-{full_scale_val:.2g}",
-            6.0,
-            body_y + body_h - 13.0,
-            "Monospace 7.5",
-            axis_col,
-        )
+        if body_h >= 34.0:
+            self._draw_text(
+                snapshot,
+                " 0.0",
+                gut_x + 4.0,
+                mid_y - 6.0,
+                "Monospace 7.5",
+                axis_col,
+            )
+        if body_h >= 22.0:
+            self._draw_text(
+                snapshot,
+                f"-{full_scale_val:.2g}",
+                gut_x + 4.0,
+                body_y + body_h - 13.0,
+                "Monospace 7.5",
+                axis_col,
+            )
 
         # Horizontal & vertical grid lines inside body
         grid_pb = Gsk.PathBuilder.new()
@@ -3241,18 +3559,26 @@ class WaveformSnapshotWidget(Gtk.Widget):
         )
 
         # Header labels (Left: Stream Title & Format; Right: Peak/RMS/Frames)
+        m_layout = self.create_pango_layout(metrics_badge)
+        m_layout.set_font_description(Pango.FontDescription.from_string("Monospace 7.5"))
+        mw, _ = m_layout.get_pixel_size()
+        show_metrics = (lane_w - mw - 10.0 > 130.0)
+        avail_title_px = (lane_w - mw - 20.0) if show_metrics else (lane_w - 16.0)
+        disp_title = title_badge
+        if avail_title_px < len(disp_title) * 6.5:
+            max_chars = max(16, int(avail_title_px / 6.2))
+            if len(disp_title) > max_chars:
+                disp_title = disp_title[: max_chars - 1] + "…"
+
         self._draw_text(
             snapshot,
-            title_badge,
+            disp_title,
             lane_x + 8.0,
             lane_y + 2.0,
-            "Sans Bold 8.5",
+            "Sans Bold 8",
             accent_color,
         )
-        m_layout = self.create_pango_layout(metrics_badge)
-        m_layout.set_font_description(Pango.FontDescription.from_string("Monospace 8"))
-        mw, _ = m_layout.get_pixel_size()
-        if lane_w - mw - 10.0 > 240.0:
+        if show_metrics:
             snapshot.save()
             pt = Graphene.Point.alloc()
             pt.init(lane_x + lane_w - mw - 8.0, lane_y + 2.5)
@@ -3341,21 +3667,23 @@ class WaveformSnapshotWidget(Gtk.Widget):
         start_idx: int,
         vis_count: int,
         total_count: int,
+        left_gutter: float = 62.0,
     ) -> None:
         r_rect = Graphene.Rect.alloc()
         r_rect.init(plot_x, ruler_y, plot_w, ruler_h)
         snapshot.append_color(self._rgba(0.07, 0.08, 0.12, 1.0), r_rect)
 
+        gut_x = max(4.0, plot_x - left_gutter + 4.0)
         self._draw_text(
             snapshot,
             "TIME / SMP",
-            4.0,
+            gut_x,
             ruler_y + 3.0,
             "Sans Bold 7",
             self._rgba(0.55, 0.62, 0.72, 0.9),
         )
 
-        n_ticks = 6
+        n_ticks = 3 if plot_w < 380.0 else (4 if plot_w < 560.0 else 6)
         rate = float(max(1, self.sample_rate))
         tick_col = self._rgba(0.72, 0.78, 0.88, 0.95)
         for ti in range(n_ticks + 1):
@@ -3395,13 +3723,19 @@ class WaveformSnapshotWidget(Gtk.Widget):
         bot_y: float,
         start_idx: int,
         vis_count: int,
+        in_samples_col: Optional[List[float]] = None,
+        out_samples_col: Optional[List[float]] = None,
+        hy: float = 0.0,
+        stream_idx: Optional[int] = None,
     ) -> None:
         rel = max(0.0, min(1.0, (hx - plot_x) / max(1.0, plot_w)))
         smp_idx = start_idx + int(round(rel * max(1, vis_count - 1)))
         t_ms = (smp_idx / float(max(1, self.sample_rate))) * 1000.0
 
-        in_val = self.in_samples[smp_idx] if smp_idx < len(self.in_samples) else 0.0
-        out_val = self.out_samples[smp_idx] if smp_idx < len(self.out_samples) else 0.0
+        in_arr = in_samples_col if in_samples_col is not None else self.in_samples
+        out_arr = out_samples_col if out_samples_col is not None else self.out_samples
+        in_val = in_arr[smp_idx] if smp_idx < len(in_arr) else 0.0
+        out_val = out_arr[smp_idx] if smp_idx < len(out_arr) else 0.0
         in_db = 20.0 * math.log10(abs(in_val)) if abs(in_val) > 1e-9 else -120.0
         out_db = 20.0 * math.log10(abs(out_val)) if abs(out_val) > 1e-9 else -120.0
 
@@ -3416,8 +3750,9 @@ class WaveformSnapshotWidget(Gtk.Widget):
         )
 
         # Floating readout pill
+        stream_prefix = f"S{stream_idx}  |  " if stream_idx is not None else ""
         info_txt = (
-            f"Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
+            f"{stream_prefix}Sample #{smp_idx} ({t_ms:.3f} ms)  |  "
             f"IN: {in_val:+.4f} ({in_db:+.1f} dBFS)  |  "
             f"OUT: {out_val:+.4f} ({out_db:+.1f} dBFS)"
         )
@@ -3426,7 +3761,7 @@ class WaveformSnapshotWidget(Gtk.Widget):
         tw, th = layout.get_pixel_size()
 
         bx = min(plot_x + plot_w - tw - 14.0, max(plot_x + 6.0, hx + 10.0))
-        by = top_y + 20.0
+        by = min(bot_y - th - 6.0, max(top_y + 20.0, hy - th - 8.0)) if hy > 0.0 else top_y + 20.0
         bg_rect = Graphene.Rect.alloc()
         bg_rect.init(bx - 5.0, by - 2.0, float(tw + 10), float(th + 4))
         snapshot.append_color(self._rgba(0.05, 0.06, 0.09, 0.92), bg_rect)
