@@ -29,7 +29,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Pango", "1.0")
-from gi.repository import Gdk, Graphene, Gsk, Gtk, Pango
+from gi.repository import Gdk, GLib, Graphene, Gsk, Gtk, Pango
 
 from .model import debug_log_command, debug_log_line
 from .tplg_ipc4 import (
@@ -2909,6 +2909,8 @@ class WaveformSnapshotWidget(Gtk.Widget):
         self.v_scroll_offset: float = 0.0
         self._max_v_scroll: float = 0.0
         self._updating_v_adj: bool = False
+        self._v_adj_idle_scheduled: bool = False
+        self._pending_v_adj_cfg: Optional[Tuple[float, float, float]] = None
         self.v_adj: Gtk.Adjustment = Gtk.Adjustment.new(0.0, 0.0, 185.0, 36.0, 120.0, 185.0)
         self.v_adj.connect("value-changed", self._on_v_adj_value_changed)
 
@@ -3116,18 +3118,33 @@ class WaveformSnapshotWidget(Gtk.Widget):
             or abs(self.v_adj.get_page_size() - viewport_h) > 0.5
             or abs(self.v_adj.get_value() - self.v_scroll_offset) > 0.5
         ):
-            self._updating_v_adj = True
-            try:
-                self.v_adj.configure(
-                    self.v_scroll_offset,
-                    0.0,
-                    eff_upper,
-                    40.0,
-                    max(80.0, viewport_h * 0.75),
-                    viewport_h,
-                )
-            finally:
-                self._updating_v_adj = False
+            # Defer Gtk.Adjustment.configure() to GLib.idle_add so we never invalidate
+            # the sibling Gtk.Scrollbar slider GtkGizmo allocation mid-snapshot.
+            self._pending_v_adj_cfg = (self.v_scroll_offset, eff_upper, viewport_h)
+            if not self._v_adj_idle_scheduled:
+                self._v_adj_idle_scheduled = True
+                GLib.idle_add(self._apply_pending_v_adj_cfg)
+
+    def _apply_pending_v_adj_cfg(self) -> bool:
+        self._v_adj_idle_scheduled = False
+        cfg = self._pending_v_adj_cfg
+        self._pending_v_adj_cfg = None
+        if cfg is None:
+            return False
+        val, eff_upper, viewport_h = cfg
+        self._updating_v_adj = True
+        try:
+            self.v_adj.configure(
+                val,
+                0.0,
+                eff_upper,
+                40.0,
+                max(80.0, viewport_h * 0.75),
+                viewport_h,
+            )
+        finally:
+            self._updating_v_adj = False
+        return False
 
     @staticmethod
     def _find_rising_zero_crossing(samples: List[float], max_search: int = 240) -> int:

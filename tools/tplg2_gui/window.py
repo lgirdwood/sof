@@ -1142,9 +1142,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             target_left = int(total_w * 0.25)
             target_center = int(total_w * 0.50)
             target_center_vpos = int(total_h * 0.68)
-            self.hpaned_outer.set_position(target_left)
-            self.hpaned_inner.set_position(target_center)
-            self.center_vpaned.set_position(target_center_vpos)
             GLib.idle_add(self._sync_inner_paned_position, target_left, target_center, target_center_vpos)
         return GLib.SOURCE_CONTINUE
 
