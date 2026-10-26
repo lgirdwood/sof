@@ -1435,6 +1435,7 @@ class Topology2Workspace:
 
         if include_testbench_io:
             self.attach_host_copier_io_nodes(vm)
+        self.attach_pipeline_pin_format_nodes(vm, is_capture=is_capture)
         return vm
 
     def build_graph_for_topology(
@@ -2254,9 +2255,15 @@ class Topology2Workspace:
         if ctrl_node and ctrl_node.children:
             badges.append(f"{len(ctrl_node.children)} ctl")
 
-        num_in = int(str(cfg.get_scalar("num_input_pins", 1) or 1))
-        num_out = int(str(cfg.get_scalar("num_output_pins", 1) or 1))
-        in_ports = [GraphPort(f"in{i}", f"in.{i}", "in", "audio") for i in range(max(1, num_in))]
+        raw_in = cfg.get_scalar("num_input_pins")
+        raw_out = cfg.get_scalar("num_output_pins")
+        num_in = (
+            int(str(raw_in))
+            if raw_in is not None and str(raw_in).isdigit()
+            else (0 if wclass == "siggen" else 1)
+        )
+        num_out = int(str(raw_out or 1)) if raw_out is not None and str(raw_out).isdigit() else 1
+        in_ports = [GraphPort(f"in{i}", f"in.{i}", "in", "audio") for i in range(0 if wclass == "siggen" else max(1, num_in))]
         out_ports = [GraphPort(f"out{i}", f"out.{i}", "out", "audio") for i in range(max(1, num_out))]
 
         return GraphNode(
@@ -3178,17 +3185,28 @@ class Topology2Workspace:
             "entries": matched_entries,
         }
 
-    def attach_module_pin_format_nodes(self, vm: GraphViewModel, main_node: GraphNode) -> None:
-        """Attach left-hand Input Pin Format node(s) and right-hand Output Pin Format node(s) to main_node."""
-        num_in = len(main_node.in_ports)
-        num_out = len(main_node.out_ports)
+    def attach_module_pin_format_nodes(
+        self,
+        vm: GraphViewModel,
+        main_node: GraphNode,
+        attach_in: bool = True,
+        attach_out: bool = True,
+        is_capture: bool = False,
+    ) -> None:
+        """Attach Input Pin Format node(s) and Output Pin Format node(s) to main_node."""
+        num_in = len(main_node.in_ports) if attach_in else 0
+        num_out = len(main_node.out_ports) if attach_out else 0
 
         def build_pin_node(
             direction: str,
             pin_indices: List[int],
         ) -> GraphNode:
             is_in = direction == "in"
-            side = "left" if is_in else "right"
+            if is_capture:
+                side = "right" if is_in else "left"
+            else:
+                side = "left" if is_in else "right"
+            arrow = "◂" if is_capture else "▸"
             p0 = pin_indices[0]
             details = self.extract_pin_format_details(
                 main_node.config,
@@ -3198,12 +3216,12 @@ class Topology2Workspace:
             if len(pin_indices) == 1:
                 pin_tag = f"{'in' if is_in else 'out'}.{p0}"
                 node_id = f"{main_node.id}.pin_{direction}.{p0}"
-                title = f"▸ {pin_tag} {'accepts' if is_in else 'outputs'}:"
+                title = f"{arrow} {pin_tag} {'accepts' if is_in else 'outputs'}:"
             else:
                 p_last = pin_indices[-1]
                 pin_tag = f"{'in' if is_in else 'out'}.{p0}..{p_last}"
                 node_id = f"{main_node.id}.pin_{direction}.all"
-                title = f"▸ {pin_tag} ({len(pin_indices)} pins):"
+                title = f"{arrow} {pin_tag} ({len(pin_indices)} pins):"
 
             cfg_key = (
                 f"Object.Base.input_audio_format ({pin_tag})"
@@ -3389,6 +3407,57 @@ class Topology2Workspace:
                             sink_port=f"in{p_idx}",
                         )
                     )
+
+    def attach_pipeline_pin_format_nodes(self, vm: GraphViewModel, is_capture: bool = False) -> None:
+        """Attach Input/Output Pin Capability Callouts to the head and tail endpoint widgets of a pipeline."""
+        wnodes = [n for n in vm.nodes.values() if n.class_category == "Widget"]
+        if not wnodes:
+            return
+        wids = {n.id for n in wnodes}
+        in_deg: Dict[str, int] = {n.id: 0 for n in wnodes}
+        out_deg: Dict[str, int] = {n.id: 0 for n in wnodes}
+        for e in vm.edges:
+            if e.source_node in wids and e.sink_node in wids and e.source_node != e.sink_node:
+                out_deg[e.source_node] += 1
+                in_deg[e.sink_node] += 1
+
+        tb_sides_by_parent: Set[Tuple[str, str]] = set()
+        for n in vm.nodes.values():
+            if n.class_category == "TestbenchIO" and n.parent_node_id:
+                s = str(n.config.get_scalar("side", "left")).lower()
+                tb_sides_by_parent.add((n.parent_node_id, s))
+
+        in_side = "right" if is_capture else "left"
+        out_side = "left" if is_capture else "right"
+
+        head_nodes = [
+            n for n in wnodes
+            if in_deg[n.id] == 0 and n.class_name != "siggen" and len(n.in_ports) > 0
+        ]
+        tail_nodes = [
+            n for n in wnodes
+            if out_deg[n.id] == 0 and n.class_name != "wov" and len(n.out_ports) > 0
+        ]
+
+        for hnode in head_nodes:
+            if (hnode.id, in_side) not in tb_sides_by_parent:
+                self.attach_module_pin_format_nodes(
+                    vm,
+                    hnode,
+                    attach_in=True,
+                    attach_out=False,
+                    is_capture=is_capture,
+                )
+
+        for tnode in tail_nodes:
+            if (tnode.id, out_side) not in tb_sides_by_parent:
+                self.attach_module_pin_format_nodes(
+                    vm,
+                    tnode,
+                    attach_in=False,
+                    attach_out=True,
+                    is_capture=is_capture,
+                )
 
     @staticmethod
     def _match_widget_id(

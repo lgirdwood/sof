@@ -778,14 +778,10 @@ class LeftNavigationPanel(Gtk.Box):
             self._hide_hover_zoom_box()
             return
 
-        cache_key = f"{item_kind}:{item_id}"
-        vm = self._mini_vm_cache.get(cache_key)
-        if vm is None:
-            if item_kind == "module":
-                vm = self.workspace.build_graph_for_module(item_id)
-            else:
-                vm = self.workspace.build_graph_for_pipeline(item_id)
-            self._mini_vm_cache[cache_key] = vm
+        if item_kind == "module":
+            vm = self._get_mini_module_vm(item_id)
+        else:
+            vm = self._get_mini_pipeline_vm(item_id)
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
 
@@ -864,6 +860,24 @@ class LeftNavigationPanel(Gtk.Box):
                 w_chain = [f"{w.get('class_name', '')}.{w.get('instance', '')}" for w in cdef.widgets]
                 if w_chain:
                     meta_lines.append(f"Chain ({len(w_chain)} widgets): {' → '.join(w_chain)}")
+                pin_in_nodes = [n for n in vm.nodes.values() if n.category == "pin_fmt_in"]
+                pin_out_nodes = [n for n in vm.nodes.values() if n.category == "pin_fmt_out"]
+                if pin_in_nodes:
+                    p_in = pin_in_nodes[0]
+                    meta_lines.append(
+                        f"IN Pin(s) ({len(pin_in_nodes)}): "
+                        f"Fmt {p_in.config.get_scalar('formats_line', '')}  •  "
+                        f"Rate {p_in.config.get_scalar('rates_line', '')}  •  "
+                        f"Ch {p_in.config.get_scalar('channels_line', '')}"
+                    )
+                if pin_out_nodes:
+                    p_out = pin_out_nodes[0]
+                    meta_lines.append(
+                        f"OUT Pin(s) ({len(pin_out_nodes)}): "
+                        f"Fmt {p_out.config.get_scalar('formats_line', '')}  •  "
+                        f"Rate {p_out.config.get_scalar('rates_line', '')}  •  "
+                        f"Ch {p_out.config.get_scalar('channels_line', '')}"
+                    )
 
         if meta_lines:
             meta_lbl = Gtk.Label(label="\n".join(meta_lines), xalign=0.0)

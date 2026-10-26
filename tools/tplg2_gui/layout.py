@@ -124,12 +124,20 @@ def _position_pin_format_nodes(vm: GraphViewModel) -> None:
         if not parent:
             continue
         pnodes.sort(key=lambda n: (int(n.instance_id) if n.instance_id.isdigit() else 0, n.id))
+        if parent.pipeline_id is not None and parent.pipeline_id in vm.containers:
+            cont = vm.containers[parent.pipeline_id]
+            right_anchor_x = max(cont.x + cont.width, parent.x + parent.width) + PIN_FMT_GAP
+            left_anchor_x = min(cont.x, parent.x) - PIN_FMT_GAP
+        else:
+            right_anchor_x = parent.x + parent.width + PIN_FMT_GAP
+            left_anchor_x = parent.x - PIN_FMT_GAP
+
         if len(pnodes) == 1:
             pnode = pnodes[0]
             if side == "right":
-                pnode.x = parent.x + parent.width + PIN_FMT_GAP
+                pnode.x = right_anchor_x
             else:
-                pnode.x = parent.x - pnode.width - PIN_FMT_GAP
+                pnode.x = left_anchor_x - pnode.width
             pnode.y = parent.y + (parent.height - pnode.height) / 2.0
         else:
             gap_y = 12.0
@@ -138,9 +146,9 @@ def _position_pin_format_nodes(vm: GraphViewModel) -> None:
             cur_y = max(16.0, mid_y - total_h / 2.0)
             for pnode in pnodes:
                 if side == "right":
-                    pnode.x = parent.x + parent.width + PIN_FMT_GAP
+                    pnode.x = right_anchor_x
                 else:
-                    pnode.x = parent.x - pnode.width - PIN_FMT_GAP
+                    pnode.x = left_anchor_x - pnode.width
                 pnode.y = cur_y
                 cur_y += pnode.height + gap_y
 
@@ -601,7 +609,18 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
             pipe_col[comp[0]] = 1
 
     has_tb_io = any(n.class_category == "TestbenchIO" for n in vm.nodes.values())
-    base_col_x = (50.0 + TB_IO_WIDTH + TB_IO_GAP) if has_tb_io else 50.0
+    left_pin_nodes = [
+        n
+        for n in vm.nodes.values()
+        if n.class_category == "PinFormat"
+        and str(n.config.get_scalar("side", "left")).lower() == "left"
+    ]
+    if has_tb_io:
+        base_col_x = 50.0 + TB_IO_WIDTH + TB_IO_GAP
+    elif left_pin_nodes:
+        base_col_x = 40.0 + max(n.width for n in left_pin_nodes) + PIN_FMT_GAP
+    else:
+        base_col_x = 50.0
     default_col0_w = max(
         (vm.containers[p].width for p in pipe_ids if pipe_col[p] == 0),
         default=440.0,

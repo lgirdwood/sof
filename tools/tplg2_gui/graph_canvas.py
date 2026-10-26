@@ -1977,6 +1977,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         bracketed schematic annotation (distinct from solid widget/module nodes).
         """
         is_in = node.category == "pin_fmt_in"
+        is_left_side = str(node.config.get_scalar("side", "left")).lower() == "left"
         f_line = str(node.config.get_scalar("formats_line", "s16, s24/32, s32"))
         r_line = str(node.config.get_scalar("rates_line", "48 kHz"))
         c_line = str(node.config.get_scalar("channels_line", "2 ch • interleaved"))
@@ -2003,7 +2004,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         dash_stroke.set_dash([2.5, 3.0])
         snapshot.append_stroke(dash_pb.to_path(), dash_stroke, dash_col)
 
-        # Open schematic bracket spine [ ┐...┘ for Input on right edge, ┌...└ for Output on left edge ]
+        # Open schematic bracket spine [ ┐...┘ on right edge when callout sits on the left, ┌...└ on left edge when on the right ]
         spine_col = (
             NODE_BORDER_SELECTED
             if is_selected
@@ -2013,7 +2014,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         sy0 = node.y + 3.0
         sy1 = node.y + node.height - 3.0
         bracket_pb = Gsk.PathBuilder.new()
-        if is_in:
+        if is_left_side:
             sx = node.x + node.width - 1.5
             bracket_pb.move_to(sx - arm, sy0)
             bracket_pb.line_to(sx, sy0)
@@ -2120,13 +2121,14 @@ class TopologyGraphCanvas(Gtk.Widget):
         y2 = v.y + v_port.rel_y
 
         if u.class_category == "PinFormat" or v.class_category == "PinFormat":
-            is_in_cap = u.class_category == "PinFormat"
+            is_in_cap = (u.category == "pin_fmt_in") or (v.category == "pin_fmt_in")
             cap_col = (
                 EDGE_SELECTED_COLOR
                 if is_sel
                 else (rgba(0.32, 0.82, 0.96, 0.72) if is_in_cap else rgba(0.98, 0.68, 0.26, 0.72))
             )
-            dx = max(6.0, abs(x2 - x1) * 0.4)
+            sign = 1.0 if x2 >= x1 else -1.0
+            dx = max(6.0, abs(x2 - x1) * 0.4) * sign
             pb = Gsk.PathBuilder.new()
             pb.move_to(x1, y1)
             pb.cubic_to(x1 + dx, y1, x2 - dx, y2, x2, y2)
