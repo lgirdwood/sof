@@ -65,6 +65,8 @@ CATEGORY_COLORS: Dict[str, Tuple[Gdk.RGBA, Gdk.RGBA]] = {
     "base": (rgba(0.36, 0.44, 0.54, 1.0), rgba(0.14, 0.16, 0.20, 0.96)),
     "pipeline": (rgba(0.25, 0.48, 0.72, 1.0), rgba(0.12, 0.17, 0.23, 0.96)),
     "testbench_io": (rgba(0.15, 0.62, 0.42, 1.0), rgba(0.11, 0.18, 0.16, 0.97)),
+    "pin_fmt_in": (rgba(0.11, 0.46, 0.68, 1.0), rgba(0.08, 0.14, 0.21, 0.96)),
+    "pin_fmt_out": (rgba(0.13, 0.54, 0.42, 1.0), rgba(0.08, 0.16, 0.14, 0.96)),
 }
 
 BG_COLOR = rgba(0.08, 0.09, 0.12, 1.0)
@@ -311,7 +313,7 @@ class TopologyGraphCanvas(Gtk.Widget):
         dapms = getattr(telem, "dapm_nodes", []) or []
 
         for nid, node in self.vm.nodes.items():
-            if node.class_category in ("Control", "TestbenchIO"):
+            if node.class_category in ("Control", "TestbenchIO", "PinFormat"):
                 continue
             matched_comp = None
             for c in comps:
@@ -1272,6 +1274,10 @@ class TopologyGraphCanvas(Gtk.Widget):
             self._snapshot_testbench_io_node(snapshot, node, rect, rrect, is_selected)
             return
 
+        if node.class_category == "PinFormat":
+            self._snapshot_pin_format_node(snapshot, node, rect, rrect, is_selected, header_col, body_col)
+            return
+
         # Clip rounded node card
         snapshot.push_rounded_clip(rrect)
         snapshot.append_color(body_col, rect)
@@ -1956,6 +1962,92 @@ class TopologyGraphCanvas(Gtk.Widget):
             px = node.x + port.rel_x
             py = node.y + port.rel_y
             self._snapshot_port_circle(snapshot, px, py, PORT_OUT_COLOR, radius=5.0)
+
+    def _snapshot_pin_format_node(
+        self,
+        snapshot: Gtk.Snapshot,
+        node: GraphNode,
+        rect: Graphene.Rect,
+        rrect: Gsk.RoundedRect,
+        is_selected: bool,
+        header_col: Gdk.RGBA,
+        body_col: Gdk.RGBA,
+    ) -> None:
+        """Render left-hand Input Pin or right-hand Output Pin audio format specification card."""
+        is_in = node.category == "pin_fmt_in"
+        f_line = str(node.config.get_scalar("formats_line", "s16, s24/32, s32"))
+        r_line = str(node.config.get_scalar("rates_line", "48 kHz"))
+        c_line = str(node.config.get_scalar("channels_line", "2 ch • interleaved"))
+
+        snapshot.push_rounded_clip(rrect)
+        snapshot.append_color(body_col, rect)
+
+        hdr_h = 21.0
+        hdr_rect = Graphene.Rect.alloc()
+        hdr_rect.init(node.x, node.y, node.width, hdr_h)
+        snapshot.append_color(header_col, hdr_rect)
+
+        pt = Graphene.Point.alloc()
+        title_layout = self._get_pango_layout(node.title, size_pt=7, bold=True)
+        snapshot.save()
+        pt.init(node.x + 8.0, node.y + 3.5)
+        snapshot.translate(pt)
+        snapshot.append_layout(title_layout, TEXT_WHITE)
+        snapshot.restore()
+
+        rows = [
+            ("FMT", f_line, rgba(0.68, 0.94, 1.0, 1.0) if is_in else rgba(0.66, 0.98, 0.84, 1.0)),
+            ("RATE", r_line, TEXT_WHITE),
+            ("CH", c_line, rgba(0.82, 0.88, 0.96, 0.96)),
+        ]
+        ry = node.y + 24.5
+        pill_bg = rgba(0.14, 0.24, 0.34, 0.95) if is_in else rgba(0.12, 0.26, 0.22, 0.95)
+        pill_fg = rgba(0.56, 0.88, 1.0, 1.0) if is_in else rgba(0.56, 0.96, 0.78, 1.0)
+
+        for tag_txt, val_txt, val_col in rows:
+            tag_w = 28.0
+            tag_h = 13.5
+            t_rect = Graphene.Rect.alloc()
+            t_rect.init(node.x + 7.0, ry + 0.5, tag_w, tag_h)
+            t_rr = Gsk.RoundedRect()
+            t_rr.init_from_rect(t_rect, 3.0)
+            snapshot.push_rounded_clip(t_rr)
+            snapshot.append_color(pill_bg, t_rect)
+            snapshot.pop()
+
+            t_lyt = self._get_pango_layout(tag_txt, size_pt=5, bold=True)
+            snapshot.save()
+            pt.init(node.x + 9.5, ry + 2.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(t_lyt, pill_fg)
+            snapshot.restore()
+
+            v_lyt = self._get_pango_layout(val_txt, size_pt=7, bold=(tag_txt in ("FMT", "RATE")))
+            snapshot.save()
+            pt.init(node.x + 39.0, ry + 0.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(v_lyt, val_col)
+            snapshot.restore()
+            ry += 16.5
+
+        snapshot.pop()
+
+        bcol = (
+            NODE_BORDER_SELECTED
+            if is_selected
+            else (rgba(0.26, 0.68, 0.92, 0.92) if is_in else rgba(0.26, 0.82, 0.62, 0.92))
+        )
+        bw = 2.0 if is_selected else 1.3
+        snapshot.append_border(rrect, [bw, bw, bw, bw], [bcol, bcol, bcol, bcol])
+
+        for port in node.in_ports:
+            px = node.x + port.rel_x
+            py = node.y + port.rel_y
+            self._snapshot_port_circle(snapshot, px, py, PORT_IN_COLOR, radius=4.6)
+        for port in node.out_ports:
+            px = node.x + port.rel_x
+            py = node.y + port.rel_y
+            self._snapshot_port_circle(snapshot, px, py, PORT_OUT_COLOR, radius=4.6)
 
     def _snapshot_port_circle(self, snapshot: Gtk.Snapshot, cx: float, cy: float, color: Gdk.RGBA, radius: float = 5.0) -> None:
         rect = Graphene.Rect.alloc()
@@ -4551,15 +4643,15 @@ class MiniGraphPreview(TopologyGraphCanvas):
         _, _, gw, gh = self._get_graph_bounds()
         if zoom_card:
             if vm.view_kind == "module":
-                req_w = int(min(780.0, max(520.0, gw * 1.55 + 48.0)))
-                req_h = int(min(520.0, max(280.0, gh * 1.55 + 44.0)))
+                req_w = int(min(940.0, max(640.0, gw * 1.25 + 48.0)))
+                req_h = int(min(540.0, max(280.0, gh * 1.25 + 44.0)))
             else:
                 req_w = int(min(1120.0, max(720.0, gw * 1.15 + 56.0)))
                 req_h = int(min(580.0, max(340.0, gh * 1.15 + 48.0)))
             self.set_size_request(req_w, req_h)
         else:
             if vm.view_kind == "module":
-                req_h = 132 if gh > 110.0 else 86
+                req_h = 136 if gh > 110.0 else 104
             else:
                 req_h = int(max(106.0, min(164.0, 290.0 * (gh / max(gw, 240.0)) + 24.0)))
             self.set_size_request(220, req_h)
@@ -4586,13 +4678,13 @@ class MiniGraphPreview(TopologyGraphCanvas):
         snapshot.append_color(BG_COLOR, rect)
 
         min_x, min_y, graph_w, graph_h = self._get_graph_bounds()
-        pad = 18.0 if self.zoom_card else 10.0
+        pad = 16.0 if self.zoom_card else 8.0
         zx = max(20.0, w - 2.0 * pad) / max(graph_w, 1.0)
         zy = max(20.0, h - 2.0 * pad) / max(graph_h, 1.0)
         if self.zoom_card:
-            max_sc = 1.65 if self.vm.view_kind == "module" else 1.35
+            max_sc = 1.45 if self.vm.view_kind == "module" else 1.35
         else:
-            max_sc = 0.82
+            max_sc = 0.84
         scale = max(0.10, min(max_sc, min(zx, zy)))
         px = (w - graph_w * scale) / 2.0 - min_x * scale
         py = (h - graph_h * scale) / 2.0 - min_y * scale
@@ -4605,6 +4697,13 @@ class MiniGraphPreview(TopologyGraphCanvas):
 
         for pid, cont in self.vm.containers.items():
             self._snapshot_container(snapshot, pid, cont)
+        self._snapshot_module_kcontrol_groups(
+            snapshot,
+            min_x - 80.0,
+            min_y - 80.0,
+            min_x + graph_w + 80.0,
+            min_y + graph_h + 80.0,
+        )
         for edge in self.vm.edges:
             self._snapshot_edge(snapshot, edge)
         for nid, node in self.vm.nodes.items():

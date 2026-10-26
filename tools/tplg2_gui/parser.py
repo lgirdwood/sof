@@ -456,6 +456,225 @@ class Topology2Workspace:
                     )
             self.platform_definitions.sort(key=lambda d: str(d["rel_path"]))
 
+        # 6. Aggregate per-module and per-pin input/output audio formats across pipelines, bench configs, and topologies
+        self._aggregate_module_pin_audio_formats()
+
+    def _aggregate_module_pin_audio_formats(self) -> None:
+        """Populate default pin counts and aggregate input_audio_format / output_audio_format specs per module."""
+        if not self.processing_modules:
+            return
+
+        # 1. Normalize default num_input_pins and num_output_pins where class definitions omit them
+        default_pin_overrides: Dict[str, Tuple[int, int]] = {
+            "siggen": (0, 1),
+            "wov": (1, 0),
+            "crossover": (1, 2),
+            "muxdemux": (1, 2),
+            "pipeline": (0, 0),
+        }
+        for mname, cdef in self.processing_modules.items():
+            ov_in, ov_out = default_pin_overrides.get(mname, (1, 1))
+            if cdef.defaults.get("num_input_pins") is None:
+                cdef.defaults["num_input_pins"] = ov_in
+            if cdef.defaults.get("num_output_pins") is None:
+                cdef.defaults["num_output_pins"] = ov_out
+
+        in_by_mod: Dict[str, List[ConfigNode]] = {m: [] for m in self.processing_modules}
+        out_by_mod: Dict[str, List[ConfigNode]] = {m: [] for m in self.processing_modules}
+
+        search_dirs = [
+            "include",
+            "include/common",
+            "include/components",
+            "include/controls",
+            "include/pipelines",
+            "include/pipelines/cavs",
+            "include/bench",
+            "platform",
+            "platform/intel",
+        ]
+
+        def add_fmt_cfg(target_list: List[ConfigNode], cfg_n: ConfigNode) -> None:
+            if any(
+                ch.node_type == "scalar"
+                or ch.key.startswith(("in_", "out_", "input_pin", "output_pin", "ibs", "obs"))
+                for ch in cfg_n.children
+            ):
+                target_list.append(cfg_n.clone())
+            else:
+                for ch in cfg_n.children:
+                    target_list.append(ch.clone())
+
+        # Seed from any format objects already embedded inside Class.Widget.<mname>
+        for mname, cdef in self.processing_modules.items():
+            for sub in cdef.sub_objects:
+                if "input_audio_format" in sub.key:
+                    add_fmt_cfg(in_by_mod[mname], sub)
+                elif "output_audio_format" in sub.key:
+                    add_fmt_cfg(out_by_mod[mname], sub)
+
+        def extract_from_widget_stmts(mname: str, stmts: List[AstStmt], cur_file: str) -> None:
+            if mname not in self.processing_modules:
+                return
+            for st in stmts:
+                if st.stmt_type == "block" and st.key == "{}":
+                    extract_from_widget_stmts(mname, st.children, cur_file)
+                elif st.stmt_type == "include":
+                    inc_p = self.resolve_include(st.key, search_dirs, cur_file)
+                    if inc_p:
+                        extract_from_widget_stmts(mname, self.get_ast(inc_p), inc_p)
+                elif st.stmt_type == "block" and st.key.startswith("IncludeByKey."):
+                    for ch in st.children:
+                        if ch.stmt_type == "kv" and ch.value:
+                            for bfmt in ("s16", "s24", "s32"):
+                                val = str(ch.value).replace("$BENCH_MODULE_FORMAT", bfmt)
+                                inc_p = self.resolve_include(val, search_dirs, cur_file)
+                                if inc_p:
+                                    extract_from_widget_stmts(mname, self.get_ast(inc_p), inc_p)
+                                if "$BENCH_MODULE_FORMAT" not in str(ch.value):
+                                    break
+                        elif ch.stmt_type == "block":
+                            extract_from_widget_stmts(mname, ch.children, cur_file)
+                elif st.stmt_type in ("block", "array"):
+                    if "input_audio_format" in st.key:
+                        add_fmt_cfg(in_by_mod[mname], self._ast_to_config_node(st, origin="default"))
+                    elif "output_audio_format" in st.key:
+                        add_fmt_cfg(out_by_mod[mname], self._ast_to_config_node(st, origin="default"))
+
+        def walk_file_stmts(stmts: List[AstStmt], cur_file: str) -> None:
+            for st in stmts:
+                if st.stmt_type in ("block", "array"):
+                    parts = split_dotted_key(st.key)
+                    if len(parts) >= 2 and parts[0] == "Object" and parts[1] == "Widget":
+                        if len(parts) == 2:
+                            for wch in st.children:
+                                wp = split_dotted_key(wch.key)
+                                if wp:
+                                    extract_from_widget_stmts(wp[0], wch.children, cur_file)
+                        else:
+                            extract_from_widget_stmts(parts[2], st.children, cur_file)
+                    else:
+                        walk_file_stmts(st.children, cur_file)
+
+        # Scan all pipeline widget definitions
+        for pdef in self.pipeline_classes.values():
+            for w in pdef.widgets:
+                extract_from_widget_stmts(str(w["class_name"]), w["stmts"], pdef.source_file)
+
+        # Scan bench, development, and production .conf files
+        for sub_dir_name in ("include/bench", "development", "production"):
+            sdir = os.path.join(self.root_dir, sub_dir_name)
+            if not os.path.isdir(sdir):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(sdir):
+                for fname in sorted(filenames):
+                    if fname.endswith(".conf"):
+                        fpath = os.path.join(dirpath, fname)
+                        walk_file_stmts(self.get_ast(fpath), fpath)
+
+        def dedup_entries(entries: List[ConfigNode], prefix: str) -> List[ConfigNode]:
+            pin_key = "input_pin_index" if prefix == "in" else "output_pin_index"
+            seen: Set[Tuple[str, ...]] = set()
+            unique: List[ConfigNode] = []
+            for e in entries:
+                p_idx = str(e.get_scalar(pin_key, "0")).strip()
+                r_ch = e.get_child(f"{prefix}_rate")
+                if r_ch and r_ch.children:
+                    r_sig = ",".join(str(x.key or x.value) for x in r_ch.children)
+                else:
+                    r_sig = str(e.get_scalar(f"{prefix}_rate", "48000"))
+                c_ch = e.get_child(f"{prefix}_channels")
+                if c_ch and c_ch.children:
+                    c_sig = ",".join(str(x.key or x.value) for x in c_ch.children)
+                else:
+                    c_sig = str(e.get_scalar(f"{prefix}_channels", "2"))
+                b_sig = str(e.get_scalar(f"{prefix}_bit_depth", "16"))
+                vb_sig = str(e.get_scalar(f"{prefix}_valid_bit_depth", b_sig))
+                st_sig = str(e.get_scalar(f"{prefix}_sample_type", "LSB_INTEGER"))
+                il_sig = str(e.get_scalar(f"{prefix}_interleaving_style", "interleaved"))
+                sig = (p_idx, r_sig, c_sig, b_sig, vb_sig, st_sig, il_sig)
+                if sig not in seen:
+                    seen.add(sig)
+                    clone_e = e.clone()
+                    clone_e.key = f"[{len(unique)}]"
+                    if clone_e.get_scalar(pin_key) is None:
+                        clone_e.set_scalar(pin_key, "0", origin="default")
+                    if clone_e.get_scalar(f"{prefix}_rate") is None and clone_e.get_child(f"{prefix}_rate") is None:
+                        clone_e.set_scalar(f"{prefix}_rate", "48000", origin="default")
+                    if clone_e.get_scalar(f"{prefix}_channels") is None and clone_e.get_child(f"{prefix}_channels") is None:
+                        clone_e.set_scalar(f"{prefix}_channels", "2", origin="default")
+                    if clone_e.get_scalar(f"{prefix}_bit_depth") is None:
+                        clone_e.set_scalar(f"{prefix}_bit_depth", "16", origin="default")
+                    if clone_e.get_scalar(f"{prefix}_valid_bit_depth") is None:
+                        clone_e.set_scalar(
+                            f"{prefix}_valid_bit_depth",
+                            str(clone_e.get_scalar(f"{prefix}_bit_depth", "16")),
+                            origin="default",
+                        )
+                    if clone_e.get_scalar(f"{prefix}_interleaving_style") is None:
+                        clone_e.set_scalar(f"{prefix}_interleaving_style", "interleaved", origin="default")
+                    unique.append(clone_e)
+            return unique
+
+        def make_default_entries(mname: str, prefix: str, num_pins: int) -> List[ConfigNode]:
+            pin_key = "input_pin_index" if prefix == "in" else "output_pin_index"
+            depths = [(24, 32)] if mname == "muxdemux" else [(16, 16), (24, 32), (32, 32)]
+            res: List[ConfigNode] = []
+            for p_idx in range(max(1, min(num_pins, 2))):
+                for vb, b in depths:
+                    entry = ConfigNode(key=f"[{len(res)}]", node_type="object", category_info="default", origin="default")
+                    entry.set_scalar(pin_key, str(p_idx), origin="default")
+                    entry.set_scalar(f"{prefix}_rate", "48000", origin="default")
+                    entry.set_scalar(f"{prefix}_channels", "2", origin="default")
+                    entry.set_scalar(f"{prefix}_bit_depth", str(b), origin="default")
+                    entry.set_scalar(f"{prefix}_valid_bit_depth", str(vb), origin="default")
+                    entry.set_scalar(f"{prefix}_interleaving_style", "interleaved", origin="default")
+                    entry.set_scalar(f"{prefix}_sample_type", "LSB_INTEGER", origin="default")
+                    res.append(entry)
+            return res
+
+        for mname, cdef in self.processing_modules.items():
+            num_in = int(str(cdef.defaults.get("num_input_pins", 1) or 0))
+            num_out = int(str(cdef.defaults.get("num_output_pins", 1) or 0))
+
+            in_unique = dedup_entries(in_by_mod[mname], "in") if num_in > 0 else []
+            out_unique = dedup_entries(out_by_mod[mname], "out") if num_out > 0 else []
+
+            if num_in > 0 and not in_unique:
+                in_unique = make_default_entries(mname, "in", num_in)
+            if num_out > 0 and not out_unique:
+                out_unique = make_default_entries(mname, "out", num_out)
+
+            # Remove any existing input/output_audio_format sub-objects and replace with aggregated format arrays
+            cdef.sub_objects = [
+                s for s in cdef.sub_objects
+                if "input_audio_format" not in s.key and "output_audio_format" not in s.key
+            ]
+            if in_unique:
+                in_arr = ConfigNode(
+                    key="Object.Base.input_audio_format",
+                    node_type="array",
+                    category_info=f"{len(in_unique)} formats",
+                    origin="default",
+                    children=in_unique,
+                )
+                cdef.sub_objects.append(in_arr)
+                if cdef.defaults.get("num_input_audio_formats") is None:
+                    cdef.defaults["num_input_audio_formats"] = len(in_unique)
+            if out_unique:
+                out_arr = ConfigNode(
+                    key="Object.Base.output_audio_format",
+                    node_type="array",
+                    category_info=f"{len(out_unique)} formats",
+                    origin="default",
+                    children=out_unique,
+                )
+                cdef.sub_objects.append(out_arr)
+                if cdef.defaults.get("num_output_audio_formats") is None:
+                    cdef.defaults["num_output_audio_formats"] = len(out_unique)
+
+            self._rebuild_class_config_tree(cdef)
+
     def _extract_classes_from_file(self, fpath: str) -> None:
         stmts = self.get_ast(fpath)
         rel_path = os.path.relpath(fpath, self.root_dir)
@@ -999,7 +1218,7 @@ class Topology2Workspace:
             )
         return vm
 
-    def build_graph_for_module(self, module_name: str, include_testbench_io: bool = True) -> GraphViewModel:
+    def build_graph_for_module(self, module_name: str, include_testbench_io: bool = False) -> GraphViewModel:
         """Build a graph representing a Processing Module Class.Widget.<name> (Pane 2)."""
         cdef = self.processing_modules[module_name]
         vm = GraphViewModel(
@@ -1009,10 +1228,20 @@ class Topology2Workspace:
             source_file=cdef.source_file,
             root_config=cdef.config_tree.clone(),
         )
-        num_in = int(cdef.defaults.get("num_input_pins", 1) or 1)
-        num_out = int(cdef.defaults.get("num_output_pins", 1) or 1)
-        in_ports = [GraphPort(f"in{i}", f"in.{i}", "in", "audio") for i in range(max(1, num_in))]
-        out_ports = [GraphPort(f"out{i}", f"out.{i}", "out", "audio") for i in range(max(1, num_out))]
+        raw_in = cdef.defaults.get("num_input_pins")
+        raw_out = cdef.defaults.get("num_output_pins")
+        num_in = (
+            int(raw_in)
+            if raw_in is not None and str(raw_in).isdigit()
+            else (0 if cdef.name in ("siggen", "pipeline") else 1)
+        )
+        num_out = (
+            int(raw_out)
+            if raw_out is not None and str(raw_out).isdigit()
+            else (0 if cdef.name in ("wov", "pipeline") else 1)
+        )
+        in_ports = [GraphPort(f"in{i}", f"in.{i}", "in", "audio") for i in range(num_in)]
+        out_ports = [GraphPort(f"out{i}", f"out.{i}", "out", "audio") for i in range(num_out)]
 
         wtype = cdef.defaults.get("type", "effect")
         cpc = cdef.defaults.get("cpc", "")
@@ -1044,6 +1273,7 @@ class Topology2Workspace:
         )
         vm.nodes[node_id] = main_node
         self.attach_widget_kcontrol_nodes(vm, main_node)
+        self.attach_module_pin_format_nodes(vm, main_node)
         if include_testbench_io:
             self.attach_host_copier_io_nodes(vm)
         return vm
@@ -2817,6 +3047,348 @@ class Topology2Workspace:
         ch_str = f"{min_c}ch" if min_c == max_c else f"{min_c}-{max_c}ch"
 
         return f"{fmt_str} {rate_str} {ch_str}"
+
+    @staticmethod
+    def extract_pin_format_details(
+        cfg: ConfigNode,
+        direction: str,
+        pin_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Extract detailed formats, rates, channels, and interleaving style for a module input or output pin."""
+        prefix = "in" if direction == "in" else "out"
+        pin_key = "input_pin_index" if direction == "in" else "output_pin_index"
+        target_keys = (
+            ("Object.Base.input_audio_format", "CombineArrays.Object.Base.input_audio_format")
+            if direction == "in"
+            else ("Object.Base.output_audio_format", "CombineArrays.Object.Base.output_audio_format")
+        )
+        fnodes = [c for c in cfg.children if c.key in target_keys and c.children]
+        all_entries: List[ConfigNode] = []
+        for fnode in fnodes:
+            for ch in fnode.children:
+                all_entries.append(ch)
+
+        matched_entries: List[ConfigNode] = []
+        if pin_index is not None and all_entries:
+            for e in all_entries:
+                p_raw = str(e.get_scalar(pin_key, "0")).strip()
+                if p_raw.isdigit() and int(p_raw) == pin_index:
+                    matched_entries.append(e)
+        if not matched_entries:
+            matched_entries = list(all_entries)
+
+        def extract_ints(entry: ConfigNode, field_name: str, default_val: int) -> List[int]:
+            ch = entry.get_child(field_name)
+            if ch is None:
+                return [default_val]
+            if ch.node_type == "scalar":
+                s = str(ch.value).strip()
+                return [int(s)] if s.isdigit() else [default_val]
+            vals: List[int] = []
+            for item in ch.children:
+                cand = str(item.key if item.key else item.value).strip()
+                if cand.isdigit():
+                    vals.append(int(cand))
+            return vals if vals else [default_val]
+
+        def fmt_khz(hz: int) -> str:
+            if hz % 1000 == 0:
+                return f"{hz // 1000}k"
+            return f"{hz / 1000:.1f}k".rstrip("0").rstrip(".")
+
+        rates: List[int] = []
+        chans: List[int] = []
+        depths: List[Tuple[int, int, str]] = []
+        styles: List[str] = []
+        sample_types: List[str] = []
+
+        for entry in matched_entries:
+            rates.extend(extract_ints(entry, f"{prefix}_rate", 48000))
+            chans.extend(extract_ints(entry, f"{prefix}_channels", 2))
+            b_list = extract_ints(entry, f"{prefix}_bit_depth", 16)
+            has_vb = entry.get_child(f"{prefix}_valid_bit_depth") is not None
+            vb_list = extract_ints(entry, f"{prefix}_valid_bit_depth", b_list[0]) if has_vb else list(b_list)
+            st_raw = str(entry.get_scalar(f"{prefix}_sample_type", "LSB_INTEGER")).strip()
+            st_up = st_raw.upper()
+            sp = "f" if "FLOAT" in st_up else ("u" if "UNSIGNED" in st_up else "s")
+            for b in b_list:
+                for vb in vb_list:
+                    depths.append((vb, b, sp))
+            il_raw = str(entry.get_scalar(f"{prefix}_interleaving_style", "interleaved")).strip().strip('"')
+            if il_raw and il_raw not in styles:
+                styles.append(il_raw)
+            st_clean = st_raw.replace("$SAMPLE_TYPE_", "").replace("_INTEGER", "_INT").strip()
+            if st_clean and st_clean not in sample_types:
+                sample_types.append(st_clean)
+
+        if not rates:
+            rates = [48000]
+        if not chans:
+            chans = [2]
+        if not depths:
+            depths = [(16, 16, "s"), (24, 32, "s"), (32, 32, "s")]
+        if not styles:
+            styles = ["interleaved"]
+        if not sample_types:
+            sample_types = ["LSB_INT"]
+
+        unique_depths = sorted(set(depths), key=lambda t: (t[0], t[1]))
+        fmt_tokens = [
+            f"{sp}{vb}/{b}" if vb != b else f"{sp}{vb}"
+            for vb, b, sp in unique_depths
+        ]
+        if len(fmt_tokens) == 1:
+            vb, b, _ = unique_depths[0]
+            formats_line = f"{fmt_tokens[0]} ({vb}-bit)" if vb == b else f"{fmt_tokens[0]} ({vb}-in-{b}b)"
+        elif len(fmt_tokens) <= 4:
+            formats_line = ", ".join(fmt_tokens)
+        else:
+            formats_line = f"{fmt_tokens[0]} .. {fmt_tokens[-1]}"
+
+        unique_rates = sorted(set(rates))
+        if len(unique_rates) == 1:
+            r0 = unique_rates[0]
+            rates_line = f"{r0 // 1000} kHz" if r0 % 1000 == 0 else f"{fmt_khz(r0)}Hz"
+        elif len(unique_rates) <= 3:
+            rates_line = ", ".join(fmt_khz(r) for r in unique_rates) + "Hz"
+        else:
+            rates_line = f"{fmt_khz(unique_rates[0])} – {fmt_khz(unique_rates[-1])}Hz ({len(unique_rates)})"
+
+        unique_chans = sorted(set(chans))
+        if len(unique_chans) == 1:
+            c0 = unique_chans[0]
+            ch_part = f"{c0} ch"
+        elif len(unique_chans) <= 3:
+            ch_part = ", ".join(str(c) for c in unique_chans) + " ch"
+        else:
+            ch_part = f"{unique_chans[0]}–{unique_chans[-1]} ch"
+
+        style_part = styles[0] if len(styles) == 1 else "/".join(styles)
+        channels_line = f"{ch_part} • {style_part}"
+
+        return {
+            "formats_line": formats_line,
+            "rates_line": rates_line,
+            "channels_line": channels_line,
+            "rates_all": ", ".join(f"{r} Hz" for r in unique_rates),
+            "channels_all": ", ".join(str(c) for c in unique_chans),
+            "formats_all": ", ".join(fmt_tokens),
+            "interleaving": ", ".join(styles),
+            "sample_types": ", ".join(sample_types),
+            "entries": matched_entries,
+        }
+
+    def attach_module_pin_format_nodes(self, vm: GraphViewModel, main_node: GraphNode) -> None:
+        """Attach left-hand Input Pin Format node(s) and right-hand Output Pin Format node(s) to main_node."""
+        num_in = len(main_node.in_ports)
+        num_out = len(main_node.out_ports)
+
+        def build_pin_node(
+            direction: str,
+            pin_indices: List[int],
+        ) -> GraphNode:
+            is_in = direction == "in"
+            side = "left" if is_in else "right"
+            p0 = pin_indices[0]
+            details = self.extract_pin_format_details(
+                main_node.config,
+                direction,
+                pin_index=p0 if len(pin_indices) == 1 else None,
+            )
+            if len(pin_indices) == 1:
+                pin_tag = f"{'in' if is_in else 'out'}.{p0}"
+                node_id = f"{main_node.id}.pin_{direction}.{p0}"
+                title = f"{'IN' if is_in else 'OUT'} Pin {p0} ({pin_tag})"
+            else:
+                p_last = pin_indices[-1]
+                pin_tag = f"{'in' if is_in else 'out'}.{p0}..{p_last}"
+                node_id = f"{main_node.id}.pin_{direction}.all"
+                title = f"{'IN' if is_in else 'OUT'} Pins {p0}–{p_last} ({len(pin_indices)}×)"
+
+            cfg_key = (
+                f"Object.Base.input_audio_format ({pin_tag})"
+                if is_in
+                else f"Object.Base.output_audio_format ({pin_tag})"
+            )
+            pin_cfg = ConfigNode(
+                key=cfg_key,
+                node_type="object",
+                category_info="Input Pin Audio Format" if is_in else "Output Pin Audio Format",
+                origin="default",
+            )
+            pin_cfg.set_scalar("side", side, category_info="Graph placement side", origin="default", is_immutable=True)
+            pin_cfg.set_scalar(
+                "direction",
+                "input" if is_in else "output",
+                category_info="Pin direction",
+                origin="default",
+                is_immutable=True,
+            )
+            pin_cfg.set_scalar(
+                "pin_index",
+                str(p0) if len(pin_indices) == 1 else f"{p0}..{pin_indices[-1]}",
+                category_info="Pin index on module",
+                origin="default",
+                is_immutable=True,
+            )
+            pin_cfg.set_scalar(
+                "formats_line",
+                str(details["formats_line"]),
+                category_info="Accepted sample formats / bit depths",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "rates_line",
+                str(details["rates_line"]),
+                category_info="Accepted sample rates",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "channels_line",
+                str(details["channels_line"]),
+                category_info="Accepted channel counts & interleaving",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "accepted_formats",
+                str(details["formats_all"]),
+                category_info="Supported PCM formats",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "accepted_rates",
+                str(details["rates_all"]),
+                category_info="Supported sampling rates (Hz)",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "accepted_channels",
+                str(details["channels_all"]),
+                category_info="Supported channel counts",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "interleaving_style",
+                str(details["interleaving"]),
+                category_info="Channel interleaving style",
+                origin="default",
+            )
+            pin_cfg.set_scalar(
+                "sample_type",
+                str(details["sample_types"]),
+                category_info="Sample encoding type",
+                origin="default",
+            )
+            entries = details.get("entries") or []
+            if entries:
+                fmt_group = ConfigNode(
+                    key="audio_format_configs",
+                    node_type="array",
+                    category_info=f"{len(entries)} format configs",
+                    origin="default",
+                )
+                for idx, ent in enumerate(entries):
+                    ec = ent.clone()
+                    ec.key = f"[{idx}]"
+                    fmt_group.children.append(ec)
+                pin_cfg.children.append(fmt_group)
+
+            if is_in:
+                in_ports: List[GraphPort] = []
+                out_ports = [
+                    GraphPort(f"out{i}", f"in.{p}", "out", "audio")
+                    for i, p in enumerate(pin_indices)
+                ]
+            else:
+                in_ports = [
+                    GraphPort(f"in{i}", f"out.{p}", "in", "audio")
+                    for i, p in enumerate(pin_indices)
+                ]
+                out_ports = []
+
+            return GraphNode(
+                id=node_id,
+                title=title,
+                subtitle=f"Fmt: {details['formats_line']}",
+                category="pin_fmt_in" if is_in else "pin_fmt_out",
+                class_category="PinFormat",
+                class_name="input_audio_format" if is_in else "output_audio_format",
+                instance_id=str(p0),
+                pipeline_id=None,
+                parent_node_id=main_node.id,
+                in_ports=in_ports,
+                out_ports=out_ports,
+                in_fmt_badge=f"Rate: {details['rates_line']}",
+                out_fmt_badge=f"Ch: {details['channels_line']}",
+                badges=[
+                    f"Fmt: {details['formats_line']}",
+                    f"Rate: {details['rates_line']}",
+                    f"Ch: {details['channels_line']}",
+                ],
+                config=pin_cfg,
+                class_def=self.base_classes.get(
+                    "Base.input_audio_format" if is_in else "Base.output_audio_format"
+                ),
+                source_file=main_node.source_file,
+            )
+
+        # 1. Left-hand Input Pin Format node(s) connected to main_node's input pin(s)
+        if num_in > 0:
+            if num_in <= 2:
+                for p_idx in range(num_in):
+                    pnode = build_pin_node("in", [p_idx])
+                    vm.nodes[pnode.id] = pnode
+                    vm.edges.append(
+                        GraphEdge(
+                            id=f"pin_in_edge_{main_node.id}_{p_idx}",
+                            source_node=pnode.id,
+                            sink_node=main_node.id,
+                            source_port="out0",
+                            sink_port=f"in{p_idx}",
+                        )
+                    )
+            else:
+                pnode = build_pin_node("in", list(range(num_in)))
+                vm.nodes[pnode.id] = pnode
+                for p_idx in range(num_in):
+                    vm.edges.append(
+                        GraphEdge(
+                            id=f"pin_in_edge_{main_node.id}_{p_idx}",
+                            source_node=pnode.id,
+                            sink_node=main_node.id,
+                            source_port=f"out{p_idx}",
+                            sink_port=f"in{p_idx}",
+                        )
+                    )
+
+        # 2. Right-hand Output Pin Format node(s) connected from main_node's output pin(s)
+        if num_out > 0:
+            if num_out <= 2:
+                for p_idx in range(num_out):
+                    pnode = build_pin_node("out", [p_idx])
+                    vm.nodes[pnode.id] = pnode
+                    vm.edges.append(
+                        GraphEdge(
+                            id=f"pin_out_edge_{main_node.id}_{p_idx}",
+                            source_node=main_node.id,
+                            sink_node=pnode.id,
+                            source_port=f"out{p_idx}",
+                            sink_port="in0",
+                        )
+                    )
+            else:
+                pnode = build_pin_node("out", list(range(num_out)))
+                vm.nodes[pnode.id] = pnode
+                for p_idx in range(num_out):
+                    vm.edges.append(
+                        GraphEdge(
+                            id=f"pin_out_edge_{main_node.id}_{p_idx}",
+                            source_node=main_node.id,
+                            sink_node=pnode.id,
+                            source_port=f"out{p_idx}",
+                            sink_port=f"in{p_idx}",
+                        )
+                    )
 
     @staticmethod
     def _match_widget_id(

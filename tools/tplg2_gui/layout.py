@@ -24,6 +24,9 @@ CTRL_GROUP_HDR = 15.0
 TB_IO_WIDTH = 224.0
 TB_IO_HEIGHT = 98.0
 TB_IO_GAP = 48.0
+PIN_FMT_WIDTH = 160.0
+PIN_FMT_HEIGHT = 76.0
+PIN_FMT_GAP = 32.0
 H_GAP = 72.0
 V_GAP = 28.0
 CONTAINER_PAD_X = 26.0
@@ -34,6 +37,8 @@ CONTAINER_GAP_Y = 48.0
 
 
 def _is_node_capture(vm: GraphViewModel, node: GraphNode) -> bool:
+    if vm.view_kind == "module":
+        return False
     if node.pipeline_id is not None and node.pipeline_id in vm.containers:
         if "capture" in vm.containers[node.pipeline_id].direction.lower():
             return True
@@ -70,22 +75,74 @@ def layout_graph(vm: GraphViewModel) -> None:
         any_cap = any(
             _is_node_capture(vm, n)
             for n in vm.nodes.values()
-            if n.class_category not in ("Control", "TestbenchIO")
+            if n.class_category not in ("Control", "TestbenchIO", "PinFormat")
         )
-        non_tb_ids = [nid for nid, n in vm.nodes.items() if n.class_category != "TestbenchIO"]
+        non_tb_ids = [
+            nid
+            for nid, n in vm.nodes.items()
+            if n.class_category not in ("TestbenchIO", "PinFormat")
+        ]
         has_left_tb = any(
             n.class_category == "TestbenchIO"
             and str(n.config.get_scalar("side", "left")).lower() == "left"
             for n in vm.nodes.values()
         )
-        sx = (60.0 + TB_IO_WIDTH + TB_IO_GAP) if has_left_tb else 60.0
+        left_pin_nodes = [
+            n
+            for n in vm.nodes.values()
+            if n.class_category == "PinFormat"
+            and str(n.config.get_scalar("side", "left")).lower() == "left"
+        ]
+        if has_left_tb:
+            sx = 60.0 + TB_IO_WIDTH + TB_IO_GAP
+        elif left_pin_nodes:
+            max_pin_w = max(n.width for n in left_pin_nodes)
+            sx = 40.0 + max_pin_w + PIN_FMT_GAP
+        else:
+            sx = 60.0
         _layout_flat_dag(vm, non_tb_ids, start_x=sx, start_y=60.0, is_capture=any_cap)
 
-    # 3. Position TestbenchIO nodes to the left of host-copiers and right of dai/alh-copiers
+    # 3. Position TestbenchIO nodes and Module PinFormat nodes relative to their parent widget
     _position_testbench_io_nodes(vm)
+    _position_pin_format_nodes(vm)
 
     # 4. Assign distinct source/sink pins to multi-edge nodes ordered top-to-bottom to avoid pin collisions
     _assign_edge_ports(vm)
+
+
+def _position_pin_format_nodes(vm: GraphViewModel) -> None:
+    """Position left-hand Input PinFormat nodes and right-hand Output PinFormat nodes aligned with module pins."""
+    by_parent_side: Dict[Tuple[str, str], List[GraphNode]] = defaultdict(list)
+    for node in vm.nodes.values():
+        if node.class_category != "PinFormat" or not node.parent_node_id:
+            continue
+        side = str(node.config.get_scalar("side", "left")).lower()
+        by_parent_side[(node.parent_node_id, side)].append(node)
+
+    for (parent_id, side), pnodes in by_parent_side.items():
+        parent = vm.nodes.get(parent_id)
+        if not parent:
+            continue
+        pnodes.sort(key=lambda n: (int(n.instance_id) if n.instance_id.isdigit() else 0, n.id))
+        if len(pnodes) == 1:
+            pnode = pnodes[0]
+            if side == "right":
+                pnode.x = parent.x + parent.width + PIN_FMT_GAP
+            else:
+                pnode.x = parent.x - pnode.width - PIN_FMT_GAP
+            pnode.y = parent.y + (parent.height - pnode.height) / 2.0
+        else:
+            gap_y = 12.0
+            total_h = sum(n.height for n in pnodes) + gap_y * (len(pnodes) - 1)
+            mid_y = parent.y + parent.height / 2.0
+            cur_y = max(16.0, mid_y - total_h / 2.0)
+            for pnode in pnodes:
+                if side == "right":
+                    pnode.x = parent.x + parent.width + PIN_FMT_GAP
+                else:
+                    pnode.x = parent.x - pnode.width - PIN_FMT_GAP
+                pnode.y = cur_y
+                cur_y += pnode.height + gap_y
 
 
 def _position_testbench_io_nodes(vm: GraphViewModel) -> None:
@@ -176,6 +233,35 @@ def _compute_node_geometry(node: GraphNode, is_capture: bool = False) -> None:
         for port in node.in_ports:
             port.rel_x = port_x
             port.rel_y = node.height / 2.0
+        return
+
+    if node.class_category == "PinFormat":
+        f_line = str(node.config.get_scalar("formats_line", ""))
+        r_line = str(node.config.get_scalar("rates_line", ""))
+        c_line = str(node.config.get_scalar("channels_line", ""))
+        title_w = len(node.title) * 6.8 + 20.0
+        l1_w = len(f"Fmt: {f_line}") * 6.3 + 20.0
+        l2_w = len(f"Rate: {r_line}") * 6.3 + 20.0
+        l3_w = len(f"Ch: {c_line}") * 6.3 + 20.0
+        node.width = max(PIN_FMT_WIDTH, min(204.0, max(title_w, l1_w, l2_w, l3_w)))
+        num_ports = max(len(node.in_ports), len(node.out_ports), 1)
+        node.height = max(PIN_FMT_HEIGHT, (34.0 + num_ports * 18.0) if num_ports > 2 else PIN_FMT_HEIGHT)
+        side = str(node.config.get_scalar("side", "left")).lower()
+        port_x = 0.0 if side == "right" else node.width
+        out_count = len(node.out_ports)
+        for i, port in enumerate(node.out_ports):
+            port.rel_x = port_x
+            if out_count == 1:
+                port.rel_y = node.height / 2.0
+            else:
+                port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / out_count)
+        in_count = len(node.in_ports)
+        for i, port in enumerate(node.in_ports):
+            port.rel_x = port_x
+            if in_count == 1:
+                port.rel_y = node.height / 2.0
+            else:
+                port.rel_y = 34.0 + (i + 0.5) * ((node.height - 38.0) / in_count)
         return
 
     if node.class_category == "Control":
@@ -282,7 +368,7 @@ def _layout_flat_dag(
         node = vm.nodes[nid]
         if node.class_category == "Control" and node.parent_node_id and node.parent_node_id in id_set:
             ctrl_by_parent[node.parent_node_id].append(nid)
-        elif node.class_category != "TestbenchIO":
+        elif node.class_category not in ("TestbenchIO", "PinFormat"):
             main_ids.append(nid)
 
     if not main_ids:
@@ -415,7 +501,7 @@ def _layout_with_containers(vm: GraphViewModel) -> None:
     orphan_ids: List[str] = []
 
     for nid, node in vm.nodes.items():
-        if node.class_category == "TestbenchIO":
+        if node.class_category in ("TestbenchIO", "PinFormat"):
             continue
         if node.pipeline_id is not None and node.pipeline_id in vm.containers:
             by_pipe[node.pipeline_id].append(nid)

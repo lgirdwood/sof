@@ -188,26 +188,32 @@ class LeftNavigationPanel(Gtk.Box):
         )
 
         # Pack the 4 vertical sub-panes into nested vertical Gtk.Paned so each is resizable
-        vpaned_top = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        vpaned_top.set_wide_handle(True)
-        vpaned_top.set_start_child(pane1)
-        vpaned_top.set_end_child(pane2)
-        vpaned_top.set_position(165)
+        self.vpaned_top = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        self.vpaned_top.set_wide_handle(True)
+        self.vpaned_top.set_resize_start_child(False)
+        self.vpaned_top.set_resize_end_child(True)
+        self.vpaned_top.set_start_child(pane1)
+        self.vpaned_top.set_end_child(pane2)
+        self.vpaned_top.set_position(165)
 
-        vpaned_bot = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        vpaned_bot.set_wide_handle(True)
-        vpaned_bot.set_start_child(pane3)
-        vpaned_bot.set_end_child(pane4)
-        vpaned_bot.set_position(185)
+        self.vpaned_bot = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        self.vpaned_bot.set_wide_handle(True)
+        self.vpaned_bot.set_resize_start_child(False)
+        self.vpaned_bot.set_resize_end_child(True)
+        self.vpaned_bot.set_start_child(pane3)
+        self.vpaned_bot.set_end_child(pane4)
+        self.vpaned_bot.set_position(185)
 
-        vpaned_main = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
-        vpaned_main.set_wide_handle(True)
-        vpaned_main.set_vexpand(True)
-        vpaned_main.set_start_child(vpaned_top)
-        vpaned_main.set_end_child(vpaned_bot)
-        vpaned_main.set_position(345)
+        self.vpaned_main = Gtk.Paned.new(Gtk.Orientation.VERTICAL)
+        self.vpaned_main.set_wide_handle(True)
+        self.vpaned_main.set_vexpand(True)
+        self.vpaned_main.set_resize_start_child(False)
+        self.vpaned_main.set_resize_end_child(True)
+        self.vpaned_main.set_start_child(self.vpaned_top)
+        self.vpaned_main.set_end_child(self.vpaned_bot)
+        self.vpaned_main.set_position(345)
 
-        self.main_notebook.append_page(vpaned_main, Gtk.Label(label="File View"))
+        self.main_notebook.append_page(self.vpaned_main, Gtk.Label(label="File View"))
         self.compile_tab_lbl: Optional[Gtk.Label] = None
         self._compile_page_idx: int = -1
         self.main_notebook.set_current_page(0)
@@ -241,16 +247,15 @@ class LeftNavigationPanel(Gtk.Box):
         tree.set_headers_visible(True)
         tree.set_enable_tree_lines(True)
 
-        # Column 0: Name (auto-sized to fit full object/class/file text)
+        # Column 0: Name (auto-sized initially, or fixed when resized/restored)
         r0 = Gtk.CellRendererText()
         r0.set_padding(4, 2)
         c0 = Gtk.TreeViewColumn(col_titles[0], r0, text=0)
         c0.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         c0.set_resizable(True)
-        c0.set_expand(True)
         tree.append_column(c0)
 
-        # Column 1: Summary (auto-sized to fit full summary/defines text)
+        # Column 1: Summary (auto-sized initially, or fixed when resized/restored)
         r1 = Gtk.CellRendererText()
         r1.set_padding(4, 2)
         r1.set_property("foreground", "#8fa3bf")
@@ -259,7 +264,7 @@ class LeftNavigationPanel(Gtk.Box):
         c1.set_resizable(True)
         tree.append_column(c1)
 
-        tree.connect("row-expanded", lambda tv, _it, _path: tv.columns_autosize())
+        tree.connect("row-expanded", lambda tv, _it, _path: self._maybe_autosize_columns(tv))
 
         sel = tree.get_selection()
         sel.set_mode(Gtk.SelectionMode.SINGLE)
@@ -349,9 +354,15 @@ class LeftNavigationPanel(Gtk.Box):
             self._populate_pipelines()
             self._populate_machine_topologies()
             for tv in (self.base_tree, self.mod_tree, self.pipe_tree, self.top_tree):
-                tv.columns_autosize()
+                self._maybe_autosize_columns(tv)
         finally:
             self._updating_selection = False
+
+    @staticmethod
+    def _maybe_autosize_columns(tv: Gtk.TreeView) -> None:
+        if any(c.get_sizing() == Gtk.TreeViewColumnSizing.FIXED for c in tv.get_columns()):
+            return
+        tv.columns_autosize()
 
     def _populate_object_modules(self) -> None:
         self._hide_hover_zoom_box()
@@ -818,6 +829,16 @@ class LeftNavigationPanel(Gtk.Box):
                     f"Pins: {n_in} in / {n_out} out  |  "
                     f"Audio Formats: {in_fmts} in / {out_fmts} out"
                 )
+                if int(str(n_in or 0)) > 0:
+                    in_det = self.workspace.extract_pin_format_details(cdef.config_tree, "in")
+                    meta_lines.append(
+                        f"IN Pin(s): Fmt {in_det['formats_line']}  •  Rate {in_det['rates_line']}  •  Ch {in_det['channels_line']}"
+                    )
+                if int(str(n_out or 0)) > 0:
+                    out_det = self.workspace.extract_pin_format_details(cdef.config_tree, "out")
+                    meta_lines.append(
+                        f"OUT Pin(s): Fmt {out_det['formats_line']}  •  Rate {out_det['rates_line']}  •  Ch {out_det['channels_line']}"
+                    )
                 ctrl_names = []
                 for ctrl in cdef.controls:
                     cname = ctrl.get("name") or f"{ctrl.get('type', 'control')}.{ctrl.get('index', '0')}"

@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import json
 import os
 import shutil
 import subprocess
 import threading
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -92,8 +93,34 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application, initial_dir: Optional[str] = None):
         super().__init__(application=app, title="SOF Topology2 Visual Graph Editor & Testbench")
         self.set_decorated(True)
-        self.set_default_size(1560, 940)
-        self.maximize()
+
+        self._ui_window_width: int = 1560
+        self._ui_window_height: int = 940
+        self._ui_window_maximized: bool = True
+        self._saved_total_w: int = 0
+        self._saved_total_h: int = 0
+        self._saved_hpaned_outer_pos: Optional[int] = None
+        self._saved_hpaned_inner_pos: Optional[int] = None
+        self._saved_center_vpaned_pos: Optional[int] = None
+        self._hpaned_outer_ratio: float = 0.25
+        self._hpaned_inner_ratio: float = 0.50
+        self._center_vpaned_ratio: float = 0.68
+        self._saved_left_vpaned_main_pos: int = 345
+        self._saved_left_vpaned_top_pos: int = 165
+        self._saved_left_vpaned_bot_pos: int = 185
+        self._saved_treeview_col_widths: Dict[str, List[int]] = {}
+        self._saved_open_tabs: List[Dict[str, Any]] = []
+        self._saved_active_tab_key: str = ""
+        self._restoring_session_tabs: bool = False
+        self._applying_programmatic_paned_pos: bool = True
+        self._paned_layout_ready: bool = False
+        self._paned_sync_seq: int = 0
+        self._save_ui_state_timer_id: Optional[int] = None
+        self._load_ui_state()
+
+        self.set_default_size(self._ui_window_width, self._ui_window_height)
+        if self._ui_window_maximized:
+            self.maximize()
 
         win_key = Gtk.EventControllerKey.new()
         win_key.connect("key-pressed", self._on_window_key_pressed)
@@ -673,14 +700,18 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.hpaned_outer.set_wide_handle(True)
         self.hpaned_outer.set_resize_start_child(False)
         self.hpaned_outer.set_resize_end_child(True)
-        self.hpaned_outer.set_position(390)
+        self.hpaned_outer.set_position(
+            self._saved_hpaned_outer_pos if self._saved_hpaned_outer_pos is not None else 390
+        )
 
         # Inner horizontal paned: [Middle Graph + Waveforms Panel (50%)] | [Right Notebook (25%)]
         self.hpaned_inner = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
         self.hpaned_inner.set_wide_handle(True)
-        self.hpaned_inner.set_resize_start_child(True)
-        self.hpaned_inner.set_resize_end_child(False)
-        self.hpaned_inner.set_position(780)
+        self.hpaned_inner.set_resize_start_child(False)
+        self.hpaned_inner.set_resize_end_child(True)
+        self.hpaned_inner.set_position(
+            self._saved_hpaned_inner_pos if self._saved_hpaned_inner_pos is not None else 780
+        )
 
         # 1. Left Hand Panel (Object View, File View & Compile notebook) wrapped in high-level panel border
         self.left_panel = LeftNavigationPanel(
@@ -688,6 +719,9 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_add_module_requested=self._on_add_module_requested,
             on_add_pipeline_requested=self._on_add_pipeline_requested,
         )
+        self.left_panel.vpaned_main.set_position(self._saved_left_vpaned_main_pos)
+        self.left_panel.vpaned_top.set_position(self._saved_left_vpaned_top_pos)
+        self.left_panel.vpaned_bot.set_position(self._saved_left_vpaned_bot_pos)
         left_panel_frame = Gtk.Frame()
         left_panel_frame.add_css_class("high-level-panel")
         left_panel_frame.set_margin_start(4)
@@ -706,9 +740,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.center_vpaned.set_wide_handle(True)
         self.center_vpaned.set_vexpand(True)
         self.center_vpaned.set_hexpand(True)
-        self.center_vpaned.set_resize_start_child(True)
-        self.center_vpaned.set_resize_end_child(False)
-        self.center_vpaned.set_position(580)
+        self.center_vpaned.set_resize_start_child(False)
+        self.center_vpaned.set_resize_end_child(True)
+        self.center_vpaned.set_position(
+            self._saved_center_vpaned_pos if self._saved_center_vpaned_pos is not None else 580
+        )
 
         self.graph_notebook = Gtk.Notebook()
         self.graph_notebook.set_scrollable(True)
@@ -1126,12 +1162,278 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         self.hpaned_outer.set_start_child(left_panel_frame)
         self.hpaned_outer.set_end_child(self.hpaned_inner)
+        self.hpaned_outer.connect("notify::position", self._on_main_paned_position_changed)
+        self.hpaned_inner.connect("notify::position", self._on_main_paned_position_changed)
+        self.center_vpaned.connect("notify::position", self._on_main_paned_position_changed)
+        self.left_panel.vpaned_main.connect("notify::position", self._on_left_paned_position_changed)
+        self.left_panel.vpaned_top.connect("notify::position", self._on_left_paned_position_changed)
+        self.left_panel.vpaned_bot.connect("notify::position", self._on_left_paned_position_changed)
+        self._apply_saved_treeview_column_widths()
+        for tv_name, tv in self._get_named_treeviews().items():
+            for col_idx, col in enumerate(tv.get_columns()):
+                col.connect("notify::width", self._on_treeview_column_width_changed, tv_name, col_idx)
+                col.connect("notify::fixed-width", self._on_treeview_column_width_changed, tv_name, col_idx)
         self.hpaned_outer.add_tick_callback(self._on_outer_paned_tick)
 
         self.set_child(self.hpaned_outer)
 
+    def _get_named_treeviews(self) -> Dict[str, Gtk.TreeView]:
+        return {
+            "right_inspector": self.right_inspector.tree,
+            "left_base": self.left_panel.base_tree,
+            "left_mod": self.left_panel.mod_tree,
+            "left_pipe": self.left_panel.pipe_tree,
+            "left_top": self.left_panel.top_tree,
+        }
+
+    def _apply_saved_treeview_column_widths(self) -> None:
+        if not self._saved_treeview_col_widths:
+            return
+        for tv_name, tv in self._get_named_treeviews().items():
+            widths = self._saved_treeview_col_widths.get(tv_name)
+            if not isinstance(widths, list):
+                continue
+            for col, w in zip(tv.get_columns(), widths):
+                if isinstance(w, (int, float)) and int(w) > 20:
+                    col.set_expand(False)
+                    col.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+                    col.set_fixed_width(int(w))
+
+    def _capture_treeview_column_widths(self, only_tv_name: Optional[str] = None) -> None:
+        named_tvs = self._get_named_treeviews()
+        targets = (
+            [(only_tv_name, named_tvs[only_tv_name])]
+            if only_tv_name and only_tv_name in named_tvs
+            else list(named_tvs.items())
+        )
+        for tv_name, tv in targets:
+            cols = tv.get_columns()
+            prev = list(self._saved_treeview_col_widths.get(tv_name, []))
+            while len(prev) < len(cols):
+                prev.append(0)
+            updated = False
+            for idx, col in enumerate(cols):
+                if col.get_sizing() == Gtk.TreeViewColumnSizing.FIXED and col.get_fixed_width() > 20:
+                    w = int(col.get_fixed_width())
+                else:
+                    # Do not record auto-stretched width of the last column unless it is FIXED
+                    if idx == len(cols) - 1 and len(cols) > 1:
+                        w = int(col.get_fixed_width()) if col.get_fixed_width() > 20 else 0
+                    else:
+                        w = int(col.get_width())
+                if w > 20 and prev[idx] != w:
+                    prev[idx] = w
+                    updated = True
+            if any(x > 20 for x in prev) and (updated or tv_name not in self._saved_treeview_col_widths):
+                self._saved_treeview_col_widths[tv_name] = prev
+
+    def _on_treeview_column_width_changed(
+        self,
+        _col: Gtk.TreeViewColumn,
+        _pspec: object,
+        tv_name: str,
+        _col_idx: int,
+    ) -> None:
+        if self._applying_programmatic_paned_pos or not self._paned_layout_ready:
+            return
+        self._capture_treeview_column_widths(only_tv_name=tv_name)
+        self._schedule_ui_state_save()
+
+    @staticmethod
+    def _get_ui_state_path() -> str:
+        override = os.environ.get("SOF_TPLG2_GUI_STATE_FILE")
+        if override:
+            return override
+        cfg_dir = os.path.join(GLib.get_user_config_dir(), "sof-tplg2-gui")
+        return os.path.join(cfg_dir, "ui_state.json")
+
+    def _load_ui_state(self) -> None:
+        """Load persisted window geometry and pane splitter positions from disk."""
+        path = self._get_ui_state_path()
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data: Dict[str, Any] = json.load(fh)
+            if not isinstance(data, dict):
+                return
+            w = int(data.get("window_width", self._ui_window_width))
+            h = int(data.get("window_height", self._ui_window_height))
+            if w > 300 and h > 200:
+                self._ui_window_width = w
+                self._ui_window_height = h
+            if "window_maximized" in data:
+                self._ui_window_maximized = bool(data["window_maximized"])
+            self._saved_total_w = int(data.get("saved_total_w", 0))
+            self._saved_total_h = int(data.get("saved_total_h", 0))
+            if "hpaned_outer_pos" in data and data["hpaned_outer_pos"] is not None:
+                self._saved_hpaned_outer_pos = max(80, int(data["hpaned_outer_pos"]))
+            if "hpaned_inner_pos" in data and data["hpaned_inner_pos"] is not None:
+                self._saved_hpaned_inner_pos = max(80, int(data["hpaned_inner_pos"]))
+            if "center_vpaned_pos" in data and data["center_vpaned_pos"] is not None:
+                self._saved_center_vpaned_pos = max(80, int(data["center_vpaned_pos"]))
+            if "hpaned_outer_ratio" in data:
+                self._hpaned_outer_ratio = max(0.05, min(0.90, float(data["hpaned_outer_ratio"])))
+            if "hpaned_inner_ratio" in data:
+                self._hpaned_inner_ratio = max(0.05, min(0.90, float(data["hpaned_inner_ratio"])))
+            if "center_vpaned_ratio" in data:
+                self._center_vpaned_ratio = max(0.10, min(0.90, float(data["center_vpaned_ratio"])))
+            if "left_vpaned_main_pos" in data:
+                self._saved_left_vpaned_main_pos = max(60, int(data["left_vpaned_main_pos"]))
+            if "left_vpaned_top_pos" in data:
+                self._saved_left_vpaned_top_pos = max(40, int(data["left_vpaned_top_pos"]))
+            if "left_vpaned_bot_pos" in data:
+                self._saved_left_vpaned_bot_pos = max(40, int(data["left_vpaned_bot_pos"]))
+            tv_cols = data.get("treeview_column_widths")
+            if isinstance(tv_cols, dict):
+                cleaned_cols: Dict[str, List[int]] = {}
+                for k, v in tv_cols.items():
+                    if isinstance(k, str) and isinstance(v, list):
+                        cleaned_cols[k] = [max(0, int(x)) for x in v if isinstance(x, (int, float))]
+                self._saved_treeview_col_widths = cleaned_cols
+            open_tabs = data.get("open_tabs")
+            if isinstance(open_tabs, list):
+                self._saved_open_tabs = [t for t in open_tabs if isinstance(t, dict)]
+            if "active_tab_key" in data and isinstance(data["active_tab_key"], str):
+                self._saved_active_tab_key = data["active_tab_key"]
+        except Exception as exc:
+            debug_log_line("UI-STATE", f"Failed to load '{path}': {exc}")
+
+    def _capture_open_tabs_state(self) -> None:
+        """Record the currently open Main Graph tabs and active tab key for session persistence."""
+        if self._restoring_session_tabs:
+            return
+        if not hasattr(self, "graph_notebook") or self.graph_notebook is None:
+            return
+        ordered_tabs: List[GraphTabPage] = []
+        n_pages = self.graph_notebook.get_n_pages()
+        for i in range(n_pages):
+            page_w = self.graph_notebook.get_nth_page(i)
+            for t in self.graph_tabs:
+                if t.view_stack is page_w or t.canvas is page_w:
+                    ordered_tabs.append(t)
+                    break
+        for t in self.graph_tabs:
+            if t not in ordered_tabs:
+                ordered_tabs.append(t)
+
+        tabs_list: List[Dict[str, Any]] = []
+        for t in ordered_tabs:
+            if t.is_untitled and (not t.canvas.vm or not t.canvas.vm.source_file):
+                continue
+            enabled_tb_io_ids: List[str] = []
+            if t.canvas.vm is not None:
+                enabled_tb_io_ids = [
+                    nid
+                    for nid, n in t.canvas.vm.nodes.items()
+                    if n.class_category == "TestbenchIO"
+                    and str(n.config.get_scalar("enabled", "false")).lower() == "true"
+                ]
+            tabs_list.append(
+                {
+                    "tab_key": t.tab_key,
+                    "pane_kind": t.pane_kind,
+                    "primary_id": t.primary_id,
+                    "secondary_id": t.secondary_id,
+                    "source_file": t.canvas.vm.source_file if t.canvas.vm else "",
+                    "text_mode": bool(t.mode_switch_btn.get_active()),
+                    "enabled_tb_io_ids": enabled_tb_io_ids,
+                }
+            )
+        self._saved_open_tabs = tabs_list
+        active = self.get_active_tab()
+        self._saved_active_tab_key = active.tab_key if active else ""
+
+    def _save_ui_state(self) -> None:
+        """Persist current window geometry, pane splitter positions, treeview column widths, and open tabs to disk."""
+        path = self._get_ui_state_path()
+        try:
+            win_w = self.get_width()
+            win_h = self.get_height()
+            if win_w > 300 and win_h > 200 and not self.is_maximized():
+                self._ui_window_width = win_w
+                self._ui_window_height = win_h
+            self._ui_window_maximized = bool(self.is_maximized())
+            if not self._restoring_session_tabs and hasattr(self, "graph_notebook"):
+                self._capture_open_tabs_state()
+
+            payload: Dict[str, Any] = {
+                "window_width": self._ui_window_width,
+                "window_height": self._ui_window_height,
+                "window_maximized": self._ui_window_maximized,
+                "saved_total_w": self._saved_total_w,
+                "saved_total_h": self._saved_total_h,
+                "hpaned_outer_pos": self._saved_hpaned_outer_pos,
+                "hpaned_inner_pos": self._saved_hpaned_inner_pos,
+                "center_vpaned_pos": self._saved_center_vpaned_pos,
+                "hpaned_outer_ratio": round(self._hpaned_outer_ratio, 6),
+                "hpaned_inner_ratio": round(self._hpaned_inner_ratio, 6),
+                "center_vpaned_ratio": round(self._center_vpaned_ratio, 6),
+                "left_vpaned_main_pos": self._saved_left_vpaned_main_pos,
+                "left_vpaned_top_pos": self._saved_left_vpaned_top_pos,
+                "left_vpaned_bot_pos": self._saved_left_vpaned_bot_pos,
+                "treeview_column_widths": self._saved_treeview_col_widths,
+                "open_tabs": self._saved_open_tabs,
+                "active_tab_key": self._saved_active_tab_key,
+            }
+            parent_dir = os.path.dirname(path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception as exc:
+            debug_log_line("UI-STATE", f"Failed to save '{path}': {exc}")
+
+    def _schedule_ui_state_save(self) -> None:
+        if self._save_ui_state_timer_id is not None:
+            return
+        self._save_ui_state_timer_id = GLib.timeout_add(250, self._flush_ui_state_save)
+
+    def _flush_ui_state_save(self) -> bool:
+        self._save_ui_state_timer_id = None
+        self._save_ui_state()
+        return False
+
+    def _on_main_paned_position_changed(self, _paned: Gtk.Paned, _pspec: object) -> None:
+        if self._applying_programmatic_paned_pos or not self._paned_layout_ready:
+            return
+        total_w = self.hpaned_outer.get_width()
+        total_h = self.hpaned_outer.get_height()
+        if total_w <= 100 or total_h <= 100:
+            return
+        if total_w != self._last_allocated_width or total_h != self._last_allocated_height:
+            return
+        outer_pos = self.hpaned_outer.get_position()
+        inner_pos = self.hpaned_inner.get_position()
+        vpaned_pos = self.center_vpaned.get_position()
+        if outer_pos <= 0 or inner_pos <= 0 or vpaned_pos <= 0:
+            return
+        self._saved_hpaned_outer_pos = outer_pos
+        self._saved_hpaned_inner_pos = inner_pos
+        self._saved_center_vpaned_pos = vpaned_pos
+        self._saved_total_w = total_w
+        self._saved_total_h = total_h
+        self._hpaned_outer_ratio = max(0.05, min(0.90, outer_pos / float(total_w)))
+        self._hpaned_inner_ratio = max(0.05, min(0.90, inner_pos / float(total_w)))
+        self._center_vpaned_ratio = max(0.10, min(0.90, vpaned_pos / float(total_h)))
+        self._schedule_ui_state_save()
+
+    def _on_left_paned_position_changed(self, _paned: Gtk.Paned, _pspec: object) -> None:
+        if self._applying_programmatic_paned_pos or not self._paned_layout_ready:
+            return
+        main_pos = self.left_panel.vpaned_main.get_position()
+        top_pos = self.left_panel.vpaned_top.get_position()
+        bot_pos = self.left_panel.vpaned_bot.get_position()
+        if main_pos > 0:
+            self._saved_left_vpaned_main_pos = main_pos
+        if top_pos > 0:
+            self._saved_left_vpaned_top_pos = top_pos
+        if bot_pos > 0:
+            self._saved_left_vpaned_bot_pos = bot_pos
+        self._schedule_ui_state_save()
+
     def _on_outer_paned_tick(self, widget: Gtk.Widget, _frame_clock: object) -> bool:
-        """Keep default horizontal split at 25% Left / 50% Main Graph / 25% Right when UI resizes."""
+        """Restore persisted pane splitter positions (or 25%/50%/68% defaults) when the window allocates/resizes."""
         total_w = widget.get_width()
         total_h = widget.get_height()
         if total_w > 100 and total_h > 100 and (
@@ -1139,17 +1441,76 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         ):
             self._last_allocated_width = total_w
             self._last_allocated_height = total_h
-            target_left = int(total_w * 0.25)
-            target_center = int(total_w * 0.50)
-            target_center_vpos = int(total_h * 0.68)
-            GLib.idle_add(self._sync_inner_paned_position, target_left, target_center, target_center_vpos)
+            self._applying_programmatic_paned_pos = True
+            self._paned_sync_seq += 1
+            sync_seq = self._paned_sync_seq
+
+            if self._saved_hpaned_outer_pos is not None and self._saved_total_w == total_w:
+                target_left = self._saved_hpaned_outer_pos
+            else:
+                target_left = int(round(total_w * self._hpaned_outer_ratio))
+
+            if self._saved_hpaned_inner_pos is not None and self._saved_total_w == total_w:
+                target_center = self._saved_hpaned_inner_pos
+            else:
+                target_center = int(round(total_w * self._hpaned_inner_ratio))
+
+            if self._saved_center_vpaned_pos is not None and self._saved_total_h == total_h:
+                target_center_vpos = self._saved_center_vpaned_pos
+            else:
+                target_center_vpos = int(round(total_h * self._center_vpaned_ratio))
+
+            target_left = max(80, min(max(80, total_w - 160), target_left))
+            target_center = max(80, min(max(80, total_w - target_left - 80), target_center))
+            target_center_vpos = max(80, min(max(80, total_h - 80), target_center_vpos))
+
+            GLib.idle_add(
+                self._sync_inner_paned_position,
+                target_left,
+                target_center,
+                target_center_vpos,
+                0,
+                sync_seq,
+            )
         return GLib.SOURCE_CONTINUE
 
-    def _sync_inner_paned_position(self, target_left: int, target_center: int, target_center_vpos: int) -> bool:
+    def _sync_inner_paned_position(
+        self,
+        target_left: int,
+        target_center: int,
+        target_center_vpos: int,
+        pass_idx: int = 0,
+        sync_seq: int = 0,
+    ) -> bool:
+        if sync_seq and sync_seq != self._paned_sync_seq:
+            return False
+        self._applying_programmatic_paned_pos = True
         self.hpaned_outer.set_position(target_left)
         self.hpaned_inner.set_position(target_center)
         self.center_vpaned.set_position(target_center_vpos)
-        self.canvas.queue_draw()
+        self.left_panel.vpaned_main.set_position(self._saved_left_vpaned_main_pos)
+        self.left_panel.vpaned_top.set_position(self._saved_left_vpaned_top_pos)
+        self.left_panel.vpaned_bot.set_position(self._saved_left_vpaned_bot_pos)
+        self._apply_saved_treeview_column_widths()
+        if pass_idx == 0:
+            GLib.timeout_add(
+                25,
+                self._sync_inner_paned_position,
+                target_left,
+                target_center,
+                target_center_vpos,
+                1,
+                sync_seq,
+            )
+        else:
+            self.canvas.queue_draw()
+            GLib.timeout_add(25, self._finish_programmatic_paned_sync, sync_seq)
+        return False
+
+    def _finish_programmatic_paned_sync(self, sync_seq: int) -> bool:
+        if sync_seq == self._paned_sync_seq:
+            self._applying_programmatic_paned_pos = False
+            self._paned_layout_ready = True
         return False
 
     # -------------------------------------------------------------------------
@@ -1187,13 +1548,108 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.status_lbl.set_text(summary)
         self.append_log(summary)
 
-        # Select default topology (`sof-hda-generic` if present, else first pipeline)
-        hda = next((m for m in ws.machine_topologies if m.name == "sof-hda-generic"), None)
-        if hda:
-            self._on_left_pane_item_selected("topology", hda.conf_path, "sof-hda-generic")
-        elif ws.pipeline_classes:
-            first_p = sorted(ws.pipeline_classes.keys())[0]
-            self._on_left_pane_item_selected("pipeline", first_p, None)
+        if not self._restore_saved_session_tabs():
+            # Select default topology (`sof-hda-generic` if present, else first pipeline)
+            hda = next((m for m in ws.machine_topologies if m.name == "sof-hda-generic"), None)
+            if hda:
+                self._on_left_pane_item_selected("topology", hda.conf_path, "sof-hda-generic")
+            elif ws.pipeline_classes:
+                first_p = sorted(ws.pipeline_classes.keys())[0]
+                self._on_left_pane_item_selected("pipeline", first_p, None)
+
+    def _restore_saved_session_tabs(self) -> bool:
+        """Re-open the Main Graph tabs that were open in the previous session and select the active tab."""
+        if not self._saved_open_tabs or not self.workspace:
+            return False
+        saved_tabs = list(self._saved_open_tabs)
+        saved_active_key = self._saved_active_tab_key
+        self._restoring_session_tabs = True
+        opened_any = False
+        try:
+            for tinfo in saved_tabs:
+                tab_key = str(tinfo.get("tab_key", ""))
+                pane_kind = str(tinfo.get("pane_kind", ""))
+                primary_id = str(tinfo.get("primary_id", ""))
+                secondary_id = tinfo.get("secondary_id") or None
+                source_file = str(tinfo.get("source_file", ""))
+                text_mode = bool(tinfo.get("text_mode", False))
+                enabled_tb_io_ids = tinfo.get("enabled_tb_io_ids")
+
+                tab: Optional[GraphTabPage] = None
+                if tab_key.startswith("file:"):
+                    fpath = primary_id if (primary_id and os.path.isfile(primary_id)) else source_file
+                    if fpath and os.path.isfile(fpath):
+                        tab = self.open_conf_file_in_tab(fpath)
+                elif pane_kind in ("base_class", "module", "pipeline", "topology"):
+                    if pane_kind == "topology" and (not primary_id or not os.path.isfile(primary_id)):
+                        bname = os.path.basename(primary_id or source_file)
+                        match = next(
+                            (
+                                m
+                                for m in self.workspace.machine_topologies
+                                if os.path.basename(m.conf_path) == bname or m.name == secondary_id
+                            ),
+                            None,
+                        )
+                        if match:
+                            primary_id = match.conf_path
+                    prev_count = len(self.graph_tabs)
+                    self._on_left_pane_item_selected(pane_kind, primary_id, secondary_id)
+                    if len(self.graph_tabs) > prev_count:
+                        tab = self.graph_tabs[-1]
+                    else:
+                        expected_key = f"{pane_kind}:{primary_id}:{secondary_id or ''}"
+                        tab = next((t for t in self.graph_tabs if t.tab_key == expected_key), None)
+                elif source_file and os.path.isfile(source_file):
+                    tab = self.open_conf_file_in_tab(source_file)
+
+                if tab is not None:
+                    opened_any = True
+                    if isinstance(enabled_tb_io_ids, list) and enabled_tb_io_ids and tab.canvas.vm:
+                        tb_id_set = {str(x) for x in enabled_tb_io_ids if x}
+                        has_match = any(
+                            nid in tb_id_set
+                            for nid, n in tab.canvas.vm.nodes.items()
+                            if n.class_category == "TestbenchIO"
+                        )
+                        if has_match:
+                            for nid, n in tab.canvas.vm.nodes.items():
+                                if n.class_category == "TestbenchIO":
+                                    n.config.set_scalar(
+                                        "enabled",
+                                        "true" if nid in tb_id_set else "false",
+                                        origin="instance",
+                                    )
+                    if text_mode:
+                        tab.mode_switch_btn.set_active(True)
+        finally:
+            self._restoring_session_tabs = False
+
+        if opened_any and self.graph_tabs:
+            target_tab = next(
+                (t for t in self.graph_tabs if t.tab_key == saved_active_key),
+                None,
+            )
+            if target_tab is None and saved_active_key:
+                # Match by primary_id + secondary_id in case workspace path changed
+                target_tab = next(
+                    (
+                        t
+                        for t in self.graph_tabs
+                        if f"{t.pane_kind}:{os.path.basename(t.primary_id)}:{t.secondary_id or ''}"
+                        == f"{saved_active_key.split(':', 1)[0]}:{os.path.basename(saved_active_key.split(':', 2)[1]) if ':' in saved_active_key else ''}:{saved_active_key.split(':', 2)[2] if saved_active_key.count(':') >= 2 else ''}"
+                    ),
+                    None,
+                )
+            if target_tab is None:
+                target_tab = self.graph_tabs[-1]
+            pnum = self.graph_notebook.page_num(target_tab.view_stack)
+            if pnum >= 0:
+                self.graph_notebook.set_current_page(pnum)
+            self._sync_ui_to_tab(target_tab)
+            self._capture_open_tabs_state()
+            return True
+        return False
 
     @staticmethod
     def _format_tab_title(vm: Optional[GraphViewModel], fallback: str = "Untitled.conf") -> str:
@@ -1240,7 +1696,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 pnum = self.graph_notebook.page_num(existing.view_stack)
                 if pnum >= 0:
                     self.graph_notebook.set_current_page(pnum)
-                self._sync_ui_to_active_tab()
+                if not self._restoring_session_tabs:
+                    self._sync_ui_to_active_tab()
+                    self._capture_open_tabs_state()
+                    self._schedule_ui_state_save()
                 return existing
 
         new_canvas = TopologyGraphCanvas(
@@ -1309,7 +1768,10 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             f"Opened tab '{vm.title}'",
             f"key={tab_key} kind={pane_kind} nodes={len(vm.nodes)} routes={len(vm.edges)}",
         )
-        self._sync_ui_to_active_tab()
+        if not self._restoring_session_tabs:
+            self._sync_ui_to_active_tab()
+            self._capture_open_tabs_state()
+            self._schedule_ui_state_save()
         return tab_page
 
     def _refresh_tab_text_from_graph(self, tab_page: GraphTabPage) -> None:
@@ -1357,7 +1819,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             if tab_page.text_editor.is_modified_in_text:
                 tab_page.text_editor.commit_to_diagram()
             tab_page.view_stack.set_visible_child_name("graph")
-            self._sync_ui_to_tab(tab_page)
+            if not self._restoring_session_tabs:
+                self._sync_ui_to_tab(tab_page)
+        if not self._restoring_session_tabs:
+            self._capture_open_tabs_state()
+            self._schedule_ui_state_save()
 
     def toggle_active_tab_text_mode(self) -> bool:
         """Toggle the active tab between Visual Graph and Topology2 Text Editor."""
@@ -1458,6 +1924,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             )
         else:
             self._sync_ui_to_active_tab()
+        self._capture_open_tabs_state()
+        self._schedule_ui_state_save()
         return True
 
     def close_current_tab(self) -> bool:
@@ -1473,9 +1941,13 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         page_widget: Gtk.Widget,
         _page_num: int,
     ) -> None:
+        if self._restoring_session_tabs:
+            return
         for tab in self.graph_tabs:
             if tab.view_stack is page_widget or tab.canvas is page_widget:
                 self._sync_ui_to_tab(tab)
+                self._saved_active_tab_key = tab.tab_key
+                self._schedule_ui_state_save()
                 break
 
     def _sync_ui_to_active_tab(self) -> None:
@@ -1742,6 +2214,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             active.primary_id = abs_path
             active.tab_key = f"file:{abs_path}"
             self._update_active_tab_header()
+            self._capture_open_tabs_state()
+            self._schedule_ui_state_save()
             self.append_log(f"Saved {vm.title} to {abs_path} ({len(content)} bytes)")
             self.status_lbl.set_text(f"Saved: {abs_path}")
             return True
@@ -2758,7 +3232,19 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     # -------------------------------------------------------------------------
 
     def _on_window_close_request(self, _win: Gtk.Window) -> bool:
-        """Cleanly destroy active IPC pipelines and stop the interactive sof-testbench4 server on exit."""
+        """Persist window pane sizes, treeview column widths, and open tabs, then stop sof-testbench4 on exit."""
+        if self._save_ui_state_timer_id is not None:
+            GLib.source_remove(self._save_ui_state_timer_id)
+            self._save_ui_state_timer_id = None
+        if self._paned_layout_ready:
+            self._on_main_paned_position_changed(self.hpaned_outer, None)
+            self._on_left_paned_position_changed(self.left_panel.vpaned_main, None)
+        self._capture_treeview_column_widths()
+        self._capture_open_tabs_state()
+        if self._save_ui_state_timer_id is not None:
+            GLib.source_remove(self._save_ui_state_timer_id)
+            self._save_ui_state_timer_id = None
+        self._save_ui_state()
         self._stop_realtime_waveform_timer()
         if self.tb_runner:
             self.tb_runner.stop_live_session()
@@ -2771,6 +3257,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             f"Selected pipelines {pipeline_ids} in Main Window",
         )
         self._update_waveform_stream_labels()
+        self._capture_open_tabs_state()
+        self._schedule_ui_state_save()
         self._sync_selected_pipelines_to_testbench(
             force_recreate=False,
             explicit_pipeline_ids=pipeline_ids,

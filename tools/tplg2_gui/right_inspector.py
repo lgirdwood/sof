@@ -106,14 +106,13 @@ class RightAttributeInspector(Gtk.Box):
         col_key.set_resizable(True)
         self.tree.append_column(col_key)
 
-        # Column 1: Editable Value (auto-sized to fit full value text)
+        # Column 1: Editable Value (auto-sized initially, or fixed when resized/restored)
         r_val = Gtk.CellRendererText()
         r_val.set_padding(4, 2)
         r_val.connect("edited", self._on_value_cell_edited)
         col_val = Gtk.TreeViewColumn("Value (Dbl-Click Edit)", r_val, text=1, editable=3, foreground=4)
         col_val.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
         col_val.set_resizable(True)
-        col_val.set_expand(True)
         self.tree.append_column(col_val)
 
         # Column 2: Metadata / Constraints / Origin (auto-sized to fit full constraints text)
@@ -125,7 +124,7 @@ class RightAttributeInspector(Gtk.Box):
         col_meta.set_resizable(True)
         self.tree.append_column(col_meta)
 
-        self.tree.connect("row-expanded", lambda tv, _it, _path: tv.columns_autosize())
+        self.tree.connect("row-expanded", lambda _tv, _it, _path: self._maybe_autosize_columns())
 
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
@@ -152,6 +151,11 @@ class RightAttributeInspector(Gtk.Box):
     def _on_filter_changed(self, entry: Gtk.SearchEntry) -> None:
         self._rebuild_tree()
 
+    def _maybe_autosize_columns(self) -> None:
+        if any(c.get_sizing() == Gtk.TreeViewColumnSizing.FIXED for c in self.tree.get_columns()):
+            return
+        self.tree.columns_autosize()
+
     def _rebuild_tree(self) -> None:
         self.store.clear()
         self._path_to_node.clear()
@@ -162,7 +166,7 @@ class RightAttributeInspector(Gtk.Box):
         for child in self.current_config.children:
             self._append_config_subtree(None, child, flt)
         self.tree.expand_all()
-        self.tree.columns_autosize()
+        self._maybe_autosize_columns()
 
     def _node_matches(self, node: ConfigNode, flt: str) -> bool:
         if not flt:
@@ -222,7 +226,7 @@ class RightAttributeInspector(Gtk.Box):
         if it:
             self.store.set_value(it, 1, new_text)
             self.store.set_value(it, 4, "#6ee7b7")
-        self.tree.columns_autosize()
+        self._maybe_autosize_columns()
 
         if self.on_attribute_edited and self.current_config:
             self.on_attribute_edited(self.current_config, cnode.key, new_text)
@@ -309,7 +313,7 @@ class RightAttributeInspector(Gtk.Box):
         sel = self.tree.get_selection()
         sel.select_path(tree_path)
         self.tree.scroll_to_cell(tree_path, None, True, 0.5, 0.0)
-        self.tree.columns_autosize()
+        self._maybe_autosize_columns()
         return True
 
 
