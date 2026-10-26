@@ -3334,8 +3334,6 @@ class WaveformSnapshotWidget(Gtk.Widget):
 
             if s_idx < len(self.multi_out_samples):
                 s_out = self.multi_out_samples[s_idx]
-            elif len(self.multi_out_samples) == 1:
-                s_out = self.multi_out_samples[0]
             elif s_idx == 0:
                 s_out = self.out_samples
             else:

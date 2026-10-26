@@ -6,7 +6,7 @@
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import shutil
 import subprocess
@@ -82,6 +82,8 @@ class GraphTabPage:
     title_lbl: Gtk.Label
     is_untitled: bool = False
     text_needs_refresh_from_graph: bool = True
+    stream_waveforms: Dict[str, Tuple[List[float], List[float]]] = field(default_factory=dict)
+    last_tb_summary: str = ""
 
 
 class Topology2MainWindow(Gtk.ApplicationWindow):
@@ -1453,6 +1455,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not self.graph_tabs:
             self.right_inspector.set_node_config(None, None, "")
             self._update_undo_redo_buttons()
+            self._update_waveform_stream_labels()
             self.status_lbl.set_text(
                 "Closed tab. Use File ▸ New or select an item in the left panel to open a graph."
             )
@@ -1899,11 +1902,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.canvas.delete_selected()
         self._update_active_tab_header()
 
-    def _get_ordered_enabled_tb_io_nodes(self) -> Tuple[List[GraphNode], List[GraphNode]]:
+    def _get_ordered_enabled_tb_io_nodes(
+        self,
+        vm_override: Optional[GraphViewModel] = None,
+    ) -> Tuple[List[GraphNode], List[GraphNode]]:
         """Return (enabled_sources, enabled_sinks) ordered by their connected copier's position
         in _extract_active_pipeline_ids(vm) so Stream 1..N match testbench file slots 1..N.
         """
-        vm = self.canvas.vm
+        vm = vm_override if vm_override is not None else self.canvas.vm
         if not vm:
             return ([], [])
         active_pids = _extract_active_pipeline_ids(vm)
@@ -1938,6 +1944,25 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         raw_sources.sort(key=_node_sort_key)
         raw_sinks.sort(key=_node_sort_key)
         return ([n for _, n in raw_sources], [n for _, n in raw_sinks])
+
+    def _get_ordered_active_stream_keys(
+        self,
+        vm_override: Optional[GraphViewModel] = None,
+    ) -> List[str]:
+        """Return ordered unique keys for each currently enabled PCM stream in `vm_override` (or active vm)."""
+        vm = vm_override if vm_override is not None else self.canvas.vm
+        if not vm:
+            return []
+        enabled_sources, enabled_sinks = self._get_ordered_enabled_tb_io_nodes(vm)
+        n_streams = max(len(enabled_sources), len(enabled_sinks))
+        if n_streams == 0:
+            return ["__default__"]
+        keys: List[str] = []
+        for idx in range(n_streams):
+            src_id = enabled_sources[idx].id if idx < len(enabled_sources) else ""
+            snk_id = enabled_sinks[idx].id if idx < len(enabled_sinks) else ""
+            keys.append(src_id or snk_id or f"stream_{idx}")
+        return keys
 
     @staticmethod
     def _describe_tb_source_signal(snode: GraphNode) -> Tuple[str, str, str]:
@@ -2154,6 +2179,60 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             multi_signal_labels=multi_sig_labels or [sig_label],
         )
 
+        # Align displayed waveforms with the currently selected PCMs on the active Main Graph tab,
+        # removing any deselected PCM waveforms and updating when switching between graph tabs.
+        active_tab = self.get_active_tab()
+        active_keys = self._get_ordered_active_stream_keys(vm)
+        if active_tab is not None:
+            active_key_set = set(active_keys)
+            for k in list(active_tab.stream_waveforms.keys()):
+                if k not in active_key_set:
+                    del active_tab.stream_waveforms[k]
+
+        aligned_in_samples: List[List[float]] = []
+        aligned_out_samples: List[List[float]] = []
+        for skey in active_keys:
+            if active_tab is not None and skey in active_tab.stream_waveforms:
+                s_in, s_out = active_tab.stream_waveforms[skey]
+                aligned_in_samples.append(list(s_in))
+                aligned_out_samples.append(list(s_out))
+            else:
+                aligned_in_samples.append([])
+                aligned_out_samples.append([])
+
+        primary_in = aligned_in_samples[0] if aligned_in_samples else []
+        primary_out = aligned_out_samples[0] if aligned_out_samples else []
+        if not primary_out:
+            for cand_s in aligned_out_samples[1:]:
+                if cand_s:
+                    primary_out = cand_s
+                    break
+
+        summary_lbl = (
+            active_tab.last_tb_summary
+            if (active_tab is not None and active_tab.last_tb_summary and any(aligned_out_samples))
+            else "No testbench run yet — click [▶ Run in Testbench]"
+        )
+        self.waveform_widget.set_waveforms(
+            primary_in,
+            primary_out,
+            summary=summary_lbl,
+            is_realtime=self.waveform_widget.is_realtime,
+            multi_in_samples=aligned_in_samples,
+            multi_out_samples=aligned_out_samples,
+        )
+        if not self.waveform_widget.is_realtime:
+            n_streams = max(1, len(aligned_in_samples), len(aligned_out_samples))
+            has_any_out = any(len(s) > 0 for s in aligned_out_samples)
+            if has_any_out:
+                self.wf_status_lbl.set_text(
+                    f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]"
+                )
+            else:
+                self.wf_status_lbl.set_text(
+                    f"Waveforms [IDLE — {n_streams} Streams]" if n_streams > 1 else "Waveforms [IDLE]"
+                )
+
     def _on_waveform_zoom_changed(self) -> None:
         self.wf_zoom_lbl.set_text(self.waveform_widget.get_zoom_summary_text())
 
@@ -2286,20 +2365,24 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                         self.canvas._suppress_auto_history = False
                 elif key in ("enabled", "target_pipelines"):
                     self._sync_selected_pipelines_to_testbench(force_recreate=True)
-                elif key == "io_type" and new_val.strip().lower() == "sig_gen" and node.class_name == "testbench-source":
-                    if not node.config.get_scalar("signal_type"):
-                        node.config.set_scalar(
-                            "signal_type",
-                            "sine_997",
-                            category_info="Signal Generator waveform type (when io_type=sig_gen)",
-                            origin="instance",
-                            valid_values=[opt[0] for opt in TopologyGraphCanvas.SIGNAL_TYPE_OPTIONS],
-                        )
-                        self.right_inspector.set_node_config(
-                            f"{node.title} ({node.class_name})",
-                            node.config,
-                            node.subtitle,
-                        )
+                elif key in ("signal_type", "io_type", "file_path"):
+                    active_tab = self.get_active_tab()
+                    if active_tab is not None and node.id in active_tab.stream_waveforms:
+                        del active_tab.stream_waveforms[node.id]
+                    if key == "io_type" and new_val.strip().lower() == "sig_gen" and node.class_name == "testbench-source":
+                        if not node.config.get_scalar("signal_type"):
+                            node.config.set_scalar(
+                                "signal_type",
+                                "sine_997",
+                                category_info="Signal Generator waveform type (when io_type=sig_gen)",
+                                origin="instance",
+                                valid_values=[opt[0] for opt in TopologyGraphCanvas.SIGNAL_TYPE_OPTIONS],
+                            )
+                            self.right_inspector.set_node_config(
+                                f"{node.title} ({node.class_name})",
+                                node.config,
+                                node.subtitle,
+                            )
             else:
                 if key == "included_param_file" and node.class_category == "Control":
                     self.canvas.vm.graph_structure_modified = True
@@ -2500,6 +2583,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         bytes_overrides = dict(self._pending_bytes_overrides)
         keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
         hot_reload = bool(hasattr(self, "hot_reload_btn") and self.hot_reload_btn.get_active())
+        run_tab = self.get_active_tab()
+        run_keys = self._get_ordered_active_stream_keys(run_tab.canvas.vm if run_tab else None)
         self._stop_realtime_waveform_timer()
         self._update_waveform_stream_labels()
         self.wf_status_lbl.set_text("Waveforms [● Running Testbench…]")
@@ -2536,14 +2621,43 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 channels_out=ch_out,
                 hot_reload_if_alive=hot_reload,
             )
-            GLib.idle_add(self._on_testbench_finished, tb_res)
+            GLib.idle_add(self._on_testbench_finished, tb_res, run_tab, run_keys)
 
         threading.Thread(target=tb_worker, daemon=True).start()
         return False
 
-    def _on_testbench_finished(self, tb_res: TestbenchRunResult) -> bool:
+    def _on_testbench_finished(
+        self,
+        tb_res: TestbenchRunResult,
+        run_tab: Optional[GraphTabPage] = None,
+        run_keys: Optional[List[str]] = None,
+    ) -> bool:
         self.run_tb_btn.set_sensitive(True)
-        self._update_waveform_stream_labels()
+        target_tab = run_tab if run_tab is not None else self.get_active_tab()
+        if target_tab is not None and target_tab.canvas.vm is not None:
+            eff_keys = (
+                list(run_keys)
+                if run_keys
+                else self._get_ordered_active_stream_keys(target_tab.canvas.vm)
+            )
+            cur_active_set = set(self._get_ordered_active_stream_keys(target_tab.canvas.vm))
+            target_tab.stream_waveforms.clear()
+            for idx, skey in enumerate(eff_keys):
+                if skey not in cur_active_set:
+                    continue
+                s_in = (
+                    list(tb_res.multi_in_samples[idx])
+                    if idx < len(tb_res.multi_in_samples)
+                    else (list(tb_res.in_samples) if idx == 0 else [])
+                )
+                s_out = (
+                    list(tb_res.multi_out_samples[idx])
+                    if idx < len(tb_res.multi_out_samples)
+                    else (list(tb_res.out_samples) if idx == 0 else [])
+                )
+                target_tab.stream_waveforms[skey] = (s_in, s_out)
+            target_tab.last_tb_summary = tb_res.summary_text
+
         self.append_log(f"$ {tb_res.command}")
         if tb_res.telemetry and tb_res.telemetry.protocol_log:
             for pline in tb_res.telemetry.protocol_log:
@@ -2563,27 +2677,30 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             and self.tb_runner.live_client
             and self.tb_runner.live_proc
         )
-        self.waveform_widget.set_waveforms(
-            tb_res.in_samples,
-            tb_res.out_samples,
-            tb_res.summary_text,
-            is_realtime=live_active,
-            multi_in_samples=tb_res.multi_in_samples,
-            multi_out_samples=tb_res.multi_out_samples,
-        )
-        n_streams = max(1, len(tb_res.multi_in_samples), len(tb_res.multi_out_samples))
-        has_any_out = bool(tb_res.out_samples or any(len(s) > 0 for s in tb_res.multi_out_samples))
-        if live_active:
-            self.wf_status_lbl.set_text(
-                f"Waveforms [● LIVE D0 — {n_streams} Streams]" if n_streams > 1 else "Waveforms [● LIVE D0]"
+        self.waveform_widget.is_realtime = live_active
+        self._update_waveform_stream_labels()
+
+        active_tab = self.get_active_tab()
+        if active_tab is target_tab:
+            n_streams = max(
+                1,
+                len(self.waveform_widget.multi_in_samples),
+                len(self.waveform_widget.multi_out_samples),
             )
-            self._start_realtime_waveform_timer()
-        else:
-            self.wf_status_lbl.set_text(
-                (f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]")
-                if has_any_out
-                else "Waveforms [FAILED]"
+            has_any_out = bool(
+                any(len(s) > 0 for s in self.waveform_widget.multi_out_samples)
             )
+            if live_active:
+                self.wf_status_lbl.set_text(
+                    f"Waveforms [● LIVE D0 — {n_streams} Streams]" if n_streams > 1 else "Waveforms [● LIVE D0]"
+                )
+                self._start_realtime_waveform_timer()
+            else:
+                self.wf_status_lbl.set_text(
+                    (f"Waveforms [SNAPSHOT — {n_streams} Streams]" if n_streams > 1 else "Waveforms [SNAPSHOT]")
+                    if has_any_out
+                    else "Waveforms [FAILED]"
+                )
 
         if tb_res.telemetry:
             self._apply_telemetry_to_ui(tb_res.telemetry)
