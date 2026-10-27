@@ -2889,7 +2889,7 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 			wname = (ci && ci->name) ? ci->name : "comp";
 
 			off += snprintf(out_buf + off, out_cap - off,
-					"  [0x%06x %-24s] pipe=%u core=%u %s mem=%s iters=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus ibs=%u obs=%u cpc=%u(viol=%u)",
+					"  [0x%06x %-24s] pipe=%u core=%u %s mem=%s iters=%llu avg=%llu peak=%llu tot=%llu cyc (%u/%u kcps) exec=%llu.%03llu/%llu.%03lluus ibs=%u obs=%u cpc=%u(viol=%u) err=%u(t0=%u)",
 					mt->comp_id, wname, mt->pipeline_id, mt->core_id,
 					mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
 					mt->mem_domain == HOST_MEM_DOMAIN_DRAM ? "DRAM" : "SRAM",
@@ -2902,7 +2902,8 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 					(unsigned long long)(mt->avg_exec_ns % 1000ULL),
 					(unsigned long long)(mt->peak_exec_ns / 1000ULL),
 					(unsigned long long)(mt->peak_exec_ns % 1000ULL),
-					mt->ibs, mt->obs, mt->effective_cpc, mt->cpc_violations);
+					mt->ibs, mt->obs, mt->effective_cpc, mt->cpc_violations,
+					mt->error_count, mt->tick0_error_count);
 			if (mt->proc_domain == COMP_PROCESSING_DOMAIN_DP) {
 				off += snprintf(out_buf + off, out_cap - off,
 						" ll_sync=%llu(%llu cyc)",
@@ -2939,6 +2940,36 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 			}
 			off += snprintf(out_buf + off, out_cap - off, "\n");
 		}
+
+		if (st->num_fw_logs > 0 && off + 192 < out_cap) {
+			off += snprintf(out_buf + off, out_cap - off,
+					"\n=== Firmware Error & Xrun Log (%u entries, total_err=%u) ===\n",
+					st->num_fw_logs, st->total_fw_errors);
+			for (i = 0; i < st->num_fw_logs && i < TB_TELEM_MAX_FW_LOGS && off + 288 < out_cap; i++) {
+				struct host_fw_log_entry *fe = &st->fw_logs[i];
+				struct tplg_comp_info *ci;
+				const char *wname;
+				const char *pdir;
+
+				if (!fe->active)
+					continue;
+				ci = (fe->comp_id != 0xFFFFFFFFU) ?
+				     find_comp_info_by_ipc_id(g_tp, fe->comp_id) : NULL;
+				wname = (ci && ci->name) ? ci->name : "fw";
+				pdir = (fe->pin_dir == 0) ? "IN" :
+				       (fe->pin_dir == 1) ? "OUT" : "NONE";
+
+				off += snprintf(out_buf + off, out_cap - off,
+						"  [FW_ERR tick=%llu level=%s pipe=%d comp=0x%06x name=%s pin=%s:%d src=%s:%d] %s\n",
+						(unsigned long long)fe->tick,
+						fe->level <= 1 ? "ERR" : "WRN",
+						fe->pipe_id == 0xFFFFFFFFU ? -1 : (int)fe->pipe_id,
+						fe->comp_id == 0xFFFFFFFFU ? 0U : fe->comp_id,
+						wname, pdir, (int)fe->pin_index,
+						fe->file[0] ? fe->file : "fw", fe->line,
+						fe->msg);
+			}
+		}
 	} else if (strncmp(cmd, "mod-buffers", 11) == 0) {
 		struct host_sched_telemetry *st = host_telem_get();
 		const char *filter = cmd + 11;
@@ -2972,13 +3003,18 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 			}
 
 			off += snprintf(out_buf + off, out_cap - off,
-					"[0x%06x %s] pipe=%u core=%u domain=%s iters=%llu cyc(last=%llu avg=%llu peak=%llu)\n",
+					"[0x%06x %s] pipe=%u core=%u domain=%s iters=%llu cyc(last=%llu avg=%llu peak=%llu) err=%u(t0=%u)\n",
 					mt->comp_id, wname, mt->pipeline_id, mt->core_id,
 					mt->proc_domain == COMP_PROCESSING_DOMAIN_DP ? "DP" : "LL",
 					(unsigned long long)mt->iterations,
 					(unsigned long long)mt->last_cycles,
 					(unsigned long long)mt->avg_cycles,
-					(unsigned long long)mt->peak_cycles);
+					(unsigned long long)mt->peak_cycles,
+					mt->error_count, mt->tick0_error_count);
+			if (mt->error_count > 0 && mt->last_error_msg[0] && off + 192 < out_cap) {
+				off += snprintf(out_buf + off, out_cap - off,
+						"  FW_ERR: %s\n", mt->last_error_msg);
+			}
 
 			for (p = 0; p < mt->num_in_pins && off + 256 < out_cap; p++) {
 				struct host_mod_pin_telem *pin = &mt->in_pins[p];
@@ -3002,9 +3038,11 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 							pin->dp_ring_exit_free);
 				}
 				off += snprintf(out_buf + off, out_cap - off,
-						" consumed=%uB(tot=%lluB) entry_rms=%d.%02ddB(pk=%d.%02ddB) exit_rms=%d.%02ddB\n",
+						" consumed=%uB(tot=%lluB) xruns=%u(underrun=%u overrun=%u t0=%u) entry_rms=%d.%02ddB(pk=%d.%02ddB) exit_rms=%d.%02ddB\n",
 						pin->last_bytes_transferred,
 						(unsigned long long)pin->total_bytes_transferred,
+						pin->xrun_count, pin->underrun_count,
+						pin->overrun_count, pin->tick0_xrun_count,
 						pin->entry_rms_dbfs_x100 / 100,
 						abs(pin->entry_rms_dbfs_x100 % 100),
 						pin->entry_peak_dbfs_x100 / 100,
@@ -3046,9 +3084,11 @@ static int execute_tb_shell_cmd(const char *cmd, char *out_buf, size_t out_cap)
 							pin->dp_ring_exit_free);
 				}
 				off += snprintf(out_buf + off, out_cap - off,
-						" produced=%uB(tot=%lluB) entry_rms=%d.%02ddB exit_rms=%d.%02ddB(pk=%d.%02ddB)\n",
+						" produced=%uB(tot=%lluB) xruns=%u(underrun=%u overrun=%u t0=%u) entry_rms=%d.%02ddB exit_rms=%d.%02ddB(pk=%d.%02ddB)\n",
 						pin->last_bytes_transferred,
 						(unsigned long long)pin->total_bytes_transferred,
+						pin->xrun_count, pin->underrun_count,
+						pin->overrun_count, pin->tick0_xrun_count,
 						pin->entry_rms_dbfs_x100 / 100,
 						abs(pin->entry_rms_dbfs_x100 % 100),
 						pin->exit_rms_dbfs_x100 / 100,

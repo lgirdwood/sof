@@ -326,6 +326,10 @@ class ModulePinBufferStats:
     dp_exit_free: int = 0
     last_bytes_transferred: int = 0
     total_bytes_transferred: int = 0
+    xrun_count: int = 0
+    underrun_count: int = 0
+    overrun_count: int = 0
+    tick0_xrun_count: int = 0
     entry_rms_db: float = -120.0
     entry_peak_db: float = -120.0
     exit_rms_db: float = -120.0
@@ -357,6 +361,10 @@ class ComponentPerfItem:
     heap_bytes: int = 0
     effective_cpc: int = 0
     cpc_violations: int = 0
+    error_count: int = 0
+    tick0_error_count: int = 0
+    last_error_msg: str = ""
+    fw_errors: List[Dict[str, Any]] = field(default_factory=list)
     ibs: int = 0
     obs: int = 0
     ll_ring_sync_iters: int = 0
@@ -461,6 +469,7 @@ class TestbenchTelemetry:
     kcontrols: List[KcontrolTelemetryItem] = field(default_factory=list)
     probes: List[Dict[str, Any]] = field(default_factory=list)
     loaded_modules: Dict[int, str] = field(default_factory=dict)
+    fw_error_logs: List[Dict[str, Any]] = field(default_factory=list)
     # Shell outputs
     shell_info: str = ""
     shell_pipelines: str = ""
@@ -1697,6 +1706,13 @@ class TestbenchRemoteClient:
                 if m_sync:
                     ll_sync_it = int(m_sync.group(1))
                     ll_sync_cyc = int(m_sync.group(2))
+                mod_err_cnt = 0
+                mod_t0_err_cnt = 0
+                m_err = re.search(r"err=(\d+)(?:\(t0=(\d+)\))?", line)
+                if m_err:
+                    mod_err_cnt = int(m_err.group(1))
+                    if m_err.group(2) is not None:
+                        mod_t0_err_cnt = int(m_err.group(2))
                 sched_mod_map[cid] = {
                     "pipeline_id": int(m_mod.group(3)),
                     "core_id": int(m_mod.group(4)),
@@ -1714,11 +1730,35 @@ class TestbenchRemoteClient:
                     "obs": int(m_mod.group(16)),
                     "effective_cpc": int(m_mod.group(17)),
                     "cpc_violations": int(m_mod.group(18)),
+                    "error_count": mod_err_cnt,
+                    "tick0_error_count": mod_t0_err_cnt,
                     "ll_ring_sync_iters": ll_sync_it,
                     "ll_ring_sync_cycles": ll_sync_cyc,
                     "in_rms_db": in_rms,
                     "out_rms_db": out_rms,
                 }
+                continue
+
+            m_fw_err = re.search(
+                r"\[FW_ERR\s+tick=(\d+)\s+level=(\S+)\s+pipe=(-?\d+)\s+comp=0x([0-9a-fA-F]+)\s+"
+                r"name=(\S+)\s+pin=(IN|OUT|NONE):(-?\d+)\s+src=([^:]+):(\d+)\]\s*(.+)$",
+                line.strip(),
+            )
+            if m_fw_err:
+                telem.fw_error_logs.append(
+                    {
+                        "tick": int(m_fw_err.group(1)),
+                        "level": m_fw_err.group(2),
+                        "pipe_id": int(m_fw_err.group(3)),
+                        "comp_id": int(m_fw_err.group(4), 16),
+                        "widget_name": m_fw_err.group(5),
+                        "pin_dir": m_fw_err.group(6),
+                        "pin_index": int(m_fw_err.group(7)),
+                        "file": m_fw_err.group(8),
+                        "line": int(m_fw_err.group(9)),
+                        "msg": m_fw_err.group(10).strip(),
+                    }
+                )
         telem.pipelines = sorted(sched_pipes, key=lambda p: (p.core_id, p.pipeline_id))
 
         # Parse detailed per-module & per-pin buffer stats from `mod-buffers` output
@@ -1728,7 +1768,7 @@ class TestbenchRemoteClient:
         for line in telem.shell_mod_buffers.splitlines():
             m_hdr = re.match(
                 r"^\[0x([0-9a-fA-F]+)\s+(\S+)\]\s+pipe=(\d+)\s+core=(\d+)\s+domain=(LL|DP)\s+"
-                r"iters=(\d+)\s+cyc\(last=(\d+)\s+avg=(\d+)\s+peak=(\d+)\)",
+                r"iters=(\d+)\s+cyc\(last=(\d+)\s+avg=(\d+)\s+peak=(\d+)\)(?:\s+err=(\d+)(?:\(t0=(\d+)\))?)?",
                 line.strip(),
             )
             if m_hdr:
@@ -1744,6 +1784,9 @@ class TestbenchRemoteClient:
                     "last_cycles": int(m_hdr.group(7)),
                     "avg_cycles": int(m_hdr.group(8)),
                     "peak_cycles": int(m_hdr.group(9)),
+                    "error_count": int(m_hdr.group(10)) if m_hdr.group(10) is not None else 0,
+                    "tick0_error_count": int(m_hdr.group(11)) if m_hdr.group(11) is not None else 0,
+                    "last_error_msg": "",
                     "in_pins": [],
                     "out_pins": [],
                 }
@@ -1751,6 +1794,11 @@ class TestbenchRemoteClient:
                 continue
 
             if cur_mod_cid is not None:
+                m_fw_msg = re.match(r"^\s*FW_ERR:\s*(.+)$", line)
+                if m_fw_msg:
+                    mod_buf_map[cur_mod_cid]["last_error_msg"] = m_fw_msg.group(1).strip()
+                    continue
+
                 m_pin = re.match(
                     r"^\s*(IN|OUT)\s*\[(\d+)\]\s+buf=(\d+)\s+peer=0x([0-9a-fA-F]+)\s+"
                     r"(\d+)Hz/(\d+)ch/fmt=(\d+)\s+size=(\d+)B\s+"
@@ -1788,6 +1836,16 @@ class TestbenchRemoteClient:
                     if m_xfer:
                         pin_stat.last_bytes_transferred = int(m_xfer.group(1))
                         pin_stat.total_bytes_transferred = int(m_xfer.group(2))
+                    m_xrun = re.search(
+                        r"xruns=(\d+)\(underrun=(\d+)\s+overrun=(\d+)(?:\s+t0=(\d+))?\)",
+                        line,
+                    )
+                    if m_xrun:
+                        pin_stat.xrun_count = int(m_xrun.group(1))
+                        pin_stat.underrun_count = int(m_xrun.group(2))
+                        pin_stat.overrun_count = int(m_xrun.group(3))
+                        if m_xrun.group(4) is not None:
+                            pin_stat.tick0_xrun_count = int(m_xrun.group(4))
                     m_erms = re.search(r"entry_rms=([+-]?\d+\.\d+)dB(?:\(pk=([+-]?\d+\.\d+)dB\))?", line)
                     if m_erms:
                         pin_stat.entry_rms_db = float(m_erms.group(1))
@@ -1881,6 +1939,8 @@ class TestbenchRemoteClient:
                 comp.obs = sinfo["obs"]
                 comp.effective_cpc = sinfo["effective_cpc"]
                 comp.cpc_violations = sinfo["cpc_violations"]
+                comp.error_count = sinfo.get("error_count", 0)
+                comp.tick0_error_count = sinfo.get("tick0_error_count", 0)
                 comp.ll_ring_sync_iters = sinfo["ll_ring_sync_iters"]
                 comp.ll_ring_sync_cycles = sinfo["ll_ring_sync_cycles"]
                 comp.in_rms_db = sinfo["in_rms_db"]
@@ -1892,6 +1952,12 @@ class TestbenchRemoteClient:
                     comp.avg_cycles = binfo["avg_cycles"]
                 if comp.peak_cycles == 0:
                     comp.peak_cycles = binfo["peak_cycles"]
+                if binfo.get("error_count", 0) > comp.error_count:
+                    comp.error_count = binfo["error_count"]
+                if binfo.get("tick0_error_count", 0) > comp.tick0_error_count:
+                    comp.tick0_error_count = binfo["tick0_error_count"]
+                if binfo.get("last_error_msg"):
+                    comp.last_error_msg = binfo["last_error_msg"]
                 comp.in_pins = list(binfo["in_pins"])
                 comp.out_pins = list(binfo["out_pins"])
                 for p in comp.in_pins + comp.out_pins:
@@ -1899,6 +1965,11 @@ class TestbenchRemoteClient:
                         p.peer_widget_name = probe_by_id[p.peer_comp_id]
                     elif p.peer_comp_id in self.ipc_widget_map:
                         p.peer_widget_name = self.ipc_widget_map[p.peer_comp_id][0]
+            comp.fw_errors = [
+                fe for fe in telem.fw_error_logs if fe.get("comp_id") == comp.resource_id
+            ]
+            if comp.fw_errors and not comp.last_error_msg:
+                comp.last_error_msg = str(comp.fw_errors[-1].get("msg", ""))
             if comp.widget_name and comp.widget_name in telem.module_heap:
                 comp.heap_bytes = telem.module_heap[comp.widget_name]
             elif comp.module_name in telem.module_heap:
@@ -4240,6 +4311,7 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         self.pan_offset_ms: float = 0.0      # Horizontal scroll offset in milliseconds
         self.expanded_tick_mode: bool = True # Magnify sub-ms execution blocks within each 1ms tick for readability
         self.show_all_cores: bool = True     # Show Cores 0..3 on Y axis
+        self.ignore_tick0_underrun: bool = True  # Ignore tick 0 / no-input underrun & stall violations
 
         # Pin buffer sample sparkline zoom & pan state (for 64-sample buffer taps)
         self.buf_spark_zoom: float = 1.0
@@ -4343,6 +4415,43 @@ class SchedulingTelemetryWidget(Gtk.Widget):
         self.expanded_tick_mode = bool(expanded)
         self._notify_zoom()
         self.queue_draw()
+
+    def set_ignore_tick0_underrun(self, ignore: bool) -> None:
+        self.ignore_tick0_underrun = bool(ignore)
+        self.queue_draw()
+
+    def _effective_pin_xruns(self, m_obj: ComponentPerfItem, pin_obj: ModulePinBufferStats) -> int:
+        """Return effective xrun count from actual testbench/FW errors, honoring ignore_tick0_underrun."""
+        p_dir = str(getattr(pin_obj, "direction", "IN") or "IN").upper()
+        p_idx = int(getattr(pin_obj, "pin_index", 0) or 0)
+        tot_x = max(
+            int(getattr(pin_obj, "xrun_count", 0) or 0),
+            int(getattr(pin_obj, "underrun_count", 0) or 0)
+            + int(getattr(pin_obj, "overrun_count", 0) or 0),
+        )
+        t0_x = int(getattr(pin_obj, "tick0_xrun_count", 0) or 0)
+        fw_errs = getattr(m_obj, "fw_errors", []) or []
+        pin_fw_errs = [
+            fe
+            for fe in fw_errs
+            if str(fe.get("pin_dir", "")).upper() == p_dir
+            and int(fe.get("pin_index", -1)) == p_idx
+        ]
+        if pin_fw_errs and tot_x == 0:
+            tot_x = len(pin_fw_errs)
+            t0_x = sum(1 for fe in pin_fw_errs if int(fe.get("tick", 0) or 0) == 0)
+        if tot_x <= 0:
+            return 0
+        if self.ignore_tick0_underrun:
+            if t0_x > 0:
+                return max(0, tot_x - t0_x)
+            if int(getattr(m_obj, "iterations", 0) or 0) <= 1:
+                return 0
+        return tot_x
+
+    def _is_pin_underrun_or_stall_ignored(self, m_obj: ComponentPerfItem, pin_obj: ModulePinBufferStats) -> bool:
+        """Return True if pin has no active testbench/FW xrun violations after applying ignore_tick0_underrun."""
+        return self._effective_pin_xruns(m_obj, pin_obj) <= 0
 
     def _get_pointer_anchor_ratio(self) -> float:
         """Return normalized [0.0, 1.0] horizontal mouse pointer position within the schedule timeline."""
@@ -4691,96 +4800,176 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                 }
             )
 
-        # 2. Pipeline XRUN / Period Overrun Violations
+        # 2. Pipeline XRUN / Period Overrun Violations (only attach to the module that violated CPC
+        #    or the highest-cycle module in the pipeline if no module had an explicit CPC violation,
+        #    so healthy neighbor modules do not get cascaded violation messages)
         if telem and telem.pipelines:
             pipe = next((p for p in telem.pipelines if p.pipeline_id == m_obj.pipeline_id), None)
             if pipe and (pipe.xruns > 0 or (pipe.period_us > 0 and pipe.exec_peak_us > pipe.period_us)):
-                gkey = f"mod:{m_obj.comp_id}:pipe_xrun"
-                x_cnt = max(1, pipe.xruns)
-                violations.append(
-                    {
-                        "v_key": gkey,
-                        "type": "PIPELINE_XRUN",
-                        "comp_id": m_obj.comp_id,
-                        "pipe_id": m_obj.pipeline_id,
-                        "core_id": m_obj.core_id,
-                        "widget_name": wname,
-                        "count": x_cnt,
-                        "cycles": pipe.peak_cycles,
-                        "effective_cpc": 0,
-                        "over_cycles": 0,
-                        "exec_us": pipe.exec_peak_us,
-                        "summary": (
-                            f"Pipeline {pipe.pipeline_id} XRUN / Period Overrun ({x_cnt}×): "
-                            f"pipe_peak={pipe.exec_peak_us:.2f} µs vs period={pipe.period_us} µs"
-                        ),
-                        "children": [
-                            {
-                                "v_key": f"{gkey}:ev:0",
-                                "type": "PIPELINE_XRUN_EVENT",
-                                "comp_id": m_obj.comp_id,
-                                "pipe_id": m_obj.pipeline_id,
-                                "core_id": m_obj.core_id,
-                                "widget_name": wname,
-                                "count": x_cnt,
-                                "exec_us": pipe.exec_peak_us,
-                                "summary": (
-                                    f"Pipe {pipe.pipeline_id} on Core {pipe.core_id}: xruns={pipe.xruns}, "
-                                    f"avg={pipe.exec_avg_us:.2f} µs / peak={pipe.exec_peak_us:.2f} µs ({pipe.avg_kcps} kcps)"
-                                ),
-                                "mod": m_obj,
-                            }
-                        ],
-                        "mod": m_obj,
-                    }
+                pipe_mods = [c for c in telem.components if c.pipeline_id == m_obj.pipeline_id]
+                any_pipe_cpc_v = any(
+                    c.cpc_violations > 0 or (c.effective_cpc > 0 and c.peak_cycles > c.effective_cpc)
+                    for c in pipe_mods
                 )
+                is_pipe_culprit = has_cpc_v if any_pipe_cpc_v else (
+                    m_obj.peak_cycles > 0
+                    and m_obj.peak_cycles == max((c.peak_cycles for c in pipe_mods), default=0)
+                )
+                if is_pipe_culprit:
+                    gkey = f"mod:{m_obj.comp_id}:pipe_xrun"
+                    x_cnt = max(1, pipe.xruns)
+                    violations.append(
+                        {
+                            "v_key": gkey,
+                            "type": "PIPELINE_XRUN",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "count": x_cnt,
+                            "cycles": pipe.peak_cycles,
+                            "effective_cpc": 0,
+                            "over_cycles": 0,
+                            "exec_us": pipe.exec_peak_us,
+                            "summary": (
+                                f"Pipeline {pipe.pipeline_id} XRUN / Period Overrun ({x_cnt}×): "
+                                f"pipe_peak={pipe.exec_peak_us:.2f} µs vs period={pipe.period_us} µs"
+                            ),
+                            "children": [
+                                {
+                                    "v_key": f"{gkey}:ev:0",
+                                    "type": "PIPELINE_XRUN_EVENT",
+                                    "comp_id": m_obj.comp_id,
+                                    "pipe_id": m_obj.pipeline_id,
+                                    "core_id": m_obj.core_id,
+                                    "widget_name": wname,
+                                    "count": x_cnt,
+                                    "exec_us": pipe.exec_peak_us,
+                                    "summary": (
+                                        f"Pipe {pipe.pipeline_id} on Core {pipe.core_id}: xruns={pipe.xruns}, "
+                                        f"avg={pipe.exec_avg_us:.2f} µs / peak={pipe.exec_peak_us:.2f} µs ({pipe.avg_kcps} kcps)"
+                                    ),
+                                    "mod": m_obj,
+                                }
+                            ],
+                            "mod": m_obj,
+                        }
+                    )
 
-        # 3. Core LL Deadline Violations
+        # 3. Core LL Deadline Violations (only attach to the violating module, never cascade to healthy modules)
         if telem and telem.cores:
             core = next((c for c in telem.cores if c.core_id == m_obj.core_id), None)
             if core and core.overruns > 0:
-                gkey = f"mod:{m_obj.comp_id}:core_overrun"
-                violations.append(
-                    {
-                        "v_key": gkey,
-                        "type": "CORE_OVERRUN",
-                        "comp_id": m_obj.comp_id,
-                        "pipe_id": m_obj.pipeline_id,
-                        "core_id": m_obj.core_id,
-                        "widget_name": wname,
-                        "count": core.overruns,
-                        "cycles": core.peak_cycles,
-                        "effective_cpc": 0,
-                        "over_cycles": 0,
-                        "exec_us": core.last_time_elapsed_us,
-                        "summary": (
-                            f"Core {core.core_id} LL Deadline Overrun ({core.overruns}×): "
-                            f"max={core.max_time_elapsed_cyc} cyc, load={core.cpu_load_pct:.1f}%"
-                        ),
-                        "children": [
-                            {
-                                "v_key": f"{gkey}:ev:0",
-                                "type": "CORE_OVERRUN_EVENT",
-                                "comp_id": m_obj.comp_id,
-                                "pipe_id": m_obj.pipeline_id,
-                                "core_id": m_obj.core_id,
-                                "widget_name": wname,
-                                "count": core.overruns,
-                                "summary": (
-                                    f"Core {core.core_id} @ {core.freq_hz // 1000000} MHz: "
-                                    f"overruns={core.overruns}, ticks={core.tick_count}, peak={core.peak_kcps} kcps"
-                                ),
-                                "mod": m_obj,
-                            }
-                        ],
-                        "mod": m_obj,
-                    }
+                core_mods = [c for c in telem.components if c.core_id == m_obj.core_id]
+                any_core_cpc_v = any(
+                    c.cpc_violations > 0 or (c.effective_cpc > 0 and c.peak_cycles > c.effective_cpc)
+                    for c in core_mods
                 )
+                is_core_culprit = has_cpc_v if any_core_cpc_v else (
+                    m_obj.peak_cycles > 0
+                    and m_obj.peak_cycles == max((c.peak_cycles for c in core_mods), default=0)
+                )
+                if is_core_culprit:
+                    gkey = f"mod:{m_obj.comp_id}:core_overrun"
+                    violations.append(
+                        {
+                            "v_key": gkey,
+                            "type": "CORE_OVERRUN",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "count": core.overruns,
+                            "cycles": core.peak_cycles,
+                            "effective_cpc": 0,
+                            "over_cycles": 0,
+                            "exec_us": core.last_time_elapsed_us,
+                            "summary": (
+                                f"Core {core.core_id} LL Deadline Overrun ({core.overruns}×): "
+                                f"max={core.max_time_elapsed_cyc} cyc, load={core.cpu_load_pct:.1f}%"
+                            ),
+                            "children": [
+                                {
+                                    "v_key": f"{gkey}:ev:0",
+                                    "type": "CORE_OVERRUN_EVENT",
+                                    "comp_id": m_obj.comp_id,
+                                    "pipe_id": m_obj.pipeline_id,
+                                    "core_id": m_obj.core_id,
+                                    "widget_name": wname,
+                                    "count": core.overruns,
+                                    "summary": (
+                                        f"Core {core.core_id} @ {core.freq_hz // 1000000} MHz: "
+                                        f"overruns={core.overruns}, ticks={core.tick_count}, peak={core.peak_kcps} kcps"
+                                    ),
+                                    "mod": m_obj,
+                                }
+                            ],
+                            "mod": m_obj,
+                        }
+                    )
 
-        # 4. Pin Buffer Starvation / Stall Violations
+        # 4. Pin Buffer Xrun / Underrun / Overrun Violations from actual testbench/FW errors
+        fw_errs = list(getattr(m_obj, "fw_errors", []) or [])
+        if self.ignore_tick0_underrun:
+            fw_errs = [fe for fe in fw_errs if int(fe.get("tick", 0) or 0) > 0]
+        handled_fw_err_ids: set = set()
+
         for p_in in m_obj.in_pins:
-            if p_in.buf_size > 0 and m_obj.iterations > 0 and p_in.total_bytes_transferred == 0 and m_obj.ibs > 0:
+            eff_x = self._effective_pin_xruns(m_obj, p_in)
+            if eff_x > 0:
                 gkey = f"mod:{m_obj.comp_id}:pin_in:{p_in.pin_index}"
+                pin_logs = [
+                    fe
+                    for fe in fw_errs
+                    if str(fe.get("pin_dir", "")).upper() == "IN"
+                    and int(fe.get("pin_index", -1)) in (p_in.pin_index, -1)
+                ]
+                for fe in pin_logs:
+                    handled_fw_err_ids.add(id(fe))
+                last_msg = (
+                    pin_logs[-1].get("msg", "")
+                    if pin_logs
+                    else (m_obj.last_error_msg or f"underrun={p_in.underrun_count} overrun={p_in.overrun_count}")
+                )
+                in_children: List[Dict[str, Any]] = []
+                for ev_i, fe in enumerate(pin_logs[:5]):
+                    t_idx = int(fe.get("tick", 0) or 0)
+                    in_children.append(
+                        {
+                            "v_key": f"{gkey}:ev:{ev_i}",
+                            "type": "FW_LOG_ERROR",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "tick_idx": t_idx,
+                            "time_ms": float(t_idx),
+                            "count": 1,
+                            "summary": (
+                                f"[FW {fe.get('level', 'ERR')} @ Tick #{t_idx} ({fe.get('file', 'fw')}:{fe.get('line', 0)})] "
+                                f"{fe.get('msg', '')}"
+                            ),
+                            "mod": m_obj,
+                        }
+                    )
+                if not in_children:
+                    in_children.append(
+                        {
+                            "v_key": f"{gkey}:ev:0",
+                            "type": "PIN_BUFFER_EVENT",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "count": eff_x,
+                            "summary": (
+                                f"IN[{p_in.pin_index}] peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}): "
+                                f"xruns={eff_x} (underrun={p_in.underrun_count}, overrun={p_in.overrun_count}) | "
+                                f"entry_avail={p_in.ll_entry_avail}B, exit_avail={p_in.ll_exit_avail}B | {last_msg}"
+                            ),
+                            "mod": m_obj,
+                        }
+                    )
                 violations.append(
                     {
                         "v_key": gkey,
@@ -4789,30 +4978,154 @@ class SchedulingTelemetryWidget(Gtk.Widget):
                         "pipe_id": m_obj.pipeline_id,
                         "core_id": m_obj.core_id,
                         "widget_name": wname,
-                        "count": 1,
+                        "count": eff_x,
                         "summary": (
-                            f"IN[{p_in.pin_index}] Buffer Starvation (buf={p_in.buf_id}): "
-                            f"0 B transferred over {m_obj.iterations} ticks (IBS={m_obj.ibs}B, size={p_in.buf_size}B)"
+                            f"IN[{p_in.pin_index}] FW Buffer Underrun/Xrun ({eff_x}×, buf={p_in.buf_id}): {last_msg}"
                         ),
-                        "children": [
-                            {
-                                "v_key": f"{gkey}:ev:0",
-                                "type": "PIN_BUFFER_EVENT",
-                                "comp_id": m_obj.comp_id,
-                                "pipe_id": m_obj.pipeline_id,
-                                "core_id": m_obj.core_id,
-                                "widget_name": wname,
-                                "count": 1,
-                                "summary": (
-                                    f"IN[{p_in.pin_index}] peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}): "
-                                    f"entry_avail={p_in.ll_entry_avail}B, exit_avail={p_in.ll_exit_avail}B, free={p_in.ll_exit_free}B"
-                                ),
-                                "mod": m_obj,
-                            }
-                        ],
+                        "children": in_children,
                         "mod": m_obj,
                     }
                 )
+
+        for p_out in m_obj.out_pins:
+            eff_x = self._effective_pin_xruns(m_obj, p_out)
+            if eff_x > 0:
+                gkey = f"mod:{m_obj.comp_id}:pin_out:{p_out.pin_index}"
+                pin_logs = [
+                    fe
+                    for fe in fw_errs
+                    if str(fe.get("pin_dir", "")).upper() == "OUT"
+                    and int(fe.get("pin_index", -1)) in (p_out.pin_index, -1)
+                ]
+                for fe in pin_logs:
+                    handled_fw_err_ids.add(id(fe))
+                last_msg = (
+                    pin_logs[-1].get("msg", "")
+                    if pin_logs
+                    else (m_obj.last_error_msg or f"overrun={p_out.overrun_count} underrun={p_out.underrun_count}")
+                )
+                out_children: List[Dict[str, Any]] = []
+                for ev_i, fe in enumerate(pin_logs[:5]):
+                    t_idx = int(fe.get("tick", 0) or 0)
+                    out_children.append(
+                        {
+                            "v_key": f"{gkey}:ev:{ev_i}",
+                            "type": "FW_LOG_ERROR",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "tick_idx": t_idx,
+                            "time_ms": float(t_idx),
+                            "count": 1,
+                            "summary": (
+                                f"[FW {fe.get('level', 'ERR')} @ Tick #{t_idx} ({fe.get('file', 'fw')}:{fe.get('line', 0)})] "
+                                f"{fe.get('msg', '')}"
+                            ),
+                            "mod": m_obj,
+                        }
+                    )
+                if not out_children:
+                    out_children.append(
+                        {
+                            "v_key": f"{gkey}:ev:0",
+                            "type": "PIN_BUFFER_EVENT",
+                            "comp_id": m_obj.comp_id,
+                            "pipe_id": m_obj.pipeline_id,
+                            "core_id": m_obj.core_id,
+                            "widget_name": wname,
+                            "count": eff_x,
+                            "summary": (
+                                f"OUT[{p_out.pin_index}] peer=0x{p_out.peer_comp_id:x} ({p_out.peer_widget_name or 'dai'}): "
+                                f"xruns={eff_x} (overrun={p_out.overrun_count}, underrun={p_out.underrun_count}) | "
+                                f"entry_avail={p_out.ll_entry_avail}B, free={p_out.ll_exit_free}B | {last_msg}"
+                            ),
+                            "mod": m_obj,
+                        }
+                    )
+                violations.append(
+                    {
+                        "v_key": gkey,
+                        "type": "PIN_BUFFER_STALL",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "count": eff_x,
+                        "summary": (
+                            f"OUT[{p_out.pin_index}] FW Buffer Overrun/Stall ({eff_x}×, buf={p_out.buf_id}): {last_msg}"
+                        ),
+                        "children": out_children,
+                        "mod": m_obj,
+                    }
+                )
+
+        # 5. Any remaining module-level FW errors logged by testbench over the network interface
+        rem_fw_errs = [fe for fe in fw_errs if id(fe) not in handled_fw_err_ids]
+        raw_err_cnt = int(getattr(m_obj, "error_count", 0) or 0)
+        t0_err_cnt = int(getattr(m_obj, "tick0_error_count", 0) or 0)
+        eff_mod_err = (
+            max(0, raw_err_cnt - t0_err_cnt)
+            if (self.ignore_tick0_underrun and t0_err_cnt > 0)
+            else (0 if (self.ignore_tick0_underrun and m_obj.iterations <= 1) else raw_err_cnt)
+        )
+        if rem_fw_errs or (eff_mod_err > 0 and not any(v["type"].startswith("PIN_BUFFER_") for v in violations)):
+            gkey = f"mod:{m_obj.comp_id}:fw_err"
+            err_cnt = max(eff_mod_err, len(rem_fw_errs), 1)
+            last_msg = (
+                rem_fw_errs[-1].get("msg", "")
+                if rem_fw_errs
+                else (m_obj.last_error_msg or f"module error count={err_cnt}")
+            )
+            fw_children: List[Dict[str, Any]] = []
+            for ev_i, fe in enumerate(rem_fw_errs[:5]):
+                t_idx = int(fe.get("tick", 0) or 0)
+                fw_children.append(
+                    {
+                        "v_key": f"{gkey}:ev:{ev_i}",
+                        "type": "FW_LOG_ERROR",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "tick_idx": t_idx,
+                        "time_ms": float(t_idx),
+                        "count": 1,
+                        "summary": (
+                            f"[FW {fe.get('level', 'ERR')} @ Tick #{t_idx} ({fe.get('file', 'fw')}:{fe.get('line', 0)})] "
+                            f"{fe.get('msg', '')}"
+                        ),
+                        "mod": m_obj,
+                    }
+                )
+            if not fw_children:
+                fw_children.append(
+                    {
+                        "v_key": f"{gkey}:ev:0",
+                        "type": "FW_LOG_ERROR",
+                        "comp_id": m_obj.comp_id,
+                        "pipe_id": m_obj.pipeline_id,
+                        "core_id": m_obj.core_id,
+                        "widget_name": wname,
+                        "count": err_cnt,
+                        "summary": f"[FW ERR] {last_msg}",
+                        "mod": m_obj,
+                    }
+                )
+            violations.append(
+                {
+                    "v_key": gkey,
+                    "type": "FW_MODULE_ERROR",
+                    "comp_id": m_obj.comp_id,
+                    "pipe_id": m_obj.pipeline_id,
+                    "core_id": m_obj.core_id,
+                    "widget_name": wname,
+                    "count": err_cnt,
+                    "summary": f"FW Error ({err_cnt}×): {last_msg}",
+                    "children": fw_children,
+                    "mod": m_obj,
+                }
+            )
         return violations
 
     def _scroll_to_expanded_module(self, comp_id: int) -> None:

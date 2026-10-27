@@ -23,11 +23,13 @@
 #define TB_TELEM_MAX_MODS	128
 #define TB_TELEM_MAX_PINS	4
 #define TB_TELEM_MAX_OVERRIDES	64
+#define TB_TELEM_MAX_FW_LOGS	64
 #define TB_MOD_TAP_SAMPLES	64
 #define TB_DSP_NOMINAL_HZ	400000000ULL	/* 400 MHz nominal DSP clock */
 
 struct pipeline;
 struct comp_dev;
+struct comp_buffer;
 
 /* Workload execution time simulation mode */
 enum host_workload_sim_mode {
@@ -160,6 +162,9 @@ struct host_mod_pin_telem {
 	uint32_t last_bytes_transferred;
 	uint64_t total_bytes_transferred;
 	uint32_t xrun_count;
+	uint32_t underrun_count;
+	uint32_t overrun_count;
+	uint32_t tick0_xrun_count;
 
 	/* Signal level telemetry on entry and exit (0.01 dBFS, e.g. -301 = -3.01 dBFS) */
 	int16_t entry_rms_dbfs_x100;
@@ -208,6 +213,8 @@ struct host_mod_telem {
 	uint64_t total_exec_ns;
 	uint32_t cpc_violations;
 	uint32_t error_count;
+	uint32_t tick0_error_count;
+	char last_error_msg[128];
 
 	/* For DP modules: LL tick ring-buffer synchronization stats */
 	uint64_t ll_ring_sync_iterations;
@@ -260,17 +267,34 @@ struct host_platform_hw_cfg {
 	uint32_t alloc_failures;
 };
 
+/* Captured firmware error/warning log entry */
+struct host_fw_log_entry {
+	bool active;
+	uint64_t tick;
+	uint32_t level;			/* LOG_LEVEL_ERROR (1) or LOG_LEVEL_WARNING (2) */
+	uint32_t pipe_id;		/* Pipeline ID or 0xFFFFFFFFU */
+	uint32_t comp_id;		/* Component IPC ID or 0xFFFFFFFFU */
+	int16_t pin_dir;		/* -1 = none, 0 = IN, 1 = OUT */
+	int16_t pin_index;		/* -1 = none, >= 0 = pin index */
+	char file[40];
+	int line;
+	char msg[160];
+};
+
 /* Global testbench scheduling and buffer telemetry state */
 struct host_sched_telemetry {
 	bool enabled;
 	uint32_t num_cores;
 	uint32_t num_pipes;
 	uint32_t num_mods;
+	uint32_t num_fw_logs;
+	uint32_t total_fw_errors;
 	struct host_platform_hw_cfg hw_cfg;
 	struct host_workload_sim_cfg sim_cfg;
 	struct host_core_telem cores[TB_TELEM_MAX_CORES];
 	struct host_pipe_telem pipes[TB_TELEM_MAX_PIPES];
 	struct host_mod_telem mods[TB_TELEM_MAX_MODS];
+	struct host_fw_log_entry fw_logs[TB_TELEM_MAX_FW_LOGS];
 };
 
 /* Reset all telemetry counters (preserves workload simulation & platform configuration) */
@@ -329,5 +353,11 @@ void host_telem_pipe_end(struct pipeline *p, uint64_t start_cycles, int ret);
 /* Module processing entry/exit hooks (is_dp_thread = false in comp_copy, true in dp_task_run) */
 uint64_t host_telem_mod_entry(struct comp_dev *dev, bool is_dp_thread);
 void host_telem_mod_exit(struct comp_dev *dev, bool is_dp_thread, uint64_t start_cycles, int ret);
+
+/* Firmware error/warning log and pin xrun capture hooks */
+void host_telem_record_log(uint32_t level, uint32_t pipe_id, uint32_t comp_id,
+			   const char *file, int line, const char *fmt, ...);
+void host_telem_record_pin_xrun(struct comp_dev *dev, struct comp_buffer *buf,
+				bool is_overrun, uint32_t req_bytes);
 
 #endif /* __PLATFORM_LIB_TELEMETRY_SCHED_H__ */

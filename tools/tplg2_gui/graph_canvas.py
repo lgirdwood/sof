@@ -166,6 +166,10 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.on_violation_bang_clicked = on_violation_bang_clicked
         self._active_context_popover: Optional[Gtk.Popover] = None
         self.live_node_telemetry: Dict[str, Dict[str, Any]] = {}
+        self.violating_edges: Dict[str, Dict[str, Any]] = {}
+        self.violating_ports: Set[Tuple[str, str, str]] = set()
+        self.violating_port_info: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self.ignore_tick0_underrun: bool = True
         self.active_probe_node_id: Optional[str] = None
         self.history = UndoRedoManager(on_history_changed=on_history_changed)
         self._suppress_auto_history: bool = False
@@ -396,9 +400,16 @@ class TopologyGraphCanvas(Gtk.Widget):
         self.diag_banner_text = None
         self.queue_draw()
 
+    def set_ignore_tick0_underrun(self, ignore: bool) -> None:
+        self.ignore_tick0_underrun = bool(ignore)
+        self.queue_draw()
+
     def set_live_telemetry_overlay(self, telem: Optional[Any]) -> None:
         """Populate live node telemetry, DAPM power badges, and violation status from TestbenchTelemetry."""
         self.live_node_telemetry.clear()
+        self.violating_edges.clear()
+        self.violating_ports.clear()
+        self.violating_port_info.clear()
         if telem is None or not self.vm:
             self.queue_draw()
             return
@@ -409,6 +420,17 @@ class TopologyGraphCanvas(Gtk.Widget):
         cores = getattr(telem, "cores", []) or []
         pipe_by_id = {int(getattr(p, "pipeline_id", -1)): p for p in pipes}
         core_by_id = {int(getattr(c, "core_id", -1)): c for c in cores}
+
+        any_pipe_cpc_over: Dict[int, bool] = {}
+        max_pipe_peak_cyc: Dict[int, int] = {}
+        for c in comps:
+            pid_c = int(getattr(c, "pipeline_id", 0) or 0)
+            pk_c = int(getattr(c, "peak_cycles", 0) or 0)
+            eff_c = int(getattr(c, "effective_cpc", 0) or 0)
+            cpcv_c = int(getattr(c, "cpc_violations", 0) or 0)
+            if cpcv_c > 0 or (eff_c > 0 and pk_c > eff_c):
+                any_pipe_cpc_over[pid_c] = True
+            max_pipe_peak_cyc[pid_c] = max(max_pipe_peak_cyc.get(pid_c, 0), pk_c)
 
         for nid, node in self.vm.nodes.items():
             if node.class_category in ("Control", "TestbenchIO", "PinFormat"):
@@ -445,28 +467,114 @@ class TopologyGraphCanvas(Gtk.Widget):
                 pk_cyc = int(getattr(matched_comp, "peak_cycles", 0) or 0) if matched_comp else 0
                 iters = int(getattr(matched_comp, "iterations", 0) or 0) if matched_comp else 0
                 ibs = int(getattr(matched_comp, "ibs", 0) or 0) if matched_comp else 0
+                obs = int(getattr(matched_comp, "obs", 0) or 0) if matched_comp else 0
                 pid_val = int(getattr(matched_comp, "pipeline_id", node.pipeline_id or 0)) if matched_comp else int(node.pipeline_id or 0)
                 cid_val = int(getattr(matched_comp, "core_id", 0)) if matched_comp else 0
 
                 p_obj = pipe_by_id.get(pid_val)
-                pipe_xruns = int(getattr(p_obj, "xruns", getattr(p_obj, "xrun_count", 0)) or 0) if p_obj else 0
+                raw_pipe_xruns = int(getattr(p_obj, "xruns", getattr(p_obj, "xrun_count", 0)) or 0) if p_obj else 0
                 c_obj = core_by_id.get(cid_val)
-                core_overruns = int(getattr(c_obj, "overruns", getattr(c_obj, "ll_deadline_violations", 0)) or 0) if c_obj else 0
+                raw_core_overruns = int(getattr(c_obj, "overruns", getattr(c_obj, "ll_deadline_violations", 0)) or 0) if c_obj else 0
+
                 in_pins = getattr(matched_comp, "in_pins", []) if matched_comp else []
-                pin_underrun = bool(
-                    any(
-                        getattr(p_in, "buf_size", 0) > 0
-                        and iters > 0
-                        and getattr(p_in, "total_bytes_transferred", 0) == 0
-                        and ibs > 0
-                        for p_in in in_pins
+                out_pins = getattr(matched_comp, "out_pins", []) if matched_comp else []
+                fw_errs = getattr(matched_comp, "fw_errors", []) if matched_comp else []
+
+                def _pin_eff_xruns(pin_obj: Any, dir_str: str, idx_p: int) -> int:
+                    p_idx = int(getattr(pin_obj, "pin_index", idx_p) or idx_p)
+                    tot_x = max(
+                        int(getattr(pin_obj, "xrun_count", 0) or 0),
+                        int(getattr(pin_obj, "underrun_count", 0) or 0)
+                        + int(getattr(pin_obj, "overrun_count", 0) or 0),
+                    )
+                    t0_x = int(getattr(pin_obj, "tick0_xrun_count", 0) or 0)
+                    p_logs = [
+                        fe
+                        for fe in (fw_errs or [])
+                        if str(fe.get("pin_dir", "")).upper() == dir_str
+                        and int(fe.get("pin_index", -1)) == p_idx
+                    ]
+                    if p_logs and tot_x == 0:
+                        tot_x = len(p_logs)
+                        t0_x = sum(1 for fe in p_logs if int(fe.get("tick", 0) or 0) == 0)
+                    if tot_x <= 0:
+                        return 0
+                    if self.ignore_tick0_underrun:
+                        if t0_x > 0:
+                            return max(0, tot_x - t0_x)
+                        if iters <= 1:
+                            return 0
+                    return tot_x
+
+                violated_in_indices = [
+                    int(getattr(p_in, "pin_index", idx_p) or idx_p)
+                    for idx_p, p_in in enumerate(in_pins)
+                    if _pin_eff_xruns(p_in, "IN", idx_p) > 0
+                ]
+                violated_out_indices = [
+                    int(getattr(p_out, "pin_index", idx_p) or idx_p)
+                    for idx_p, p_out in enumerate(out_pins)
+                    if _pin_eff_xruns(p_out, "OUT", idx_p) > 0
+                ]
+                raw_mod_err = int(getattr(matched_comp, "error_count", 0) or 0) if matched_comp else 0
+                t0_mod_err = int(getattr(matched_comp, "tick0_error_count", 0) or 0) if matched_comp else 0
+                mod_errs = (
+                    max(0, raw_mod_err - t0_mod_err)
+                    if (self.ignore_tick0_underrun and t0_mod_err > 0)
+                    else (0 if (self.ignore_tick0_underrun and iters <= 1) else raw_mod_err)
+                )
+                pin_underrun = bool(violated_in_indices or violated_out_indices)
+                has_cpc_over = cpc_v > 0 or (eff_cpc > 0 and pk_cyc > eff_cpc)
+
+                # Only attribute pipeline XRUN / core overrun to this module if it violated CPC
+                # or if no module in the pipeline violated CPC and this module is the peak-cycle culprit
+                is_xrun_culprit = has_cpc_over or (
+                    not any_pipe_cpc_over.get(pid_val, False)
+                    and pk_cyc > 0
+                    and pk_cyc == max_pipe_peak_cyc.get(pid_val, 0)
+                )
+                pipe_xruns = raw_pipe_xruns if is_xrun_culprit else 0
+                core_overruns = raw_core_overruns if is_xrun_culprit else 0
+
+                has_violation = bool(
+                    has_cpc_over or pin_underrun or mod_errs > 0 or pipe_xruns > 0 or core_overruns > 0
+                )
+                v_cnt = (
+                    cpc_v
+                    if cpc_v > 0
+                    else (
+                        pipe_xruns
+                        + core_overruns
+                        + len(violated_in_indices)
+                        + len(violated_out_indices)
+                        + mod_errs
+                        + (1 if has_cpc_over else 0)
                     )
                 )
-                has_cpc_over = cpc_v > 0 or (eff_cpc > 0 and pk_cyc > eff_cpc)
-                has_violation = bool(has_cpc_over or pipe_xruns > 0 or core_overruns > 0 or pin_underrun)
-                v_cnt = cpc_v if cpc_v > 0 else (pipe_xruns + core_overruns + (1 if pin_underrun else 0) + (1 if has_cpc_over else 0))
 
-                self.live_node_telemetry[nid] = {
+                # Build concise violation reason and pin tags for this module only (no cascading to neighbors)
+                violation_reasons: List[str] = []
+                pill_parts: List[str] = []
+                if has_cpc_over:
+                    violation_reasons.append(f"CPC:{pk_cyc}>{eff_cpc}(v={max(1, cpc_v)})")
+                    pill_parts.append("CPC")
+                for p_idx in violated_in_indices:
+                    violation_reasons.append(f"IN[{p_idx}] UNDERRUN")
+                    pill_parts.append(f"IN[{p_idx}]")
+                for p_idx in violated_out_indices:
+                    violation_reasons.append(f"OUT[{p_idx}] STALL")
+                    pill_parts.append(f"OUT[{p_idx}]")
+                if mod_errs > 0 and not (violated_in_indices or violated_out_indices):
+                    violation_reasons.append(f"FW_ERR(v={mod_errs})")
+                    pill_parts.append("FW_ERR")
+                if not violation_reasons and (pipe_xruns > 0 or core_overruns > 0):
+                    violation_reasons.append(f"XRUN(v={pipe_xruns or core_overruns})")
+                    pill_parts.append("XRUN")
+
+                reason_str = "+".join(pill_parts[:2]) if pill_parts else "VIOL"
+                violation_pill_tag = f"! {reason_str} v={max(1, v_cnt)}"
+
+                telem_entry: Dict[str, Any] = {
                     "comp_id": int(getattr(matched_comp, "resource_id", getattr(matched_comp, "comp_id", 0))) if matched_comp else int(d_nid),
                     "widget_name": (getattr(matched_comp, "widget_name", "") if matched_comp else d_name) or nid,
                     "pipeline_id": pid_val,
@@ -479,6 +587,11 @@ class TopologyGraphCanvas(Gtk.Widget):
                     "out_rms_db": float(getattr(matched_comp, "out_rms_db", -120.0)) if matched_comp else -120.0,
                     "powered": bool(d_pwr) if matched_dapm else True,
                     "has_violation": has_violation,
+                    "direct_violation": has_violation,
+                    "violation_reasons": violation_reasons,
+                    "violation_pill_tag": violation_pill_tag,
+                    "violated_in_pins": violated_in_indices,
+                    "violated_out_pins": violated_out_indices,
                     "violation_count": v_cnt,
                     "cpc_violations": cpc_v,
                     "effective_cpc": eff_cpc,
@@ -489,6 +602,40 @@ class TopologyGraphCanvas(Gtk.Widget):
                     "pin_underrun": pin_underrun,
                     "mod_obj": matched_comp,
                 }
+                self.live_node_telemetry[nid] = telem_entry
+
+                # Mark ONLY the specific violated pin port(s) on this violating module
+                for p_idx in violated_in_indices:
+                    port_obj = (
+                        node.in_ports[p_idx]
+                        if p_idx < len(node.in_ports)
+                        else (node.in_ports[0] if node.in_ports else None)
+                    )
+                    if port_obj is not None:
+                        pkey = (nid, port_obj.id, "in")
+                        self.violating_ports.add(pkey)
+                        self.violating_port_info[pkey] = {
+                            "primary_nid": nid,
+                            "primary_telem": telem_entry,
+                            "pin_label": f"IN[{p_idx}]",
+                            "reason": f"IN[{p_idx}] UNDERRUN",
+                        }
+                for p_idx in violated_out_indices:
+                    port_obj = (
+                        node.out_ports[p_idx]
+                        if p_idx < len(node.out_ports)
+                        else (node.out_ports[0] if node.out_ports else None)
+                    )
+                    if port_obj is not None:
+                        pkey = (nid, port_obj.id, "out")
+                        self.violating_ports.add(pkey)
+                        self.violating_port_info[pkey] = {
+                            "primary_nid": nid,
+                            "primary_telem": telem_entry,
+                            "pin_label": f"OUT[{p_idx}]",
+                            "reason": f"OUT[{p_idx}] STALL",
+                        }
+
         self.queue_draw()
 
     def set_graph(self, vm: GraphViewModel, workspace: Optional[Topology2Workspace] = None) -> None:
@@ -1494,9 +1641,9 @@ class TopologyGraphCanvas(Gtk.Widget):
             snapshot.append_layout(bang_lbl, TEXT_WHITE)
             snapshot.restore()
 
-            # 2) Compact red [! v=N] violation pill next to the TAP pill in top-right of header
+            # 2) Compact red [! <reason/pin> v=N] violation pill next to the TAP pill in top-right of header
             v_cnt = int(telem_info.get("violation_count", 1) or 1)
-            vpill_txt = f"! v={v_cnt}"
+            vpill_txt = str(telem_info.get("violation_pill_tag") or f"! v={v_cnt}")
             vpill_lbl = self._get_pango_layout(vpill_txt, size_pt=6, bold=True)
             _, vpill_ext = vpill_lbl.get_pixel_extents()
             vpill_w = max(32.0, float(vpill_ext.width) + 10.0)
@@ -1547,10 +1694,14 @@ class TopologyGraphCanvas(Gtk.Widget):
             pwr_str = "ON" if telem_info.get("powered", True) else "OFF"
             if has_violation:
                 v_cnt = int(telem_info.get("violation_count", 1) or 1)
-                pk_cyc = int(telem_info.get("peak_cycles", 0) or 0)
-                eff_cpc = int(telem_info.get("effective_cpc", 0) or 0)
-                cpc_tag = f" · CPC:{pk_cyc}/{eff_cpc}" if eff_cpc > 0 else ""
-                sub_text = f"! VIOLATION (v={v_cnt}){cpc_tag} · ⚡{kcps_val:.0f} KCPS · {mem_dom}"
+                reasons = telem_info.get("violation_reasons") or []
+                if reasons:
+                    sub_text = f"! {' · '.join(reasons)} · ⚡{kcps_val:.0f} KCPS"
+                else:
+                    pk_cyc = int(telem_info.get("peak_cycles", 0) or 0)
+                    eff_cpc = int(telem_info.get("effective_cpc", 0) or 0)
+                    cpc_tag = f" · CPC:{pk_cyc}/{eff_cpc}" if eff_cpc > 0 else ""
+                    sub_text = f"! VIOLATION (v={v_cnt}){cpc_tag} · ⚡{kcps_val:.0f} KCPS"
                 sub_col = rgba(1.0, 0.52, 0.52, 1.0)
             elif out_db > -115.0:
                 sub_text = f"⚡{kcps_val:.0f} KCPS · {mem_dom} · {out_db:.1f}dB [{pwr_str}]"
@@ -1629,18 +1780,40 @@ class TopologyGraphCanvas(Gtk.Widget):
                 snapshot.restore()
                 bx += bw_px + 5.0
 
-        # Input & Output connection ports
+        # Input & Output connection ports (render red bang (!) badge on violated pin connections)
         for port in node.in_ports:
             px = node.x + port.rel_x
             py = node.y + port.rel_y
             is_hov = self.hovered_port == (node.id, port.id, "in")
-            self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_IN_COLOR, radius=6.5 if is_hov else 5.0)
+            if (node.id, port.id, "in") in self.violating_ports:
+                self._snapshot_port_circle(snapshot, px, py, rgba(1.0, 0.90, 0.90, 0.98), radius=8.2 if is_hov else 7.4)
+                self._snapshot_port_circle(snapshot, px, py, rgba(0.92, 0.12, 0.16, 1.0), radius=6.8 if is_hov else 6.0)
+                pb_lbl = self._get_pango_layout("!", size_pt=7, bold=True)
+                _, pb_ext = pb_lbl.get_pixel_extents()
+                snapshot.save()
+                pt.init(px - float(pb_ext.width) * 0.5, py - float(pb_ext.height) * 0.5)
+                snapshot.translate(pt)
+                snapshot.append_layout(pb_lbl, TEXT_WHITE)
+                snapshot.restore()
+            else:
+                self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_IN_COLOR, radius=6.5 if is_hov else 5.0)
 
         for port in node.out_ports:
             px = node.x + port.rel_x
             py = node.y + port.rel_y
             is_hov = self.hovered_port == (node.id, port.id, "out")
-            self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_OUT_COLOR, radius=6.5 if is_hov else 5.0)
+            if (node.id, port.id, "out") in self.violating_ports:
+                self._snapshot_port_circle(snapshot, px, py, rgba(1.0, 0.90, 0.90, 0.98), radius=8.2 if is_hov else 7.4)
+                self._snapshot_port_circle(snapshot, px, py, rgba(0.92, 0.12, 0.16, 1.0), radius=6.8 if is_hov else 6.0)
+                pb_lbl = self._get_pango_layout("!", size_pt=7, bold=True)
+                _, pb_ext = pb_lbl.get_pixel_extents()
+                snapshot.save()
+                pt.init(px - float(pb_ext.width) * 0.5, py - float(pb_ext.height) * 0.5)
+                snapshot.translate(pt)
+                snapshot.append_layout(pb_lbl, TEXT_WHITE)
+                snapshot.restore()
+            else:
+                self._snapshot_port_circle(snapshot, px, py, PORT_HOVER_COLOR if is_hov else PORT_OUT_COLOR, radius=6.5 if is_hov else 5.0)
 
     @staticmethod
     def _get_kcontrol_short_name(node: GraphNode) -> str:
@@ -2350,7 +2523,22 @@ class TopologyGraphCanvas(Gtk.Widget):
             return
 
         is_diag = edge.id == self.diag_highlight_edge_id
-        if is_diag:
+        v_edge_meta = self.violating_edges.get(edge.id)
+        if v_edge_meta is not None:
+            # Outer crimson alert glow along the violated pin connection wire
+            self._snapshot_bezier_wire(
+                snapshot,
+                x1,
+                y1,
+                x2,
+                y2,
+                rgba(0.96, 0.14, 0.18, 0.28),
+                width=6.8,
+                dashed=False,
+            )
+            color = rgba(1.0, 0.22, 0.25, 0.98)
+            width = 3.4
+        elif is_diag:
             color = (
                 rgba(1.0, 0.30, 0.30, 1.0)
                 if self.diag_banner_severity == "error"
@@ -2361,6 +2549,48 @@ class TopologyGraphCanvas(Gtk.Widget):
             color = EDGE_SELECTED_COLOR if is_sel else (EDGE_INTER_COLOR if edge.is_inter_pipeline else EDGE_INTRA_COLOR)
             width = 3.2 if is_sel else (2.4 if edge.is_inter_pipeline else 2.0)
         self._snapshot_bezier_wire(snapshot, x1, y1, x2, y2, color, width=width, dashed=edge.is_inter_pipeline)
+
+        # Render a Red Bang (!) badge at the midpoint of a violated pin connection wire
+        if v_edge_meta is not None:
+            mx = 0.5 * (x1 + x2)
+            my = 0.5 * (y1 + y2)
+            pin_txt = f"{u_port.id}→{v_port.id}"
+            pin_lyt = self._get_pango_layout(pin_txt, size_pt=6, bold=True)
+            _, pin_ext = pin_lyt.get_pixel_extents()
+            pill_w = 18.0 + float(pin_ext.width) + 8.0
+            pill_h = 16.0
+            pill_x = mx - pill_w * 0.5
+            pill_y = my - pill_h * 0.5
+
+            pill_rect = Graphene.Rect.alloc()
+            pill_rect.init(pill_x, pill_y, pill_w, pill_h)
+            pill_rr = Gsk.RoundedRect()
+            pill_rr.init_from_rect(pill_rect, 8.0)
+            snapshot.push_rounded_clip(pill_rr)
+            snapshot.append_color(rgba(0.76, 0.08, 0.12, 0.96), pill_rect)
+            snapshot.pop()
+            eb_col = rgba(1.0, 0.76, 0.76, 0.98)
+            snapshot.append_border(pill_rr, [1.2, 1.2, 1.2, 1.2], [eb_col, eb_col, eb_col, eb_col])
+
+            # Circular Red Bang (!) inside left end of the wire badge
+            bcx = pill_x + 8.5
+            bcy = my
+            self._snapshot_port_circle(snapshot, bcx, bcy, rgba(1.0, 0.94, 0.94, 0.98), radius=6.8)
+            self._snapshot_port_circle(snapshot, bcx, bcy, rgba(0.95, 0.14, 0.18, 1.0), radius=5.6)
+            b_lbl = self._get_pango_layout("!", size_pt=7, bold=True)
+            _, b_ext = b_lbl.get_pixel_extents()
+            pt = Graphene.Point.alloc()
+            snapshot.save()
+            pt.init(bcx - float(b_ext.width) * 0.5, bcy - float(b_ext.height) * 0.5)
+            snapshot.translate(pt)
+            snapshot.append_layout(b_lbl, TEXT_WHITE)
+            snapshot.restore()
+
+            snapshot.save()
+            pt.init(pill_x + 17.5, pill_y + 2.0)
+            snapshot.translate(pt)
+            snapshot.append_layout(pin_lyt, TEXT_WHITE)
+            snapshot.restore()
 
     @staticmethod
     def _resolve_edge_ports(u: GraphNode, v: GraphNode, edge: GraphEdge) -> Tuple[GraphPort, GraphPort]:
@@ -2573,6 +2803,11 @@ class TopologyGraphCanvas(Gtk.Widget):
             y1 = u.y + u_port.rel_y
             x2 = v.x + v_port.rel_x
             y2 = v.y + v_port.rel_y
+            if edge.id in self.violating_edges:
+                mx = 0.5 * (x1 + x2)
+                my = 0.5 * (y1 + y2)
+                if abs(wx - mx) <= 38.0 and abs(wy - my) <= 12.0:
+                    return edge.id
             dx = max(45.0, abs(x2 - x1) * 0.48)
             sign = 1.0 if x2 >= x1 else -1.0
             # Sample 16 points along cubic Bezier
@@ -2601,8 +2836,16 @@ class TopologyGraphCanvas(Gtk.Widget):
         state = gesture.get_current_event_state()
         additive = bool(state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK))
 
-        # Check port first (don't change selection if starting a wire drag)
-        if not self._has_multi_selection() and self._hit_test_port(wx, wy) is not None:
+        # Check port first (don't change selection if starting a wire drag; if violated port red bang clicked, zoom to violation)
+        port_hit = self._hit_test_port(wx, wy)
+        if not self._has_multi_selection() and port_hit is not None:
+            p_key = (port_hit[0], port_hit[1], port_hit[2])
+            if p_key in self.violating_port_info and self.on_violation_bang_clicked:
+                p_meta = self.violating_port_info[p_key]
+                self.on_violation_bang_clicked(
+                    str(p_meta.get("primary_nid") or port_hit[0]),
+                    p_meta.get("primary_telem") or self.live_node_telemetry.get(port_hit[0], {}),
+                )
             return
 
         # If a multi-selection group is active and user presses inside the selected group/containers/nodes,
@@ -2674,9 +2917,19 @@ class TopologyGraphCanvas(Gtk.Widget):
             telem_info = self.live_node_telemetry.get(nid)
             has_v = bool(telem_info and telem_info.get("has_violation"))
             if has_v and telem_info is not None and 0.0 <= ly <= 26.0:
-                if lx <= 26.0 or (node.width - 96.0 <= lx < node.width - 48.0):
+                if lx <= 26.0 or (node.width - 125.0 <= lx < node.width - 48.0):
                     if self.on_violation_bang_clicked:
-                        self.on_violation_bang_clicked(nid, telem_info)
+                        target_nid = (
+                            nid
+                            if telem_info.get("direct_violation", True)
+                            else str(telem_info.get("primary_violation_nid") or nid)
+                        )
+                        target_telem = (
+                            telem_info
+                            if telem_info.get("direct_violation", True)
+                            else (telem_info.get("primary_violation_telem") or telem_info)
+                        )
+                        self.on_violation_bang_clicked(target_nid, target_telem)
                     self.queue_draw()
                     return
             if 0.0 <= ly <= 26.0 and lx >= node.width - 48.0:
@@ -2699,6 +2952,12 @@ class TopologyGraphCanvas(Gtk.Widget):
 
         eid = self._hit_test_edge(wx, wy)
         if eid:
+            if eid in self.violating_edges and self.on_violation_bang_clicked:
+                ve_meta = self.violating_edges[eid]
+                self.on_violation_bang_clicked(
+                    str(ve_meta.get("primary_nid") or ""),
+                    ve_meta.get("primary_telem") or {},
+                )
             self.selected_node_id = None
             self.selected_node_ids.clear()
             self.selected_edge_id = eid

@@ -1081,6 +1081,13 @@ static inline void component_set_nearest_period_frames(struct comp_dev *current,
  *  @{
  */
 
+#ifdef CONFIG_LIBRARY
+__attribute__((weak)) void host_telem_record_pin_xrun(struct comp_dev *dev,
+						      struct comp_buffer *buf,
+						      bool is_overrun,
+						      uint32_t req_bytes);
+#endif
+
 /**
  * Called by the component device when underrun is detected.
  * @param dev Component device.
@@ -1095,6 +1102,11 @@ static inline void comp_underrun(struct comp_dev *dev,
 
 	int32_t bytes = (int32_t)audio_stream_get_avail_bytes(&source->stream) -
 			copy_bytes;
+
+#ifdef CONFIG_LIBRARY
+	if (host_telem_record_pin_xrun)
+		host_telem_record_pin_xrun(dev, source, false, copy_bytes);
+#endif
 
 	comp_err(dev, "comp_underrun(): dev->comp.id = %u, source->avail = %u, copy_bytes = %u",
 		 dev_comp_id(dev),
@@ -1117,6 +1129,11 @@ static inline void comp_overrun(struct comp_dev *dev, struct comp_buffer *sink,
 
 	int32_t bytes = (int32_t)copy_bytes -
 			audio_stream_get_free_bytes(&sink->stream);
+
+#ifdef CONFIG_LIBRARY
+	if (host_telem_record_pin_xrun)
+		host_telem_record_pin_xrun(dev, sink, true, copy_bytes);
+#endif
 
 	comp_err(dev, "comp_overrun(): sink->free = %u, copy_bytes = %u",
 		 audio_stream_get_free_bytes(&sink->stream), copy_bytes);

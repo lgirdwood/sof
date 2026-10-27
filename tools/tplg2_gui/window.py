@@ -9,14 +9,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+from . import __version__ as TOOL_VERSION
 
 from .compiler import (
     CompileDiagnostic,
@@ -377,6 +381,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.action_select_target_variant,
         )
         self._register_win_action("open_active_platform_def", lambda: self.action_open_active_platform_def())
+        self._register_win_action("about", self.action_show_about)
 
         app = self.get_application()
         if app is not None:
@@ -477,9 +482,241 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self._populate_target_menu()
         menubar_model.append_submenu("Target", self.target_menu)
 
+        # 5. Help Menu (About)
+        help_menu = Gio.Menu.new()
+        help_sec = Gio.Menu.new()
+        help_sec.append("About…", "win.about")
+        help_menu.append_section(None, help_sec)
+        menubar_model.append_submenu("Help", help_menu)
+
         self.menubar_model = menubar_model
         menubar = Gtk.PopoverMenuBar.new_from_model(menubar_model)
         return menubar
+
+    def _collect_version_info(self) -> Dict[str, str]:
+        """Collect versions of the Tool, SOF firmware/testbench, ALSA library/driver, and alsa-utils."""
+        gtk_ver = f"{Gtk.get_major_version()}.{Gtk.get_minor_version()}.{Gtk.get_micro_version()}"
+        py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        tool_ver = f"SOF Topology2 Studio v{TOOL_VERSION} (GTK {gtk_ver}, Python {py_ver})"
+
+        # Resolve SOF root directory
+        tplg2_root = (
+            self.workspace.root_dir
+            if (self.workspace and self.workspace.root_dir)
+            else os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "topology", "topology2"))
+        )
+        sof_root = os.path.abspath(os.path.join(tplg2_root, "..", "..", ".."))
+
+        # 1. SOF Version
+        sof_ver_parts: List[str] = []
+        sof_ver_h_candidates = [
+            os.path.join(sof_root, "tools", "testbench", "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
+            os.path.join(sof_root, "build_testbench", "sof_ep", "build", "generated", "include", "sof_versions.h"),
+        ]
+        for vh_path in sof_ver_h_candidates:
+            if os.path.isfile(vh_path):
+                try:
+                    with open(vh_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        vh_txt = fh.read()
+                    maj = re.search(r"#define\s+SOF_MAJOR\s+(\d+)", vh_txt)
+                    mnr = re.search(r"#define\s+SOF_MINOR\s+(\d+)", vh_txt)
+                    mic = re.search(r"#define\s+SOF_MICRO\s+(\d+)", vh_txt)
+                    gtag = re.search(r'#define\s+SOF_GIT_TAG\s+"([^"]+)"', vh_txt)
+                    if maj and mnr and mic:
+                        sof_ver_parts.append(f"v{maj.group(1)}.{mnr.group(1)}.{mic.group(1)}")
+                    if gtag:
+                        sof_ver_parts.append(f"({gtag.group(1)})")
+                    break
+                except Exception:
+                    pass
+        if not sof_ver_parts:
+            cmake_p = os.path.join(sof_root, "CMakeLists.txt")
+            if os.path.isfile(cmake_p):
+                try:
+                    with open(cmake_p, "r", encoding="utf-8", errors="ignore") as fh:
+                        cm_txt = fh.read()
+                    maj = re.search(r"set\(VERSION_MAJOR\s+(\d+)\)", cm_txt)
+                    mnr = re.search(r"set\(VERSION_MINOR\s+(\d+)\)", cm_txt)
+                    mic = re.search(r"set\(VERSION_MICRO\s+(\d+)\)", cm_txt)
+                    if maj and mnr and mic:
+                        sof_ver_parts.append(f"v{maj.group(1)}.{mnr.group(1)}.{mic.group(1)}")
+                except Exception:
+                    pass
+            try:
+                git_out = subprocess.check_output(
+                    ["git", "-C", sof_root, "describe", "--tags", "--always"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=1.5,
+                ).strip()
+                if git_out:
+                    sof_ver_parts.append(f"({git_out})")
+            except Exception:
+                pass
+        if self.last_telemetry and self.last_telemetry.fw_version and self.last_telemetry.fw_version != "0.0.0.0":
+            sof_ver_parts.append(f"[Live FW: v{self.last_telemetry.fw_version}]")
+        sof_ver = " ".join(sof_ver_parts) if sof_ver_parts else "Unknown"
+
+        # 2. ALSA & alsa-utils versions
+        alsatplg_bin = (
+            self.compiler.alsatplg_bin
+            if (self.compiler and getattr(self.compiler, "alsatplg_bin", None))
+            else (shutil.which("alsatplg") or "alsatplg")
+        )
+        alsatplg_ver = ""
+        libasound_ver = ""
+        libatopology_ver = ""
+        try:
+            out = subprocess.check_output(
+                [alsatplg_bin, "--version"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=1.5,
+            )
+            for ln in out.splitlines():
+                m_t = re.search(r"alsatplg\s+version\s+(\S+)", ln, re.IGNORECASE)
+                if m_t:
+                    alsatplg_ver = m_t.group(1)
+                m_a = re.search(r"libasound\s+version\s+(\S+)", ln, re.IGNORECASE)
+                if m_a:
+                    libasound_ver = m_a.group(1)
+                m_top = re.search(r"libatopology\s+version\s+(\S+)", ln, re.IGNORECASE)
+                if m_top:
+                    libatopology_ver = m_top.group(1)
+        except Exception:
+            pass
+
+        if not libasound_ver:
+            try:
+                libasound_ver = subprocess.check_output(
+                    ["pkg-config", "--modversion", "alsa"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=1.5,
+                ).strip()
+            except Exception:
+                pass
+
+        aplay_ver = ""
+        aplay_bin = shutil.which("aplay")
+        if aplay_bin:
+            try:
+                out = subprocess.check_output(
+                    [aplay_bin, "--version"],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=1.5,
+                )
+                m_ap = re.search(r"version\s+([0-9][0-9A-Za-z._-]*)", out)
+                if m_ap:
+                    aplay_ver = m_ap.group(1)
+            except Exception:
+                pass
+
+        kernel_alsa = ""
+        if os.path.isfile("/proc/asound/version"):
+            try:
+                with open("/proc/asound/version", "r", encoding="utf-8", errors="ignore") as fh:
+                    k_line = fh.readline().strip().rstrip(".")
+                m_k = re.search(r"Version\s+(\S+)", k_line)
+                kernel_alsa = m_k.group(1) if m_k else k_line
+            except Exception:
+                pass
+
+        alsa_parts: List[str] = []
+        if libasound_ver:
+            alsa_parts.append(f"libasound {libasound_ver}")
+        if libatopology_ver:
+            alsa_parts.append(f"libatopology {libatopology_ver}")
+        if kernel_alsa:
+            alsa_parts.append(f"Kernel ALSA {kernel_alsa}")
+        alsa_ver = "  |  ".join(alsa_parts) if alsa_parts else "Unknown"
+
+        utils_parts: List[str] = []
+        if alsatplg_ver:
+            utils_parts.append(f"alsatplg {alsatplg_ver}")
+        if aplay_ver and aplay_ver != alsatplg_ver:
+            utils_parts.append(f"aplay {aplay_ver}")
+        elif aplay_ver and not alsatplg_ver:
+            utils_parts.append(f"alsa-utils {aplay_ver}")
+        if alsatplg_bin:
+            utils_parts.append(f"({alsatplg_bin})")
+        alsautils_ver = " ".join(utils_parts) if utils_parts else "Unknown"
+
+        return {
+            "tool": tool_ver,
+            "sof": sof_ver,
+            "alsa": alsa_ver,
+            "alsautils": alsautils_ver,
+        }
+
+    def action_show_about(self) -> None:
+        """Display the Help -> About dialog showing Tool, SOF, ALSA, and alsa-utils versions."""
+        debug_log_action("HELP-ABOUT", "Open About dialog")
+        vinfo = self._collect_version_info()
+
+        dlg = Gtk.Window(
+            title="About SOF Topology2 Studio",
+            transient_for=self,
+            modal=True,
+            default_width=560,
+            default_height=310,
+            resizable=False,
+        )
+        self._about_dialog = dlg
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(18)
+        outer.set_margin_bottom(18)
+        outer.set_margin_start(22)
+        outer.set_margin_end(22)
+
+        title_lbl = Gtk.Label(label="SOF Topology2 Studio")
+        title_lbl.add_css_class("heading")
+        title_lbl.set_xalign(0.0)
+        outer.append(title_lbl)
+
+        sub_lbl = Gtk.Label(
+            label="Visual Graph Editor, IPC4 Topology Compiler & Real-Time SOF Testbench"
+        )
+        sub_lbl.set_xalign(0.0)
+        outer.append(sub_lbl)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        outer.append(sep)
+
+        grid = Gtk.Grid(column_spacing=16, row_spacing=10)
+        rows = [
+            ("Tool Version:", vinfo["tool"]),
+            ("SOF Version:", vinfo["sof"]),
+            ("ALSA Version:", vinfo["alsa"]),
+            ("alsa-utils Version:", vinfo["alsautils"]),
+        ]
+        for r_idx, (k_txt, val_txt) in enumerate(rows):
+            k_lbl = Gtk.Label(label=k_txt)
+            k_lbl.set_xalign(0.0)
+            k_lbl.add_css_class("heading")
+            v_lbl = Gtk.Label(label=val_txt)
+            v_lbl.set_xalign(0.0)
+            v_lbl.set_selectable(True)
+            v_lbl.set_wrap(True)
+            v_lbl.set_hexpand(True)
+            grid.attach(k_lbl, 0, r_idx, 1, 1)
+            grid.attach(v_lbl, 1, r_idx, 1, 1)
+
+        outer.append(grid)
+
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.set_halign(Gtk.Align.END)
+        btn_row.set_margin_top(10)
+        close_btn = Gtk.Button(label="Close")
+        close_btn.add_css_class("suggested-action")
+        close_btn.connect("clicked", lambda _b: dlg.close())
+        btn_row.append(close_btn)
+        outer.append(btn_row)
+
+        dlg.set_child(outer)
+        dlg.present()
 
     def _populate_target_menu(self) -> None:
         """Populate the Target menu with Platform Architecture choices."""
@@ -668,23 +905,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         header.set_show_title_buttons(True)
         self.set_titlebar(header)
 
-        # Left side: Unified Menubar (File, Edit, View)
+        # Left side: Unified Menubar (File, Edit, View, Target, Help)
         self.menubar = self._build_menubar()
         header.pack_start(self.menubar)
 
-        # Right header controls: Testbench Audio Config + Compile + Run in Testbench
-        self.play_out_btn = Gtk.Button(label="Play Out WAV")
-        self.play_out_btn.set_sensitive(False)
-        self.play_out_btn.set_tooltip_text("Play processed testbench output WAV via aplay")
-        self.play_out_btn.connect("clicked", self._on_play_output_clicked)
-        header.pack_end(self.play_out_btn)
-
-        self.keep_alive_btn = Gtk.ToggleButton(label="Keep Server (-W)")
-        self.keep_alive_btn.set_tooltip_text(
-            "Keep sof-testbench4 SOFR TCP server running after run for interactive control & telemetry"
-        )
-        header.pack_end(self.keep_alive_btn)
-
+        # Right header controls: Compile + Run in Testbench
         self.run_tb_btn = Gtk.Button(label="▶ Run in Testbench")
         self.run_tb_btn.add_css_class("suggested-action")
         self.run_tb_btn.set_tooltip_text(
@@ -867,6 +1092,14 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         )
         self.sched_expanded_btn.connect("toggled", self._on_sched_expanded_toggled)
         sched_toolbar.append(self.sched_expanded_btn)
+
+        self.sched_ignore_tick0_chk = Gtk.CheckButton.new_with_label("Ignore Tick 0 Underrun/Stall")
+        self.sched_ignore_tick0_chk.set_active(True)
+        self.sched_ignore_tick0_chk.set_tooltip_text(
+            "Ignore Tick 0 / startup pin buffer underrun and stall violations when the DSP has no input yet"
+        )
+        self.sched_ignore_tick0_chk.connect("toggled", self._on_sched_ignore_tick0_toggled)
+        sched_toolbar.append(self.sched_ignore_tick0_chk)
 
         self.sched_zoom_lbl = Gtk.Label(label="Win: 10.00/10.0 ms (1.0×, Expanded Slices)")
         self.sched_zoom_lbl.add_css_class("monospace")
@@ -1079,7 +1312,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.hot_reload_btn = Gtk.ToggleButton(label="🔥 Hot-Reload")
         self.hot_reload_btn.set_active(False)
         self.hot_reload_btn.set_tooltip_text(
-            "When Keep Server (-W) is active, hot-reload compiled topologies via 'tplg-load' & 'io-cfg' without restarting sof-testbench4"
+            "Hot-reload compiled topologies via 'tplg-load' & 'io-cfg' without restarting sof-testbench4"
         )
         exec_row1.append(self.hot_reload_btn)
         ctl_box.append(exec_row1)
@@ -1242,8 +1475,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         ctl_scroll.set_child(ctl_box)
         self.right_notebook.append_page(ctl_scroll, Gtk.Label(label="Remote Control"))
 
-        # Right Notebook Tab 4: Telemetry Log View (Violation & Pin/Scheduler Log Inspector)
-        self.telemetry_log_page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        # Right Notebook Tab 4: Graphical & Searchable Telemetry Log TreeView Inspector
+        self.telemetry_log_page_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
         self.telemetry_log_page_box.set_margin_start(4)
         self.telemetry_log_page_box.set_margin_end(4)
         self.telemetry_log_page_box.set_margin_top(4)
@@ -1251,7 +1484,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         vlog_hdr_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.telemetry_log_title_lbl = Gtk.Label(
-            label="Telemetry Log: Click any violation in Scheduling & Buffers to inspect detailed violation logs."
+            label="Telemetry Log: Click any violation or run Testbench to inspect structured telemetry."
         )
         self.telemetry_log_title_lbl.set_xalign(0.0)
         self.telemetry_log_title_lbl.set_hexpand(True)
@@ -1260,13 +1493,181 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         vlog_hdr_box.append(self.telemetry_log_title_lbl)
 
         btn_vlog_all = Gtk.Button(label="Show All")
-        btn_vlog_all.set_tooltip_text("Show full telemetry & violation log across all modules")
-        btn_vlog_all.connect("clicked", lambda _b: self._populate_telemetry_log_view(self.last_telemetry, None))
+        btn_vlog_all.set_tooltip_text("Reset filters and show full telemetry & violation tree across all sections")
+        btn_vlog_all.connect("clicked", self._on_telemetry_log_show_all_clicked)
         vlog_hdr_box.append(btn_vlog_all)
         self.telemetry_log_page_box.append(vlog_hdr_box)
 
+        # 1. Top KPI Summary Cards Strip
+        self.telemetry_kpi_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.telemetry_kpi_box.set_homogeneous(True)
+
+        def _make_kpi_badge(default_txt: str) -> Gtk.Label:
+            fr = Gtk.Frame()
+            lbl = Gtk.Label(label=default_txt)
+            lbl.set_margin_start(6)
+            lbl.set_margin_end(6)
+            lbl.set_margin_top(3)
+            lbl.set_margin_bottom(3)
+            lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            lbl.add_css_class("caption")
+            fr.set_child(lbl)
+            self.telemetry_kpi_box.append(fr)
+            return lbl
+
+        self.kpi_viol_lbl = _make_kpi_badge("🟢 0 Violations")
+        self.kpi_core_lbl = _make_kpi_badge("⚡ Cores: Idle")
+        self.kpi_kcps_lbl = _make_kpi_badge("🧩 Modules: 0 (0 KCPS)")
+        self.kpi_mem_lbl = _make_kpi_badge("💾 SRAM / Ticks: 0")
+        self.telemetry_log_page_box.append(self.telemetry_kpi_box)
+
+        # 2. Search Entry + Expand/Collapse Toolbar
+        vlog_search_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.telemetry_search_entry = Gtk.SearchEntry()
+        self.telemetry_search_entry.set_placeholder_text(
+            "Search modules, pins, buffers, violations, cores, kcontrols…"
+        )
+        self.telemetry_search_entry.set_hexpand(True)
+        self.telemetry_search_entry.connect("search-changed", self._on_telemetry_search_changed)
+        vlog_search_row.append(self.telemetry_search_entry)
+
+        btn_tree_exp = Gtk.Button(label="⊞ Expand")
+        btn_tree_exp.set_tooltip_text("Expand all telemetry tree sections")
+        btn_tree_exp.connect("clicked", lambda _b: self.telemetry_log_tree.expand_all())
+        vlog_search_row.append(btn_tree_exp)
+
+        btn_tree_col = Gtk.Button(label="⊟ Collapse")
+        btn_tree_col.set_tooltip_text("Collapse all telemetry tree sections")
+        btn_tree_col.connect("clicked", lambda _b: self.telemetry_log_tree.collapse_all())
+        vlog_search_row.append(btn_tree_col)
+        self.telemetry_log_page_box.append(vlog_search_row)
+
+        # 3. Quick-Filter Category Pills
+        vlog_filter_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self._telemetry_category_filter: str = "all"
+        self._telemetry_filter_btns: Dict[str, Gtk.ToggleButton] = {}
+        self._updating_telemetry_filter_btns: bool = False
+        for cat_key, cat_lbl in (
+            ("all", "All Sections"),
+            ("violations", "⚠ Violations"),
+            ("modules", "🧩 Modules & Pins"),
+            ("cores_pipes", "⚡ Cores & Pipes"),
+            ("system", "💾 Power & Kcontrols"),
+        ):
+            tbtn = Gtk.ToggleButton(label=cat_lbl)
+            tbtn.set_active(cat_key == "all")
+            tbtn.add_css_class("caption")
+            tbtn.connect("toggled", self._on_telemetry_category_pill_toggled, cat_key)
+            vlog_filter_row.append(tbtn)
+            self._telemetry_filter_btns[cat_key] = tbtn
+        self.telemetry_log_page_box.append(vlog_filter_row)
+
+        # 4. Multi-Column Graphical Gtk.TreeView with Gtk.CellRendererProgress
+        # Columns:
+        #   0: Item / Hierarchy (str)
+        #   1: Status / Metric (str)
+        #   2: Utilization / Fill % (int 0..100)
+        #   3: Progress Bar Text (str)
+        #   4: Progress Bar Visible (bool)
+        #   5: Details / Connected Peers / Timing (str)
+        #   6: Foreground color hex (str)
+        #   7: Background color hex (str)
+        #   8: Background color set (bool)
+        #   9: Font weight (int)
+        #  10: Row action key (str)
+        self.telemetry_log_store = Gtk.TreeStore.new(
+            [str, str, int, str, bool, str, str, str, bool, int, str]
+        )
+        self.telemetry_log_tree = Gtk.TreeView.new_with_model(self.telemetry_log_store)
+        self.telemetry_log_tree.set_headers_visible(True)
+        self.telemetry_log_tree.set_enable_tree_lines(True)
+        self.telemetry_log_tree.set_activate_on_single_click(False)
+        self._telemetry_tree_row_meta: Dict[str, Dict[str, Any]] = {}
+        self._syncing_telemetry_tree_selection: bool = False
+
+        # Column 0: Telemetry Section / Module / Pin / Violation
+        r_t_item = Gtk.CellRendererText()
+        r_t_item.set_padding(4, 3)
+        col_t_item = Gtk.TreeViewColumn(
+            "Section / Module / Pin",
+            r_t_item,
+            text=0,
+            foreground=6,
+            cell_background=7,
+            cell_background_set=8,
+            weight=9,
+        )
+        col_t_item.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        col_t_item.set_resizable(True)
+        self.telemetry_log_tree.append_column(col_t_item)
+
+        # Column 1: Status / Primary Metric
+        r_t_stat = Gtk.CellRendererText()
+        r_t_stat.set_padding(4, 3)
+        col_t_stat = Gtk.TreeViewColumn(
+            "Status / Value",
+            r_t_stat,
+            text=1,
+            foreground=6,
+            cell_background=7,
+            cell_background_set=8,
+            weight=9,
+        )
+        col_t_stat.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        col_t_stat.set_resizable(True)
+        self.telemetry_log_tree.append_column(col_t_stat)
+
+        # Column 2: Graphical Load / Budget / Buffer Fill Progress Bar
+        r_t_prog = Gtk.CellRendererProgress()
+        r_t_prog.set_fixed_size(110, 18)
+        col_t_prog = Gtk.TreeViewColumn(
+            "Budget / Fill %",
+            r_t_prog,
+            value=2,
+            text=3,
+            visible=4,
+            cell_background=7,
+            cell_background_set=8,
+        )
+        col_t_prog.set_sizing(Gtk.TreeViewColumnSizing.FIXED)
+        col_t_prog.set_fixed_width(120)
+        col_t_prog.set_resizable(True)
+        self.telemetry_log_tree.append_column(col_t_prog)
+
+        # Column 3: Details / Connected Peers / Timing
+        r_t_det = Gtk.CellRendererText()
+        r_t_det.set_padding(4, 3)
+        col_t_det = Gtk.TreeViewColumn(
+            "Details / Connected Peers / Timing",
+            r_t_det,
+            text=5,
+            foreground=6,
+            cell_background=7,
+            cell_background_set=8,
+        )
+        col_t_det.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+        col_t_det.set_resizable(True)
+        col_t_det.set_expand(True)
+        self.telemetry_log_tree.append_column(col_t_det)
+
+        t_sel = self.telemetry_log_tree.get_selection()
+        t_sel.set_mode(Gtk.SelectionMode.SINGLE)
+        t_sel.connect("changed", self._on_telemetry_tree_selection_changed)
+        self.telemetry_log_tree.connect("row-activated", self._on_telemetry_tree_row_activated)
+
+        vlog_tree_scroll = Gtk.ScrolledWindow()
+        vlog_tree_scroll.set_vexpand(True)
+        vlog_tree_scroll.set_hexpand(True)
+        vlog_tree_scroll.set_child(self.telemetry_log_tree)
+        self.telemetry_log_page_box.append(vlog_tree_scroll)
+
+        # 5. Collapsible Raw Shell & Protocol Log Expander at bottom
+        self.telemetry_raw_expander = Gtk.Expander(
+            label="📜 Raw Shell & Protocol Log Output (sched-telem / mod-buffers)"
+        )
+        self.telemetry_raw_expander.set_expanded(False)
         vlog_scroll = Gtk.ScrolledWindow()
-        vlog_scroll.set_vexpand(True)
+        vlog_scroll.set_size_request(-1, 140)
         vlog_scroll.set_hexpand(True)
         self.telemetry_log_view = Gtk.TextView()
         self.telemetry_log_view.set_editable(False)
@@ -1274,7 +1675,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         self.telemetry_log_view.set_wrap_mode(Gtk.WrapMode.NONE)
         self._init_telemetry_log_tags()
         vlog_scroll.set_child(self.telemetry_log_view)
-        self.telemetry_log_page_box.append(vlog_scroll)
+        self.telemetry_raw_expander.set_child(vlog_scroll)
+        self.telemetry_log_page_box.append(self.telemetry_raw_expander)
         self._focused_violation_info: Optional[Dict[str, Any]] = None
 
         self.right_notebook.append_page(
@@ -1313,6 +1715,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     def _get_named_treeviews(self) -> Dict[str, Gtk.TreeView]:
         return {
             "right_inspector": self.right_inspector.tree,
+            "telemetry_log": self.telemetry_log_tree,
             "left_base": self.left_panel.base_tree,
             "left_mod": self.left_panel.mod_tree,
             "left_pipe": self.left_panel.pipe_tree,
@@ -1855,6 +2258,8 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             on_view_source_requested=self._on_view_source_requested,
             on_violation_bang_clicked=self._on_canvas_violation_bang_clicked,
         )
+        if hasattr(self, "sched_ignore_tick0_chk"):
+            new_canvas.ignore_tick0_underrun = self.sched_ignore_tick0_chk.get_active()
         new_canvas.set_graph(vm, self.workspace)
 
         new_text_editor = TopologyTextEditor()
@@ -3006,6 +3411,20 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if hasattr(self, "sched_telemetry_widget"):
             self.sched_telemetry_widget.set_expanded_tick_mode(btn.get_active())
 
+    def _on_sched_ignore_tick0_toggled(self, chk: Gtk.CheckButton) -> None:
+        ignore = bool(chk.get_active())
+        if hasattr(self, "sched_telemetry_widget"):
+            self.sched_telemetry_widget.set_ignore_tick0_underrun(ignore)
+        if hasattr(self, "_fallback_canvas") and self._fallback_canvas is not None:
+            self._fallback_canvas.ignore_tick0_underrun = ignore
+        for tab in getattr(self, "graph_tabs", []):
+            tab.canvas.ignore_tick0_underrun = ignore
+        telem = getattr(self.sched_telemetry_widget, "telemetry", None) if hasattr(self, "sched_telemetry_widget") else None
+        if telem is not None:
+            if self.canvas is not None:
+                self.canvas.set_live_telemetry_overlay(telem)
+            self._populate_telemetry_log_view(telem, getattr(self, "_focused_violation_info", None))
+
     def _init_telemetry_log_tags(self) -> None:
         if not hasattr(self, "telemetry_log_view"):
             return
@@ -3115,6 +3534,127 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             f"Zoomed Timeline & Telemetry Log → [{vtype}] {wname}: {summary}"
         )
 
+    def _on_telemetry_log_show_all_clicked(self, _btn: Gtk.Button) -> None:
+        """Reset search/category filters and show the full Telemetry Log TreeView."""
+        self._focused_violation_info = None
+        if hasattr(self, "telemetry_search_entry") and self.telemetry_search_entry.get_text():
+            self.telemetry_search_entry.set_text("")
+        if getattr(self, "_telemetry_category_filter", "all") != "all":
+            self._set_telemetry_category_filter("all")
+        telem = getattr(self, "_last_telemetry_log_data", None) or self.last_telemetry
+        self._populate_telemetry_log_view(telem, None)
+
+    def _set_telemetry_category_filter(self, cat_key: str) -> None:
+        self._telemetry_category_filter = cat_key
+        if not hasattr(self, "_telemetry_filter_btns"):
+            return
+        self._updating_telemetry_filter_btns = True
+        try:
+            for k, b in self._telemetry_filter_btns.items():
+                b.set_active(k == cat_key)
+        finally:
+            self._updating_telemetry_filter_btns = False
+
+    def _on_telemetry_category_pill_toggled(self, btn: Gtk.ToggleButton, cat_key: str) -> None:
+        if getattr(self, "_updating_telemetry_filter_btns", False):
+            return
+        if not btn.get_active():
+            if getattr(self, "_telemetry_category_filter", "all") == cat_key:
+                self._set_telemetry_category_filter("all")
+            else:
+                return
+        else:
+            self._set_telemetry_category_filter(cat_key)
+        telem = getattr(self, "_last_telemetry_log_data", None) or self.last_telemetry
+        self._populate_telemetry_log_view(telem, getattr(self, "_focused_violation_info", None))
+
+    def _on_telemetry_search_changed(self, _entry: Gtk.SearchEntry) -> None:
+        telem = getattr(self, "_last_telemetry_log_data", None) or self.last_telemetry
+        self._populate_telemetry_log_view(telem, getattr(self, "_focused_violation_info", None))
+
+    def _on_telemetry_tree_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        if getattr(self, "_syncing_telemetry_tree_selection", False):
+            return
+        model, tree_iter = selection.get_selected()
+        if not model or not tree_iter:
+            return
+        row_key = str(model.get_value(tree_iter, 10) or "")
+        if row_key:
+            self._activate_telemetry_tree_row(row_key, zoom_timeline=True)
+
+    def _on_telemetry_tree_row_activated(
+        self,
+        _tree: Gtk.TreeView,
+        path: Gtk.TreePath,
+        _col: Gtk.TreeViewColumn,
+    ) -> None:
+        if getattr(self, "_syncing_telemetry_tree_selection", False):
+            return
+        tree_iter = self.telemetry_log_store.get_iter(path)
+        if not tree_iter:
+            return
+        row_key = str(self.telemetry_log_store.get_value(tree_iter, 10) or "")
+        if row_key:
+            self._activate_telemetry_tree_row(row_key, zoom_timeline=True)
+
+    def _activate_telemetry_tree_row(self, row_key: str, zoom_timeline: bool = True) -> None:
+        meta = getattr(self, "_telemetry_tree_row_meta", {}).get(row_key)
+        if not meta:
+            return
+        comp_id = meta.get("comp_id")
+        wname = str(meta.get("widget_name") or "")
+        peer_wname = str(meta.get("peer_widget_name") or "")
+        viol_dict = meta.get("violation")
+
+        # 1. Highlight/select corresponding module or pin route edge on TopologyGraphCanvas
+        if self.canvas and self.canvas.vm:
+            matched_edge = None
+            if meta.get("kind") == "pin_buffer" and wname and peer_wname:
+                for edge in self.canvas.vm.edges:
+                    if (
+                        (wname in edge.source_node and peer_wname in edge.sink_node)
+                        or (peer_wname in edge.source_node and wname in edge.sink_node)
+                        or (edge.source_node == wname and edge.sink_node == peer_wname)
+                        or (edge.source_node == peer_wname and edge.sink_node == wname)
+                    ):
+                        matched_edge = edge
+                        break
+            if matched_edge is not None:
+                self.canvas.selected_node_id = None
+                self.canvas.selected_node_ids.clear()
+                self.canvas.selected_edge_id = matched_edge.id
+                self.canvas.queue_draw()
+            elif comp_id or wname:
+                for nid, gnode in self.canvas.vm.nodes.items():
+                    nt = self.canvas.live_node_telemetry.get(nid, {})
+                    if (comp_id and nt.get("comp_id") == comp_id) or (
+                        wname and (nid == wname or gnode.title == wname or wname in nid)
+                    ):
+                        self.canvas.select_node(nid)
+                        break
+
+        # 2. If row has violation or module timing info, zoom/focus Scheduling & Buffers timeline
+        if zoom_timeline and hasattr(self, "sched_telemetry_widget"):
+            if viol_dict:
+                if hasattr(self, "waveform_notebook"):
+                    self.waveform_notebook.set_current_page(1)
+                self.sched_telemetry_widget.focus_and_zoom_to_violation(viol_dict)
+            elif comp_id is not None and meta.get("mod_obj") is not None:
+                m_obj = meta["mod_obj"]
+                synth_v = {
+                    "v_key": f"mod:{comp_id}:cpc",
+                    "type": "MODULE_INSPECT",
+                    "comp_id": comp_id,
+                    "pipe_id": getattr(m_obj, "pipeline_id", 1),
+                    "core_id": getattr(m_obj, "core_id", 0),
+                    "widget_name": wname,
+                    "tick_idx": 0,
+                    "mod": m_obj,
+                }
+                if hasattr(self, "waveform_notebook"):
+                    self.waveform_notebook.set_current_page(1)
+                self.sched_telemetry_widget.focus_and_zoom_to_violation(synth_v)
+
     def _populate_telemetry_log_view(
         self,
         telem: Optional[TestbenchTelemetry],
@@ -3122,6 +3662,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
     ) -> None:
         if not hasattr(self, "telemetry_log_view"):
             return
+        if telem is not None:
+            self._last_telemetry_log_data = telem
+        else:
+            telem = getattr(self, "_last_telemetry_log_data", None)
+
         self._init_telemetry_log_tags()
         buf = self.telemetry_log_view.get_buffer()
         buf.set_text("")
@@ -3136,28 +3681,892 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
                 buf.apply_tag_by_name(tag_name, s_it, e_it)
             return start_off
 
+        if hasattr(self, "telemetry_log_store"):
+            self._syncing_telemetry_tree_selection = True
+            self.telemetry_log_store.clear()
+            self._telemetry_tree_row_meta.clear()
+            self._syncing_telemetry_tree_selection = False
+
         if telem is None:
             self.telemetry_log_title_lbl.set_text(
                 "Telemetry Log: No telemetry data yet — run Testbench to inspect scheduling & pin buffer violations."
             )
+            if hasattr(self, "kpi_viol_lbl"):
+                self.kpi_viol_lbl.set_text("🟢 0 Violations")
+                self.kpi_core_lbl.set_text("⚡ Cores: Idle")
+                self.kpi_kcps_lbl.set_text("🧩 Modules: 0 (0 KCPS)")
+                self.kpi_mem_lbl.set_text("💾 SRAM / Ticks: 0")
+            if hasattr(self, "telemetry_log_store"):
+                self.telemetry_log_store.append(
+                    None,
+                    [
+                        "ℹ No telemetry data collected yet",
+                        "IDLE",
+                        0,
+                        "",
+                        False,
+                        "Click [▶ Run in Testbench] to populate cores, pipelines, modules, pin buffers, and violations.",
+                        "#94a3b8",
+                        "#181c26",
+                        False,
+                        int(Pango.Weight.NORMAL),
+                        "",
+                    ],
+                )
             append_tagged("No telemetry data collected yet. Click [▶ Run in Testbench] to populate.", "vlog_dim")
             return
 
         focus_cid = focus_violation.get("comp_id") if focus_violation else None
+        focus_vkey = str(focus_violation.get("v_key", "")) if focus_violation else ""
         focus_vtype = focus_violation.get("type", "") if focus_violation else ""
         focus_wname = focus_violation.get("widget_name", "") if focus_violation else ""
         focus_summary = focus_violation.get("summary", "") if focus_violation else ""
         scroll_target_offset: Optional[int] = None
 
+        active_mods = [
+            c for c in telem.components if c.iterations > 0 or c.avg_cycles > 0 or c.in_pins or c.out_pins
+        ]
+        if not active_mods and telem.components:
+            active_mods = list(telem.components)
+
+        # Collect structured violations per module
+        mod_violations_map: Dict[int, List[Dict[str, Any]]] = {}
+        total_viol_events = 0
+        violating_mod_count = 0
+        for m in active_mods:
+            v_list = (
+                self.sched_telemetry_widget._collect_module_violations(m)
+                if hasattr(self, "sched_telemetry_widget")
+                else []
+            )
+            if not v_list and (m.cpc_violations > 0 or (m.effective_cpc > 0 and m.peak_cycles > m.effective_cpc)):
+                v_list = [
+                    {
+                        "v_key": f"mod:{m.comp_id}:cpc",
+                        "type": "CPC_VIOLATION",
+                        "comp_id": m.comp_id,
+                        "pipe_id": m.pipeline_id,
+                        "core_id": m.core_id,
+                        "widget_name": m.widget_name or m.module_name,
+                        "count": max(1, m.cpc_violations),
+                        "cycles": m.peak_cycles,
+                        "effective_cpc": m.effective_cpc,
+                        "summary": f"CPC Overrun: peak={m.peak_cycles} cyc > CPC={m.effective_cpc} cyc (v={m.cpc_violations})",
+                        "children": [],
+                        "mod": m,
+                    }
+                ]
+            if v_list:
+                mod_violations_map[m.comp_id] = v_list
+                violating_mod_count += 1
+                total_viol_events += sum(int(vg.get("count", 1) or 1) for vg in v_list)
+
+        # Update Top Title & KPI Summary Cards
         if focus_violation:
             self.telemetry_log_title_lbl.set_text(
                 f"⚠ Telemetry Log — [{focus_vtype}] {focus_wname}: {focus_summary}"
             )
         else:
-            total_cpc_v = sum(c.cpc_violations for c in telem.components)
             self.telemetry_log_title_lbl.set_text(
-                f"Telemetry Log — {len(telem.components)} Modules | Total CPC Violations: {total_cpc_v} | LL Ticks: {telem.total_ll_ticks}"
+                f"Telemetry Log — {len(active_mods)} Modules | Violations: {total_viol_events} ({violating_mod_count} Modules) | LL Ticks: {telem.total_ll_ticks}"
             )
+
+        if hasattr(self, "kpi_viol_lbl"):
+            if total_viol_events > 0:
+                self.kpi_viol_lbl.set_markup(
+                    f"<span foreground='#ff6b6b' weight='bold'>🔴 {total_viol_events} Violations ({violating_mod_count} Mod)</span>"
+                )
+            else:
+                self.kpi_viol_lbl.set_markup(
+                    "<span foreground='#5cd68d' weight='bold'>🟢 0 Violations (Healthy)</span>"
+                )
+            active_cores = [c for c in telem.cores if c.enabled or c.tick_count > 0]
+            pk_load = max((c.cpu_load_pct for c in active_cores), default=0.0)
+            self.kpi_core_lbl.set_text(
+                f"⚡ Cores: {len(active_cores)} Active (Peak {pk_load:.1f}%)"
+            )
+            tot_kcps = sum(m.avg_kcps for m in active_mods)
+            pk_kcps = sum(m.peak_kcps for m in active_mods)
+            self.kpi_kcps_lbl.set_text(
+                f"🧩 {len(active_mods)} Mods ({tot_kcps}/{pk_kcps} KCPS)"
+            )
+            self.kpi_mem_lbl.set_text(
+                f"💾 Heap: {telem.total_heap_bytes:,}B • Ticks: {telem.total_ll_ticks}"
+            )
+
+        # ---------------------------------------------------------------------
+        # Build Hierarchical Tree Nodes for Gtk.TreeStore
+        # ---------------------------------------------------------------------
+        W_BOLD = int(Pango.Weight.BOLD)
+        W_NORM = int(Pango.Weight.NORMAL)
+
+        def make_node(
+            title: str,
+            status: str = "",
+            prog_val: int = 0,
+            prog_txt: str = "",
+            prog_vis: bool = False,
+            details: str = "",
+            fg: str = "#e2e8f0",
+            bg: str = "#181c26",
+            bg_set: bool = False,
+            weight: int = W_NORM,
+            row_key: str = "",
+            category: str = "all",
+            auto_expand: bool = False,
+            is_focus_target: bool = False,
+            meta: Optional[Dict[str, Any]] = None,
+            children: Optional[List[Dict[str, Any]]] = None,
+        ) -> Dict[str, Any]:
+            if row_key and meta is not None:
+                self._telemetry_tree_row_meta[row_key] = meta
+            return {
+                "title": title,
+                "status": status,
+                "prog_val": max(0, min(100, int(prog_val))),
+                "prog_txt": prog_txt,
+                "prog_vis": bool(prog_vis),
+                "details": details,
+                "fg": fg or "#e2e8f0",
+                "bg": bg or "#181c26",
+                "bg_set": bool(bg_set),
+                "weight": weight,
+                "row_key": row_key,
+                "category": category,
+                "auto_expand": bool(auto_expand),
+                "is_focus_target": bool(is_focus_target),
+                "children": list(children) if children else [],
+            }
+
+        tree_roots: List[Dict[str, Any]] = []
+
+        # SECTION 1: Active Violations & Alerts
+        viol_section_children: List[Dict[str, Any]] = []
+        if focus_violation:
+            f_mod: Optional[ComponentPerfItem] = focus_violation.get("mod")
+            if f_mod is None and focus_cid is not None:
+                f_mod = next((c for c in telem.components if c.comp_id == focus_cid), None)
+            f_cpc_pct = (
+                int((f_mod.peak_cycles * 100.0) / max(1, f_mod.effective_cpc))
+                if (f_mod and f_mod.effective_cpc > 0)
+                else 100
+            )
+            f_children: List[Dict[str, Any]] = []
+            if f_mod is not None:
+                m_us = f_mod.exec_avg_us if f_mod.exec_avg_us > 0 else (f_mod.avg_cycles / 393.216)
+                m_pk_us = f_mod.exec_peak_us if f_mod.exec_peak_us > 0 else (f_mod.peak_cycles / 393.216)
+                f_children.append(
+                    make_node(
+                        title=f"📍 Location: Pipeline {f_mod.pipeline_id} • Core {f_mod.core_id}",
+                        status=f"{f_mod.domain} / {f_mod.mem_type}",
+                        details=f"Widget: {f_mod.widget_name or f_mod.module_name} (comp_id=0x{f_mod.comp_id:06x}) | Iterations={f_mod.iterations}",
+                        fg="#ffd166",
+                        weight=W_BOLD,
+                    )
+                )
+                f_children.append(
+                    make_node(
+                        title="⏱ Execution Timing & CPC Budget",
+                        status=f"{f_mod.peak_cycles:,} / {f_mod.effective_cpc:,} cyc",
+                        prog_val=min(100, f_cpc_pct),
+                        prog_txt=f"{f_cpc_pct}% CPC !",
+                        prog_vis=f_mod.effective_cpc > 0,
+                        details=f"avg={m_us:.2f} µs / peak={m_pk_us:.2f} µs | KCPS avg={f_mod.avg_kcps} / peak={f_mod.peak_kcps} | violations={f_mod.cpc_violations}",
+                        fg="#ff6b6b",
+                        weight=W_BOLD,
+                    )
+                )
+                for p_in in f_mod.in_pins:
+                    fill_pct = int((p_in.ll_exit_avail * 100) / max(1, p_in.buf_size)) if p_in.buf_size > 0 else 0
+                    f_children.append(
+                        make_node(
+                            title=f"🔌 Connected Source Pin IN[{p_in.pin_index}] ← {p_in.peer_widget_name or 'host'}",
+                            status=f"{p_in.ll_exit_avail}/{p_in.buf_size} B",
+                            prog_val=fill_pct,
+                            prog_txt=f"{fill_pct}% Fill",
+                            prog_vis=p_in.buf_size > 0,
+                            details=f"buf={p_in.buf_id} peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}) | xfer={p_in.last_bytes_transferred}B (tot={p_in.total_bytes_transferred:,}B) | {p_in.entry_rms_db:+.1f}dBFS",
+                            fg="#ffd166",
+                            row_key=f"focus:pin_in:{f_mod.comp_id}:{p_in.pin_index}",
+                            meta={
+                                "kind": "pin_buffer",
+                                "comp_id": f_mod.comp_id,
+                                "widget_name": f_mod.widget_name or f_mod.module_name,
+                                "peer_widget_name": p_in.peer_widget_name,
+                            },
+                        )
+                    )
+                for p_out in f_mod.out_pins:
+                    fill_pct = int((p_out.ll_exit_avail * 100) / max(1, p_out.buf_size)) if p_out.buf_size > 0 else 0
+                    f_children.append(
+                        make_node(
+                            title=f"🔌 Connected Sink Pin OUT[{p_out.pin_index}] → {p_out.peer_widget_name or 'dai'}",
+                            status=f"{p_out.ll_exit_avail}/{p_out.buf_size} B",
+                            prog_val=fill_pct,
+                            prog_txt=f"{fill_pct}% Fill",
+                            prog_vis=p_out.buf_size > 0,
+                            details=f"buf={p_out.buf_id} peer=0x{p_out.peer_comp_id:x} ({p_out.peer_widget_name or 'dai'}) | xfer={p_out.last_bytes_transferred}B (tot={p_out.total_bytes_transferred:,}B) | {p_out.exit_rms_db:+.1f}dBFS",
+                            fg="#ffd166",
+                            row_key=f"focus:pin_out:{f_mod.comp_id}:{p_out.pin_index}",
+                            meta={
+                                "kind": "pin_buffer",
+                                "comp_id": f_mod.comp_id,
+                                "widget_name": f_mod.widget_name or f_mod.module_name,
+                                "peer_widget_name": p_out.peer_widget_name,
+                            },
+                        )
+                    )
+            viol_section_children.append(
+                make_node(
+                    title=f"🎯 FOCUSED: [{focus_vtype}] {focus_wname}",
+                    status=f"! comp=0x{int(focus_cid or 0):04x}",
+                    prog_val=min(100, f_cpc_pct),
+                    prog_txt=f"{f_cpc_pct}% CPC !",
+                    prog_vis=True,
+                    details=focus_summary,
+                    fg="#ffffff",
+                    bg="#681826",
+                    bg_set=True,
+                    weight=W_BOLD,
+                    row_key="focus:primary_violation",
+                    auto_expand=True,
+                    is_focus_target=True,
+                    meta={
+                        "kind": "violation",
+                        "comp_id": focus_cid,
+                        "widget_name": focus_wname,
+                        "violation": focus_violation,
+                        "mod_obj": f_mod,
+                    },
+                    children=f_children,
+                )
+            )
+
+        for m in active_mods:
+            v_grps = mod_violations_map.get(m.comp_id, [])
+            if not v_grps:
+                continue
+            wname = m.widget_name or m.module_name or f"0x{m.comp_id:x}"
+            for vg in v_grps:
+                vkey = str(vg.get("v_key", f"v:{m.comp_id}"))
+                is_f = bool(focus_vkey and focus_vkey == vkey)
+                cpc_pct = (
+                    int((m.peak_cycles * 100.0) / max(1, m.effective_cpc))
+                    if m.effective_cpc > 0
+                    else 100
+                )
+                ev_nodes: List[Dict[str, Any]] = []
+                for ev in vg.get("children", []):
+                    ev_key = str(ev.get("v_key", ""))
+                    ev_is_f = bool(focus_vkey and focus_vkey == ev_key)
+                    ev_cyc = int(ev.get("cycles", m.peak_cycles) or m.peak_cycles)
+                    ev_bud = int(ev.get("effective_cpc", m.effective_cpc) or m.effective_cpc or 1)
+                    ev_pct = int((ev_cyc * 100.0) / max(1, ev_bud))
+                    ev_nodes.append(
+                        make_node(
+                            title=f"• {ev.get('type', 'EVENT')} (Tick #{ev.get('tick_idx', 0)})",
+                            status=f"{ev_cyc:,} / {ev_bud:,} cyc",
+                            prog_val=min(100, ev_pct),
+                            prog_txt=f"{ev_pct}% CPC",
+                            prog_vis=ev_bud > 0,
+                            details=str(ev.get("summary", "")),
+                            fg="#ffffff" if ev_is_f else "#fca5a5",
+                            bg="#681826" if ev_is_f else "#2a1218",
+                            bg_set=True,
+                            weight=W_BOLD if ev_is_f else W_NORM,
+                            row_key=f"viol_ev:{ev_key}",
+                            is_focus_target=ev_is_f,
+                            meta={
+                                "kind": "violation",
+                                "comp_id": m.comp_id,
+                                "widget_name": wname,
+                                "violation": ev,
+                                "mod_obj": m,
+                            },
+                        )
+                    )
+                viol_section_children.append(
+                    make_node(
+                        title=f"🔴 ! {wname} — [{vg['type']}]",
+                        status=f"! v={vg.get('count', 1)}",
+                        prog_val=min(100, cpc_pct),
+                        prog_txt=f"{cpc_pct}% CPC !",
+                        prog_vis=True,
+                        details=str(vg.get("summary", "")),
+                        fg="#ffffff" if is_f else "#ff6b6b",
+                        bg="#681826" if is_f else "#38151e",
+                        bg_set=True,
+                        weight=W_BOLD,
+                        row_key=f"viol_grp:{vkey}",
+                        auto_expand=is_f or (focus_cid == m.comp_id) or len(viol_section_children) <= 4,
+                        is_focus_target=is_f and not focus_violation,
+                        meta={
+                            "kind": "violation",
+                            "comp_id": m.comp_id,
+                            "widget_name": wname,
+                            "violation": vg,
+                            "mod_obj": m,
+                        },
+                        children=ev_nodes,
+                    )
+                )
+
+        if viol_section_children:
+            tree_roots.append(
+                make_node(
+                    title=f"🔴 Active Violations & Alerts ({total_viol_events} events across {violating_mod_count} modules)",
+                    status=f"! {total_viol_events} VIOLATIONS",
+                    prog_val=100,
+                    prog_txt=f"{violating_mod_count}/{max(1, len(active_mods))} Mods !",
+                    prog_vis=True,
+                    details="Click any violation or event to zoom the Scheduling Timeline & highlight Source/Sink on the Topology Graph",
+                    fg="#ff6b6b",
+                    bg="#2b1118",
+                    bg_set=True,
+                    weight=W_BOLD,
+                    category="violations",
+                    auto_expand=True,
+                    children=viol_section_children,
+                )
+            )
+        else:
+            tree_roots.append(
+                make_node(
+                    title="🟢 Active Violations & Alerts (0 Violations)",
+                    status="ALL OK",
+                    prog_val=0,
+                    prog_txt="0% Overruns",
+                    prog_vis=True,
+                    details="All DSP cores, pipelines, module CPC budgets, and pin buffers operated within real-time constraints",
+                    fg="#5cd68d",
+                    bg="#11261d",
+                    bg_set=True,
+                    weight=W_BOLD,
+                    category="violations",
+                    auto_expand=False,
+                )
+            )
+
+        # SECTION 2: Modules, CPC Budgets & Pin Buffers
+        mod_section_children: List[Dict[str, Any]] = []
+        max_mod_kcps = max((m.peak_kcps for m in active_mods), default=1) or 1
+        for m in active_mods:
+            wname = m.widget_name or m.module_name or f"0x{m.comp_id:x}"
+            v_grps = mod_violations_map.get(m.comp_id, [])
+            has_v = bool(v_grps)
+            is_target_mod = focus_cid is not None and m.comp_id == focus_cid
+            m_us = m.exec_avg_us if m.exec_avg_us > 0 else (m.avg_cycles / 393.216)
+            m_pk_us = m.exec_peak_us if m.exec_peak_us > 0 else (m.peak_cycles / 393.216)
+
+            if m.effective_cpc > 0:
+                cpc_pct = int((m.peak_cycles * 100.0) / max(1, m.effective_cpc))
+                bar_txt = f"{cpc_pct}% CPC ({m.peak_cycles}/{m.effective_cpc})"
+            else:
+                cpc_pct = int((m.peak_kcps * 100.0) / max_mod_kcps)
+                bar_txt = f"{m.peak_kcps} KCPS"
+
+            m_children: List[Dict[str, Any]] = [
+                make_node(
+                    title="⚡ Timing, KCPS & Memory Footprint",
+                    status=f"{m.avg_kcps}/{m.peak_kcps} KCPS",
+                    prog_val=min(100, cpc_pct),
+                    prog_txt=bar_txt,
+                    prog_vis=True,
+                    details=(
+                        f"exec avg={m_us:.2f} µs / peak={m_pk_us:.2f} µs | cyc avg={m.avg_cycles:,} / peak={m.peak_cycles:,} | "
+                        f"CPC={m.effective_cpc:,} (v={m.cpc_violations}) | IBS={m.ibs}B OBS={m.obs}B | Heap={m.heap_bytes:,}B | "
+                        f"Audio={m.in_rms_db:+.1f}→{m.out_rms_db:+.1f}dBFS"
+                    ),
+                    fg="#ff6b6b" if has_v else "#cbd5e1",
+                )
+            ]
+
+            if v_grps:
+                v_sub: List[Dict[str, Any]] = []
+                for vg in v_grps:
+                    ev_sub = [
+                        make_node(
+                            title=f"• Tick #{ev.get('tick_idx', 0)} ({ev.get('time_ms', 0.0):.2f} ms)",
+                            status=f"{ev.get('cycles', 0):,} cyc",
+                            details=str(ev.get("summary", "")),
+                            fg="#fca5a5",
+                            row_key=f"mod_tree_ev:{ev.get('v_key', '')}",
+                            meta={
+                                "kind": "violation",
+                                "comp_id": m.comp_id,
+                                "widget_name": wname,
+                                "violation": ev,
+                                "mod_obj": m,
+                            },
+                        )
+                        for ev in vg.get("children", [])
+                    ]
+                    v_sub.append(
+                        make_node(
+                            title=f"⚠ [{vg['type']}]",
+                            status=f"v={vg.get('count', 1)}",
+                            prog_val=min(100, cpc_pct),
+                            prog_txt=f"{cpc_pct}% CPC !",
+                            prog_vis=True,
+                            details=str(vg.get("summary", "")),
+                            fg="#ff6b6b",
+                            weight=W_BOLD,
+                            row_key=f"mod_tree_vg:{vg.get('v_key', '')}",
+                            auto_expand=True,
+                            meta={
+                                "kind": "violation",
+                                "comp_id": m.comp_id,
+                                "widget_name": wname,
+                                "violation": vg,
+                                "mod_obj": m,
+                            },
+                            children=ev_sub,
+                        )
+                    )
+                m_children.append(
+                    make_node(
+                        title=f"🔴 Module Violations ({len(v_grps)})",
+                        status=f"! v={m.cpc_violations or len(v_grps)}",
+                        details="Expand to inspect per-tick violation events",
+                        fg="#ff6b6b",
+                        weight=W_BOLD,
+                        auto_expand=True,
+                        children=v_sub,
+                    )
+                )
+
+            ignore_t0 = bool(getattr(self.sched_telemetry_widget, "ignore_tick0_underrun", True)) if hasattr(self, "sched_telemetry_widget") else True
+            if m.in_pins:
+                in_sub: List[Dict[str, Any]] = []
+                for p_in in m.in_pins:
+                    fill_pct = int((p_in.ll_exit_avail * 100) / max(1, p_in.buf_size)) if p_in.buf_size > 0 else 0
+                    eff_x = (
+                        self.sched_telemetry_widget._effective_pin_xruns(m, p_in)
+                        if hasattr(self, "sched_telemetry_widget")
+                        else int(getattr(p_in, "xrun_count", 0) or 0)
+                    )
+                    pin_starved = eff_x > 0
+                    xrun_tag = (
+                        f" | xruns={eff_x}(underrun={getattr(p_in, 'underrun_count', 0)} overrun={getattr(p_in, 'overrun_count', 0)})"
+                        if eff_x > 0
+                        else ""
+                    )
+                    in_sub.append(
+                        make_node(
+                            title=f"IN[{p_in.pin_index}] ← Source: {p_in.peer_widget_name or 'host'}",
+                            status=f"{p_in.ll_entry_avail}→{p_in.ll_exit_avail}/{p_in.buf_size} B",
+                            prog_val=fill_pct,
+                            prog_txt=f"{fill_pct}% Fill" if not pin_starved else f"XRUN ({eff_x}×) !",
+                            prog_vis=p_in.buf_size > 0,
+                            details=(
+                                f"buf={p_in.buf_id} | peer=0x{p_in.peer_comp_id:x} ({p_in.peer_widget_name or 'host'}) | "
+                                f"free={p_in.ll_exit_free}B | xfer={p_in.last_bytes_transferred}B (tot={p_in.total_bytes_transferred:,}B){xrun_tag} | "
+                                f"{p_in.rate}Hz {p_in.channels}ch | rms={p_in.entry_rms_db:+.1f}dBFS"
+                            ),
+                            fg="#ff6b6b" if pin_starved else "#93c5fd",
+                            weight=W_BOLD if pin_starved else W_NORM,
+                            row_key=f"mod:{m.comp_id}:in:{p_in.pin_index}",
+                            meta={
+                                "kind": "pin_buffer",
+                                "comp_id": m.comp_id,
+                                "widget_name": wname,
+                                "peer_widget_name": p_in.peer_widget_name,
+                                "mod_obj": m,
+                            },
+                        )
+                    )
+                m_children.append(
+                    make_node(
+                        title=f"🔌 Input Pin Buffers ({len(m.in_pins)})",
+                        status=f"IBS={m.ibs} B",
+                        details=", ".join(f"IN[{p.pin_index}]←{p.peer_widget_name or 'host'}" for p in m.in_pins),
+                        fg="#7ec8ff",
+                        weight=W_BOLD,
+                        auto_expand=has_v or is_target_mod,
+                        children=in_sub,
+                    )
+                )
+
+            if m.out_pins:
+                out_sub: List[Dict[str, Any]] = []
+                for p_out in m.out_pins:
+                    fill_pct = int((p_out.ll_exit_avail * 100) / max(1, p_out.buf_size)) if p_out.buf_size > 0 else 0
+                    eff_x = (
+                        self.sched_telemetry_widget._effective_pin_xruns(m, p_out)
+                        if hasattr(self, "sched_telemetry_widget")
+                        else int(getattr(p_out, "xrun_count", 0) or 0)
+                    )
+                    pin_starved = eff_x > 0
+                    xrun_tag = (
+                        f" | xruns={eff_x}(overrun={getattr(p_out, 'overrun_count', 0)} underrun={getattr(p_out, 'underrun_count', 0)})"
+                        if eff_x > 0
+                        else ""
+                    )
+                    out_sub.append(
+                        make_node(
+                            title=f"OUT[{p_out.pin_index}] → Sink: {p_out.peer_widget_name or 'dai'}",
+                            status=f"{p_out.ll_entry_avail}→{p_out.ll_exit_avail}/{p_out.buf_size} B",
+                            prog_val=fill_pct,
+                            prog_txt=f"{fill_pct}% Fill" if not pin_starved else f"XRUN ({eff_x}×) !",
+                            prog_vis=p_out.buf_size > 0,
+                            details=(
+                                f"buf={p_out.buf_id} | peer=0x{p_out.peer_comp_id:x} ({p_out.peer_widget_name or 'dai'}) | "
+                                f"free={p_out.ll_exit_free}B | xfer={p_out.last_bytes_transferred}B (tot={p_out.total_bytes_transferred:,}B){xrun_tag} | "
+                                f"{p_out.rate}Hz {p_out.channels}ch | rms={p_out.exit_rms_db:+.1f}dBFS"
+                            ),
+                            fg="#ff6b6b" if pin_starved else "#fdba74",
+                            weight=W_BOLD if pin_starved else W_NORM,
+                            row_key=f"mod:{m.comp_id}:out:{p_out.pin_index}",
+                            meta={
+                                "kind": "pin_buffer",
+                                "comp_id": m.comp_id,
+                                "widget_name": wname,
+                                "peer_widget_name": p_out.peer_widget_name,
+                                "mod_obj": m,
+                            },
+                        )
+                    )
+                m_children.append(
+                    make_node(
+                        title=f"🔌 Output Pin Buffers ({len(m.out_pins)})",
+                        status=f"OBS={m.obs} B",
+                        details=", ".join(f"OUT[{p.pin_index}]→{p.peer_widget_name or 'dai'}" for p in m.out_pins),
+                        fg="#fdba74",
+                        weight=W_BOLD,
+                        auto_expand=has_v or is_target_mod,
+                        children=out_sub,
+                    )
+                )
+
+            mod_section_children.append(
+                make_node(
+                    title=f"{'🔴 !' if has_v else '🟢 ●'} {wname} (0x{m.comp_id:04x})",
+                    status=f"! VIOLATION (v={m.cpc_violations or len(v_grps)})" if has_v else "OK (v=0)",
+                    prog_val=min(100, cpc_pct),
+                    prog_txt=bar_txt,
+                    prog_vis=True,
+                    details=(
+                        f"[P{m.pipeline_id}•C{m.core_id}•{m.domain}•{m.mem_type}] "
+                        f"cyc={m.avg_cycles}/{m.peak_cycles} CPC={m.effective_cpc} | "
+                        f"exec={m_us:.2f}/{m_pk_us:.2f}µs | {m.avg_kcps}/{m.peak_kcps} KCPS | iters={m.iterations}"
+                    ),
+                    fg="#ffffff" if is_target_mod else ("#ff6b6b" if has_v else "#5cd68d"),
+                    bg="#4c1824" if is_target_mod else ("#2c141b" if has_v else ""),
+                    bg_set=is_target_mod or has_v,
+                    weight=W_BOLD if (has_v or is_target_mod) else W_NORM,
+                    row_key=f"mod_row:{m.comp_id}",
+                    auto_expand=is_target_mod or has_v,
+                    meta={
+                        "kind": "module",
+                        "comp_id": m.comp_id,
+                        "widget_name": wname,
+                        "mod_obj": m,
+                        "violation": v_grps[0] if v_grps else None,
+                    },
+                    children=m_children,
+                )
+            )
+
+        tree_roots.append(
+            make_node(
+                title=f"🧩 Modules, CPC Budgets & Pin Buffers ({len(active_mods)} Modules)",
+                status=f"{violating_mod_count} Violating / {len(active_mods)} Total",
+                prog_val=int((violating_mod_count * 100) / max(1, len(active_mods))) if violating_mod_count else 100,
+                prog_txt=f"{len(active_mods)} Active Mods",
+                prog_vis=True,
+                details="Expand any module to inspect CPC cycle budget, input/output pin ring buffers, and connected Source/Sink peers",
+                fg="#7ec8ff",
+                bg="#162032",
+                bg_set=True,
+                weight=W_BOLD,
+                category="modules",
+                auto_expand=True,
+                children=mod_section_children,
+            )
+        )
+
+        # SECTION 3: DSP Cores & Pipelines
+        cp_children: List[Dict[str, Any]] = []
+        for c in telem.cores:
+            if not (c.enabled or c.tick_count > 0 or c.core_id == 0):
+                continue
+            has_co = c.overruns > 0
+            freq_mhz = (c.freq_hz / 1e6) if c.freq_hz > 0 else (telem.dsp_clock_hz / 1e6)
+            ld_pct = int(min(100.0, max(0.0, c.cpu_load_pct)))
+            cp_children.append(
+                make_node(
+                    title=f"{'🔴 !' if has_co else '⚡'} DSP Core {c.core_id} ({freq_mhz:.0f} MHz)",
+                    status=f"! OVERRUN (v={c.overruns})" if has_co else f"ACTIVE ({c.ll_ticks} ticks)",
+                    prog_val=ld_pct,
+                    prog_txt=f"{c.cpu_load_pct:.1f}% CPU",
+                    prog_vis=True,
+                    details=(
+                        f"LL cyc avg={c.avg_cycles:,} / peak={c.peak_cycles:,} ({c.ll_exec_avg_us:.1f}/{c.ll_exec_peak_us:.1f} µs) | "
+                        f"LL={c.avg_kcps}/{c.peak_kcps} KCPS | DP={c.dp_avg_kcps}/{c.dp_peak_kcps} KCPS ({c.dp_runs} runs)"
+                    ),
+                    fg="#ff6b6b" if has_co else "#a5f3fc",
+                    weight=W_BOLD,
+                )
+            )
+
+        for p in telem.pipelines:
+            has_px = p.xruns > 0
+            p_us = p.exec_peak_us if p.exec_peak_us > 0 else (p.peak_cycles / 393.216)
+            p_avg_us = p.exec_avg_us if p.exec_avg_us > 0 else (p.avg_cycles / 393.216)
+            bud_pct = int((p_us * 100.0) / max(1, p.period_us))
+            p_mods = [m for m in active_mods if m.pipeline_id == p.pipeline_id]
+            p_mod_rows = [
+                make_node(
+                    title=f"↳ {m.widget_name or m.module_name} (0x{m.comp_id:04x})",
+                    status=f"{m.avg_cycles}/{m.peak_cycles} cyc",
+                    prog_val=min(100, int((m.peak_cycles * 100.0) / max(1, m.effective_cpc))) if m.effective_cpc > 0 else 0,
+                    prog_txt=f"{int((m.peak_cycles * 100.0) / max(1, m.effective_cpc))}% CPC" if m.effective_cpc > 0 else "",
+                    prog_vis=m.effective_cpc > 0,
+                    details=f"{m.domain}•{m.mem_type} | {m.avg_kcps}/{m.peak_kcps} KCPS | IBS={m.ibs}B OBS={m.obs}B",
+                    fg="#ff6b6b" if m.comp_id in mod_violations_map else "#cbd5e1",
+                    row_key=f"pipe_mod:{p.pipeline_id}:{m.comp_id}",
+                    meta={"kind": "module", "comp_id": m.comp_id, "widget_name": m.widget_name or m.module_name, "mod_obj": m},
+                )
+                for m in p_mods
+            ]
+            cp_children.append(
+                make_node(
+                    title=f"{'🔴 !' if has_px else '🔀'} Pipeline {p.pipeline_id} [Core {p.core_id} • {p.mem_type}]",
+                    status=f"! XRUN (xruns={p.xruns})" if has_px else f"OK ({p.copies} copies)",
+                    prog_val=min(100, bud_pct),
+                    prog_txt=f"{bud_pct}% Period ({p_us:.1f}/{p.period_us}µs)",
+                    prog_vis=True,
+                    details=(
+                        f"prio={p.priority} period={p.period_us}µs | cyc={p.avg_cycles:,}/{p.peak_cycles:,} | "
+                        f"exec={p_avg_us:.2f}/{p_us:.2f}µs | {p.avg_kcps}/{p.peak_kcps} KCPS | "
+                        f"LL={p.ll_module_count} DP={p.dp_module_count}"
+                    ),
+                    fg="#ff6b6b" if has_px else "#c4b5fd",
+                    weight=W_BOLD,
+                    auto_expand=has_px,
+                    children=p_mod_rows,
+                )
+            )
+
+        tree_roots.append(
+            make_node(
+                title=f"⚡ DSP Cores & Pipelines ({len(telem.cores)} Cores, {len(telem.pipelines)} Pipelines)",
+                status=f"{telem.total_ll_ticks} LL Ticks",
+                prog_val=int(max((c.cpu_load_pct for c in telem.cores), default=0.0)),
+                prog_txt="Core & Pipe Load",
+                prog_vis=bool(telem.cores),
+                details="Hardware DSP core utilization, LL tick deadlines, and per-pipeline period budgets",
+                fg="#7ec8ff",
+                bg="#162032",
+                bg_set=True,
+                weight=W_BOLD,
+                category="cores_pipes",
+                auto_expand=False,
+                children=cp_children,
+            )
+        )
+
+        # SECTION 4: Platform, Power, SRAM, Kcontrols & Raw Logs
+        sys_children: List[Dict[str, Any]] = []
+        pwr_str = "D0 (ACTIVE)" if telem.dsp_power_state == 1 else f"D3 (PAUSED/{telem.dsp_power_state})"
+        sim_modes = {0: "OFF (HOST-MEASURED)", 1: "VIRTUAL-CPC", 2: "REALTIME-PACED"}
+        mem_dom = "DRAM" if telem.default_mem_domain == 1 else "SRAM"
+        sys_children.append(
+            make_node(
+                title=f"🖥 Platform: {telem.platform} (FW v{telem.fw_version})",
+                status=pwr_str,
+                details=(
+                    f"Sim={sim_modes.get(telem.workload_sim_mode, 'OFF')} | Default Mem={mem_dom} "
+                    f"(DRAM {telem.dram_factor_x100 / 100.0:.2f}x +{telem.dram_cycles_per_word} cyc/w) | "
+                    f"PCM: {telem.pcm_frames_played} frames @ {telem.pcm_rate}Hz ({telem.pcm_channels}ch)"
+                ),
+                fg="#a7f3d0",
+            )
+        )
+        hp_tot = max(1, telem.hpsram.total_banks)
+        hp_pct = int((telem.hpsram.powered_banks * 100) / hp_tot) if telem.hpsram.total_banks > 0 else 0
+        sys_children.append(
+            make_node(
+                title="💾 Memory: HPSRAM / LPSRAM & Module Heap",
+                status=f"Heap: {telem.total_heap_bytes:,} B",
+                prog_val=hp_pct,
+                prog_txt=f"HPSRAM {telem.hpsram.powered_banks}/{telem.hpsram.total_banks} Banks",
+                prog_vis=telem.hpsram.total_banks > 0,
+                details=(
+                    f"HPSRAM: {telem.hpsram.powered_banks}/{telem.hpsram.total_banks} ON ({telem.hpsram.free_phys_pages} free pages) | "
+                    f"LPSRAM: {telem.lpsram.powered_banks}/{telem.lpsram.total_banks} ON | Total Module Heap: {telem.total_heap_bytes:,} B"
+                ),
+                fg="#fde68a",
+            )
+        )
+        dapm_pct = (
+            int((telem.dapm_powered_nodes * 100) / max(1, telem.dapm_total_nodes))
+            if telem.dapm_total_nodes > 0
+            else 0
+        )
+        sys_children.append(
+            make_node(
+                title="🔌 DAPM Graph Power State",
+                status=f"{telem.dapm_powered_nodes}/{telem.dapm_total_nodes} Widgets ON",
+                prog_val=dapm_pct,
+                prog_txt=f"{dapm_pct}% Powered",
+                prog_vis=telem.dapm_total_nodes > 0,
+                details=f"Active Routes: {telem.dapm_active_edges}/{telem.dapm_total_edges} | Runtime PM Active: {telem.pm_runtime_active}",
+                fg="#93c5fd",
+            )
+        )
+        if telem.kcontrols:
+            kc_rows = [
+                make_node(
+                    title=f"🎛 [numid={kc.numid}] {kc.name}",
+                    status=f"[{','.join(str(v) for v in kc.values)}]",
+                    details=f"type={kc.type_str} ({kc.iface_str}) | access={kc.access_str} | range=[{kc.min_val}..{kc.max_val}] | widget={kc.target_widget}",
+                    fg="#cbd5e1",
+                    row_key=f"kc_row:{kc.numid}",
+                    meta={"kind": "kcontrol", "widget_name": kc.target_widget},
+                )
+                for kc in telem.kcontrols
+            ]
+            sys_children.append(
+                make_node(
+                    title=f"🎛 Topology Kcontrols ({len(telem.kcontrols)})",
+                    status=f"{len(telem.kcontrols)} Controls",
+                    details="ALSA mixer, enum, switch, and bytes controls discovered on topology",
+                    fg="#7ec8ff",
+                    weight=W_BOLD,
+                    children=kc_rows,
+                )
+            )
+        if telem.shell_sched_telem or telem.shell_mod_buffers:
+            raw_rows: List[Dict[str, Any]] = []
+            for idx_l, raw_ln in enumerate((telem.shell_sched_telem or "").splitlines()):
+                if not raw_ln.strip():
+                    continue
+                is_err_ln = ("cpc_v=" in raw_ln and "cpc_v=0" not in raw_ln) or (
+                    "xruns=" in raw_ln and "xruns=0" not in raw_ln
+                )
+                raw_rows.append(
+                    make_node(
+                        title=f"sched-telem[{idx_l}]",
+                        status="ALERT" if is_err_ln else "LOG",
+                        details=raw_ln.strip(),
+                        fg="#ff6b6b" if is_err_ln else "#94a3b8",
+                    )
+                )
+            for idx_l, raw_ln in enumerate((telem.shell_mod_buffers or "").splitlines()):
+                if not raw_ln.strip():
+                    continue
+                raw_rows.append(
+                    make_node(
+                        title=f"mod-buffers[{idx_l}]",
+                        status="BUF",
+                        details=raw_ln.strip(),
+                        fg="#94a3b8",
+                    )
+                )
+            sys_children.append(
+                make_node(
+                    title=f"📜 Raw Shell Telemetry Lines ({len(raw_rows)} lines)",
+                    status="sched-telem / mod-buffers",
+                    details="Searchable raw testbench CLI output lines",
+                    fg="#94a3b8",
+                    children=raw_rows,
+                )
+            )
+
+        tree_roots.append(
+            make_node(
+                title="💾 Platform, Power, SRAM, Kcontrols & Raw Logs",
+                status=pwr_str,
+                prog_val=dapm_pct,
+                prog_txt=f"{telem.dapm_powered_nodes}/{telem.dapm_total_nodes} DAPM",
+                prog_vis=telem.dapm_total_nodes > 0,
+                details=f"{telem.platform} • FW v{telem.fw_version} • {len(telem.kcontrols)} Kcontrols",
+                fg="#7ec8ff",
+                bg="#162032",
+                bg_set=True,
+                weight=W_BOLD,
+                category="system",
+                auto_expand=False,
+                children=sys_children,
+            )
+        )
+
+        # Apply Category Pill Filter & Search Query Filter
+        active_cat = getattr(self, "_telemetry_category_filter", "all")
+        search_q = (
+            self.telemetry_search_entry.get_text().strip().lower()
+            if hasattr(self, "telemetry_search_entry")
+            else ""
+        )
+
+        def filter_node_recursive(node_dict: Dict[str, Any], is_root: bool = False) -> Optional[Dict[str, Any]]:
+            if is_root and active_cat != "all" and node_dict.get("category") != active_cat:
+                return None
+            if not search_q:
+                return node_dict
+            haystack = f"{node_dict['title']} {node_dict['status']} {node_dict['prog_txt']} {node_dict['details']}".lower()
+            self_matches = search_q in haystack
+            filtered_children: List[Dict[str, Any]] = []
+            for ch in node_dict.get("children", []):
+                f_ch = filter_node_recursive(ch, is_root=False)
+                if f_ch is not None:
+                    filtered_children.append(f_ch)
+            if self_matches or filtered_children:
+                copied = dict(node_dict)
+                copied["children"] = filtered_children if filtered_children else list(node_dict.get("children", []))
+                if filtered_children or search_q:
+                    copied["auto_expand"] = True
+                return copied
+            return None
+
+        filtered_roots = [
+            fr for r in tree_roots for fr in [filter_node_recursive(r, is_root=True)] if fr is not None
+        ]
+
+        # Populate Gtk.TreeStore and expand/select target paths
+        if hasattr(self, "telemetry_log_store") and hasattr(self, "telemetry_log_tree"):
+            self._syncing_telemetry_tree_selection = True
+            expand_paths: List[Gtk.TreePath] = []
+            focus_path: Optional[Gtk.TreePath] = None
+
+            def insert_tree_node(parent_iter: Optional[Gtk.TreeIter], nd: Dict[str, Any]) -> None:
+                nonlocal focus_path
+                it = self.telemetry_log_store.append(
+                    parent_iter,
+                    [
+                        nd["title"],
+                        nd["status"],
+                        nd["prog_val"],
+                        nd["prog_txt"],
+                        nd["prog_vis"],
+                        nd["details"],
+                        nd["fg"] or "#e2e8f0",
+                        nd["bg"] or "#181c26",
+                        nd["bg_set"],
+                        nd["weight"],
+                        nd["row_key"],
+                    ],
+                )
+                tpath = self.telemetry_log_store.get_path(it)
+                if nd.get("auto_expand") and tpath is not None:
+                    expand_paths.append(tpath)
+                if nd.get("is_focus_target") and tpath is not None and focus_path is None:
+                    focus_path = tpath
+                for child_nd in nd.get("children", []):
+                    insert_tree_node(it, child_nd)
+
+            for r_nd in filtered_roots:
+                insert_tree_node(None, r_nd)
+
+            for ep in expand_paths:
+                self.telemetry_log_tree.expand_to_path(ep)
+
+            if focus_path is not None:
+                self.telemetry_log_tree.expand_to_path(focus_path)
+                self.telemetry_log_tree.get_selection().select_path(focus_path)
+                self.telemetry_log_tree.scroll_to_cell(focus_path, None, True, 0.25, 0.0)
+            self._syncing_telemetry_tree_selection = False
 
         # 1. Focused Violation Diagnostic Section
         if focus_violation:
@@ -3316,7 +4725,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         active = btn.get_active()
         self.waveform_widget.is_realtime = active
         if active:
-            self.keep_alive_btn.set_active(True)
             if self.tb_runner and self.tb_runner.live_client and self.tb_runner.live_proc:
                 # Ensure DSP is in D0 active state for real-time streaming
                 self.tb_runner.live_client.pm_control(SOF_PM_OP_WAKE_HOLD)
@@ -3668,7 +5076,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         pipes = list(res.pipeline_ids) if res.pipeline_ids else [1, 2]
         kctl_overrides = self._collect_kcontrol_overrides()
         bytes_overrides = dict(self._pending_bytes_overrides)
-        keep_alive = self.keep_alive_btn.get_active() or self.rt_waveform_btn.get_active()
+        keep_alive = True
         hot_reload = bool(hasattr(self, "hot_reload_btn") and self.hot_reload_btn.get_active())
         run_tab = self.get_active_tab()
         run_io_keys = self._get_ordered_active_io_keys(run_tab.canvas.vm if run_tab else None)
@@ -3799,7 +5207,6 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
         if tb_res.success and tb_res.out_wav_path and os.path.isfile(tb_res.out_wav_path):
             self.last_output_wav = tb_res.out_wav_path
-            self.play_out_btn.set_sensitive(True)
         return False
 
     def _apply_telemetry_to_ui(self, telem: TestbenchTelemetry) -> None:
@@ -4071,7 +5478,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_remote_pm_ctl(self, op: int) -> None:
         if not self.tb_runner or not self.tb_runner.live_client:
-            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench for live PM control.")
+            self.status_lbl.set_text("Click ▶ Run in Testbench for live PM control.")
             return
         st, info = self.tb_runner.live_client.pm_control(op)
         self.append_log(f"[SOFR] Live OP_PM_CTL op={op} -> status={st} {info}")
@@ -4131,7 +5538,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if self._syncing_remote_controls:
             return
         if not self.tb_runner or not self.tb_runner.live_client:
-            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to toggle DSP cores live.")
+            self.status_lbl.set_text("Click ▶ Run in Testbench to toggle DSP cores live.")
             return
         en = btn.get_active()
         st, info = self.tb_runner.live_client.pm_core_enable(core_id, en)
@@ -4142,7 +5549,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_reset_wsim_clicked(self, _btn: Gtk.Button) -> None:
         if not self.tb_runner or not self.tb_runner.live_client:
-            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to reset simulation stats.")
+            self.status_lbl.set_text("Click ▶ Run in Testbench to reset simulation stats.")
             return
         info = self.tb_runner.live_client.workload_sim_reset()
         st = info.get("status", 0) if info else -1
@@ -4195,7 +5602,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
 
     def _on_read_sram_window_clicked(self, win_id: int, win_label: str) -> None:
         if not self.tb_runner or not self.tb_runner.live_client:
-            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to inspect SRAM windows.")
+            self.status_lbl.set_text("Click ▶ Run in Testbench to inspect SRAM windows.")
             return
         st, raw = self.tb_runner.live_client.read_sram_window(win_id=win_id, offset=0, size=256)
         hex_lines: List[str] = [f"[SOFR] OP_WIN_READ {win_label} (win_id={win_id}, status={st}, {len(raw)} bytes):"]
@@ -4217,7 +5624,7 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
         if not cmd:
             return
         if not self.tb_runner or not self.tb_runner.live_client:
-            self.status_lbl.set_text("Enable 'Keep Server (-W)' and click ▶ Run in Testbench to run live shell commands.")
+            self.status_lbl.set_text("Click ▶ Run in Testbench to run live shell commands.")
             return
         st, out = self.tb_runner.live_client.exec_shell(cmd)
         self.append_log(f"[SOFR] $ {cmd}\n{out.strip()}")
@@ -4252,23 +5659,11 @@ class Topology2MainWindow(Gtk.ApplicationWindow):
             self.rt_waveform_btn.set_active(False)
         if self.tb_runner:
             self.tb_runner.stop_live_session()
-            self.keep_alive_btn.set_active(False)
             self.wf_status_lbl.set_text(
                 "Waveforms [SNAPSHOT]" if self.waveform_widget.out_samples else "Waveforms [IDLE]"
             )
             self.status_lbl.set_text("Stopped live SOFR testbench server.")
             self.append_log("[SOFR] Live testbench server stopped.")
-
-    def _on_play_output_clicked(self, _btn: Gtk.Button) -> None:
-        if not self.last_output_wav or not os.path.isfile(self.last_output_wav):
-            return
-        player = shutil.which("aplay") or shutil.which("pw-play")
-        if player:
-            debug_log_command("AUDIO-PLAY", f"{player} {self.last_output_wav}", returncode=0)
-            subprocess.Popen([player, self.last_output_wav])
-            self.status_lbl.set_text(f"Playing {self.last_output_wav} …")
-        else:
-            self.status_lbl.set_text(f"Output WAV ready at: {self.last_output_wav}")
 
     def _init_log_text_tags(self) -> None:
         buf = self.log_view.get_buffer()

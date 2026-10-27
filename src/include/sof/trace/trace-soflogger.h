@@ -166,12 +166,18 @@ void _log_sofdict(log_func_t sofdict_logf, bool atomic, const void *log_entry,
 /* trace level used on host configurations */
 extern int host_trace_level;
 
+__attribute__((weak)) void host_telem_record_log(uint32_t level, uint32_t pipe_id, uint32_t comp_id,
+						 const char *file, int line, const char *fmt, ...);
+
 char *get_trace_class(uint32_t trace_class);
 #define _log_message(ignored_log_func, atomic, level, comp_class, ctx, id_1, id_2, format, ...)	\
 do {								\
 	(void)ctx;						\
-	(void)id_1;						\
-	(void)id_2;						\
+	const char *_fname = strrchr(__FILE__, '/') ?		\
+			     strrchr(__FILE__, '/') + 1 : __FILE__; \
+	if ((level) <= 2 && host_telem_record_log)		\
+		host_telem_record_log((uint32_t)(level), (uint32_t)(id_1), (uint32_t)(id_2), \
+				      _fname, __LINE__, format, ##__VA_ARGS__); \
 	struct timeval tv;					\
 	char slevel[5][4] = {"dis", "err", "wrn", "inf", "dbg"}; \
 	char *msg = "(%s:%d) " format;				\
@@ -179,7 +185,7 @@ do {								\
 		gettimeofday(&tv, NULL);				\
 		fprintf(stderr, "trace: [%ld.%6.6ld] <%s> ", tv.tv_sec, tv.tv_usec, \
 			slevel[level]);					\
-		fprintf(stderr, msg, strrchr(__FILE__, '/') + 1,	\
+		fprintf(stderr, msg, _fname,			\
 			__LINE__, ##__VA_ARGS__);			\
 		fprintf(stderr, "\n");					\
 	}							\

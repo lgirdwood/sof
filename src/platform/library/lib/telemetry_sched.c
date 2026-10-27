@@ -20,6 +20,7 @@
 #include <sof/audio/pipeline.h>
 #include <sof/audio/module_adapter/module/generic.h>
 #include <rtos/alloc.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -28,6 +29,10 @@
 
 #if !defined(__XTENSA__) && !defined(CONFIG_XT_SIMULATOR)
 static volatile char g_telem_lock;
+static __thread uint32_t g_tls_active_comp_id = 0xFFFFFFFFU;
+static __thread uint32_t g_tls_active_pipe_id = 0xFFFFFFFFU;
+static __thread uint32_t g_tls_active_core_id;
+static __thread uint32_t g_tls_mod_entry_errs;
 #define TELEM_LOCK() \
 	do { \
 		while (__atomic_test_and_set(&g_telem_lock, __ATOMIC_ACQUIRE)) { \
@@ -35,6 +40,10 @@ static volatile char g_telem_lock;
 	} while (0)
 #define TELEM_UNLOCK()	__atomic_clear(&g_telem_lock, __ATOMIC_RELEASE)
 #else
+static uint32_t g_tls_active_comp_id = 0xFFFFFFFFU;
+static uint32_t g_tls_active_pipe_id = 0xFFFFFFFFU;
+static uint32_t g_tls_active_core_id;
+static uint32_t g_tls_mod_entry_errs;
 #define TELEM_LOCK()	do {} while (0)
 #define TELEM_UNLOCK()	do {} while (0)
 #endif
@@ -1158,6 +1167,9 @@ uint64_t host_telem_pipe_begin(struct pipeline *p)
 	if (!g_sched_telem.enabled || !p)
 		return 0;
 
+	g_tls_active_pipe_id = p->pipeline_id;
+	g_tls_active_core_id = (p->core < TB_TELEM_MAX_CORES) ? p->core : 0;
+
 	pt = find_or_alloc_pipe(p->pipeline_id);
 	if (pt) {
 		/* Base LL pipeline dispatch overhead (120 cycles in SRAM, scaled in DRAM) */
@@ -1180,6 +1192,9 @@ void host_telem_pipe_end(struct pipeline *p, uint64_t start_cycles, int ret)
 	struct host_pipe_telem *pt;
 	uint64_t end_cycles, delta, exec_ns;
 	uint32_t period_us, freq_hz, i, ll_cnt = 0, dp_cnt = 0;
+
+	g_tls_active_pipe_id = 0xFFFFFFFFU;
+	g_tls_active_comp_id = 0xFFFFFFFFU;
 
 	if (!g_sched_telem.enabled || !p)
 		return;
@@ -1253,6 +1268,12 @@ uint64_t host_telem_mod_entry(struct comp_dev *dev, bool is_dp_thread)
 	m = find_or_alloc_mod(dev->ipc_config.id);
 	if (!m)
 		return host_telem_timestamp_cycles();
+
+	g_tls_active_comp_id = dev->ipc_config.id;
+	g_tls_active_pipe_id = dev->ipc_config.pipeline_id;
+	g_tls_active_core_id = (dev->ipc_config.core < TB_TELEM_MAX_CORES) ?
+			       dev->ipc_config.core : 0;
+	g_tls_mod_entry_errs = m->error_count;
 
 	m->pipeline_id = dev->ipc_config.pipeline_id;
 	m->core_id = dev->ipc_config.core;
@@ -1501,8 +1522,11 @@ void host_telem_mod_exit(struct comp_dev *dev, bool is_dp_thread, uint64_t start
 	resolve_mod_sim_params(m);
 	core_id = (m->core_id < TB_TELEM_MAX_CORES) ? m->core_id : 0;
 
-	if (ret < 0)
-		m->error_count++;
+	if (ret < 0 && m->error_count == g_tls_mod_entry_errs) {
+		host_telem_record_log(1, m->pipeline_id, m->comp_id, "component.c", 605,
+				      "module copy/process failed with status %d", ret);
+	}
+	g_tls_active_comp_id = 0xFFFFFFFFU;
 
 	if (!is_dp_thread && dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_DP) {
 		/* DP module during LL tick: only synced secondary ring buffers */
@@ -1752,4 +1776,237 @@ void host_telem_mod_exit(struct comp_dev *dev, bool is_dp_thread, uint64_t start
 
 	if (m->effective_cpc > 0 && delta > m->effective_cpc)
 		m->cpc_violations++;
+}
+
+void host_telem_record_pin_xrun(struct comp_dev *dev, struct comp_buffer *buf,
+				bool is_overrun, uint32_t req_bytes)
+{
+	struct host_mod_telem *m;
+	struct comp_buffer *b;
+	uint32_t idx = 0, target_buf_id;
+	uint32_t core_id;
+	uint64_t tick;
+	bool found = false;
+
+	(void)req_bytes;
+	if (!g_sched_telem.enabled || !dev)
+		return;
+
+	m = find_or_alloc_mod(dev->ipc_config.id);
+	if (!m)
+		return;
+
+	core_id = (dev->ipc_config.core < TB_TELEM_MAX_CORES) ? dev->ipc_config.core : 0;
+	tick = g_sched_telem.cores[core_id].ll_tick_count;
+	target_buf_id = buf ? buf_get_id(buf) : 0xFFFFFFFFU;
+
+	TELEM_LOCK();
+	if (!is_overrun) {
+		for (idx = 0; idx < m->num_in_pins && idx < TB_TELEM_MAX_PINS; idx++) {
+			if (m->in_pins[idx].active && m->in_pins[idx].buf_id == target_buf_id) {
+				found = true;
+				break;
+			}
+		}
+		if (!found && buf) {
+			idx = 0;
+			comp_dev_for_each_producer(dev, b) {
+				if (idx >= TB_TELEM_MAX_PINS)
+					break;
+				if (b == buf) {
+					found = true;
+					break;
+				}
+				idx++;
+			}
+		}
+		if (!found)
+			idx = 0;
+		if (idx < TB_TELEM_MAX_PINS) {
+			m->in_pins[idx].active = true;
+			if (idx >= m->num_in_pins)
+				m->num_in_pins = idx + 1;
+			m->in_pins[idx].underrun_count++;
+			m->in_pins[idx].xrun_count++;
+			if (tick == 0 && m->iterations == 0)
+				m->in_pins[idx].tick0_xrun_count++;
+		}
+	} else {
+		for (idx = 0; idx < m->num_out_pins && idx < TB_TELEM_MAX_PINS; idx++) {
+			if (m->out_pins[idx].active && m->out_pins[idx].buf_id == target_buf_id) {
+				found = true;
+				break;
+			}
+		}
+		if (!found && buf) {
+			idx = 0;
+			comp_dev_for_each_consumer(dev, b) {
+				if (idx >= TB_TELEM_MAX_PINS)
+					break;
+				if (b == buf) {
+					found = true;
+					break;
+				}
+				idx++;
+			}
+		}
+		if (!found)
+			idx = 0;
+		if (idx < TB_TELEM_MAX_PINS) {
+			m->out_pins[idx].active = true;
+			if (idx >= m->num_out_pins)
+				m->num_out_pins = idx + 1;
+			m->out_pins[idx].overrun_count++;
+			m->out_pins[idx].xrun_count++;
+			if (tick == 0 && m->iterations == 0)
+				m->out_pins[idx].tick0_xrun_count++;
+		}
+	}
+	TELEM_UNLOCK();
+}
+
+void host_telem_record_log(uint32_t level, uint32_t pipe_id, uint32_t comp_id,
+			   const char *file, int line, const char *fmt, ...)
+{
+	struct host_mod_telem *m = NULL;
+	struct host_fw_log_entry *entry;
+	char msg_buf[160];
+	va_list ap;
+	uint32_t i, p, core_id, slot;
+	uint64_t tick;
+	int16_t pin_dir = -1, pin_idx = -1;
+	size_t len;
+
+	if (!g_sched_telem.enabled || !fmt || level == 0 || level > 2)
+		return;
+
+	va_start(ap, fmt);
+	vsnprintf(msg_buf, sizeof(msg_buf), fmt, ap);
+	va_end(ap);
+
+	len = strlen(msg_buf);
+	while (len > 0 && (msg_buf[len - 1] == '\n' || msg_buf[len - 1] == '\r'))
+		msg_buf[--len] = '\0';
+
+	if (pipe_id == 0xFFFFFFFFU && g_tls_active_pipe_id != 0xFFFFFFFFU)
+		pipe_id = g_tls_active_pipe_id;
+	if (comp_id == 0xFFFFFFFFU && g_tls_active_comp_id != 0xFFFFFFFFU)
+		comp_id = g_tls_active_comp_id;
+
+	TELEM_LOCK();
+
+	/* Match comp_id to an active module, or fallback to g_tls_active_comp_id / buffer ID */
+	for (i = 0; i < g_sched_telem.num_mods; i++) {
+		if (g_sched_telem.mods[i].active && g_sched_telem.mods[i].comp_id == comp_id) {
+			m = &g_sched_telem.mods[i];
+			break;
+		}
+	}
+	if (!m && g_tls_active_comp_id != 0xFFFFFFFFU) {
+		for (i = 0; i < g_sched_telem.num_mods; i++) {
+			if (g_sched_telem.mods[i].active &&
+			    g_sched_telem.mods[i].comp_id == g_tls_active_comp_id) {
+				m = &g_sched_telem.mods[i];
+				comp_id = m->comp_id;
+				break;
+			}
+		}
+	}
+	if (!m && comp_id != 0xFFFFFFFFU) {
+		for (i = 0; i < g_sched_telem.num_mods && !m; i++) {
+			struct host_mod_telem *cand = &g_sched_telem.mods[i];
+
+			if (!cand->active)
+				continue;
+			for (p = 0; p < cand->num_in_pins; p++) {
+				if (cand->in_pins[p].active && cand->in_pins[p].buf_id == comp_id) {
+					m = cand;
+					comp_id = cand->comp_id;
+					pin_dir = 0;
+					pin_idx = (int16_t)p;
+					break;
+				}
+			}
+			for (p = 0; !m && p < cand->num_out_pins; p++) {
+				if (cand->out_pins[p].active &&
+				    cand->out_pins[p].buf_id == comp_id) {
+					m = cand;
+					comp_id = cand->comp_id;
+					pin_dir = 1;
+					pin_idx = (int16_t)p;
+					break;
+				}
+			}
+		}
+	}
+
+	core_id = m ? ((m->core_id < TB_TELEM_MAX_CORES) ? m->core_id : 0) :
+		      ((g_tls_active_core_id < TB_TELEM_MAX_CORES) ? g_tls_active_core_id : 0);
+	tick = g_sched_telem.cores[core_id].ll_tick_count;
+
+	if (m) {
+		if (pipe_id == 0xFFFFFFFFU)
+			pipe_id = m->pipeline_id;
+		if (pin_dir < 0) {
+			if (strcasestr(msg_buf, "underrun") ||
+			    strcasestr(msg_buf, "LL to DP copy error") ||
+			    strcasestr(msg_buf, "source")) {
+				pin_dir = 0;
+				pin_idx = 0;
+			} else if (strcasestr(msg_buf, "overrun") ||
+				   strcasestr(msg_buf, "DP to LL copy error") ||
+				   strcasestr(msg_buf, "sink")) {
+				pin_dir = 1;
+				pin_idx = 0;
+			}
+		}
+
+		if (level <= 1) {
+			m->error_count++;
+			if (tick == 0 && m->iterations == 0)
+				m->tick0_error_count++;
+			snprintf(m->last_error_msg, sizeof(m->last_error_msg), "%s", msg_buf);
+
+			/* Increment pin xrun counters if not already counted by comp_underrun/overrun */
+			if (!strstr(msg_buf, "comp_underrun()") &&
+			    !strstr(msg_buf, "comp_overrun()")) {
+				if (pin_dir == 0 && pin_idx >= 0 &&
+				    (uint32_t)pin_idx < m->num_in_pins) {
+					m->in_pins[pin_idx].underrun_count++;
+					m->in_pins[pin_idx].xrun_count++;
+					if (tick == 0 && m->iterations == 0)
+						m->in_pins[pin_idx].tick0_xrun_count++;
+				} else if (pin_dir == 1 && pin_idx >= 0 &&
+					   (uint32_t)pin_idx < m->num_out_pins) {
+					m->out_pins[pin_idx].overrun_count++;
+					m->out_pins[pin_idx].xrun_count++;
+					if (tick == 0 && m->iterations == 0)
+						m->out_pins[pin_idx].tick0_xrun_count++;
+				}
+			}
+		}
+	}
+
+	if (level <= 1)
+		g_sched_telem.total_fw_errors++;
+
+	if (g_sched_telem.num_fw_logs < TB_TELEM_MAX_FW_LOGS) {
+		slot = g_sched_telem.num_fw_logs++;
+	} else {
+		slot = (g_sched_telem.total_fw_errors - 1U) % TB_TELEM_MAX_FW_LOGS;
+	}
+
+	entry = &g_sched_telem.fw_logs[slot];
+	entry->active = true;
+	entry->tick = tick;
+	entry->level = level;
+	entry->pipe_id = pipe_id;
+	entry->comp_id = comp_id;
+	entry->pin_dir = pin_dir;
+	entry->pin_index = pin_idx;
+	snprintf(entry->file, sizeof(entry->file), "%s", file ? file : "fw");
+	entry->line = line;
+	snprintf(entry->msg, sizeof(entry->msg), "%s", msg_buf);
+
+	TELEM_UNLOCK();
 }
