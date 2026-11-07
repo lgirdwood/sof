@@ -343,6 +343,9 @@ BT_CP_HOST_PIPELINE_ID=201,PREPROCESS_PLUGINS=nhlt,NHLT_BIN=nhlt-sof-ptl-ssp2-bt
 "dmic-wov-feature\;sof-dmic-4ch-wov-multi\;PLATFORM=none,NUM_DMICS=4,DMIC0_ID=5,DMIC1_ID=6,DMIC1_ENABLE=false,DMIC1_RATE=16000,DMIC_WOV_DAI_CHANNELS=4,INCLUDE_WOV=multi"
 "dmic-wov-feature\;sof-ptl-dmic-4ch-wov-multi\;PLATFORM=ptl,NUM_DMICS=4,PREPROCESS_PLUGINS=nhlt,NHLT_BIN=nhlt-sof-ptl-dmic-4ch-wov-multi.bin,DMIC_WOV_DAI_CHANNELS=4,INCLUDE_WOV=multi"
 
+# Single-slot WoV feature topology to load alongside sof-ptl-rt721-4ch.
+"rt721-4ch-wov-feature\;sof-ptl-rt721-4ch-wov-single\;DMIC0_RATE=48000"
+
 # Functional SoundWire topologies with integrated multi-slot WoV feature
 "cavs-sdw\;sof-ptl-rt721-4ch-wov-multi\;PLATFORM=ptl,SDW_DMIC=1,NUM_SDW_AMP_LINKS=1,NUM_DMICS=4,\
 PDM1_MIC_A_ENABLE=1,PDM1_MIC_B_ENABLE=1,DMIC0_ID=5,DMIC1_ID=6,HDMI1_ID=7,HDMI2_ID=8,HDMI3_ID=9,\

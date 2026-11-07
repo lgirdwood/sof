@@ -21,6 +21,7 @@ function sof_selector_blobs()
 	% Values of enum ipc4_channel_config
 	IPC4_CHANNEL_CONFIG_MONO = 0;
 	IPC4_CHANNEL_CONFIG_STEREO = 1;
+	IPC4_CHANNEL_CONFIG_3_POINT_1 = 4;
 	IPC4_CHANNEL_CONFIG_QUATRO = 5;
 	IPC4_CHANNEL_CONFIG_5_POINT_1 = 8;
 	IPC4_CHANNEL_CONFIG_DUAL_MONO = 9;
@@ -39,6 +40,15 @@ function sof_selector_blobs()
 	sel.coeffs(1, 1) = 0.7071;
 	sel.coeffs(1, 2) = 0.7071;
 	stereo_to_mono_pack8 = write_blob(sel, "downmix_stereo_to_mono");
+
+	% PTL's 4-channel PDM capture uses channels 0/1 for microphones and 2/3
+	% for echo reference. Feed only the microphone pair to the WoV detector.
+	sel.ch_count = [4 1];
+	sel.ch_config = [IPC4_CHANNEL_CONFIG_3_POINT_1 IPC4_CHANNEL_CONFIG_MONO];
+	sel.coeffs = zeros(8,8);
+	sel.coeffs(1, 1) = 0.5;
+	sel.coeffs(1, 2) = 0.5;
+	dmic_mic_pair_to_mono_pack8 = write_blob(sel, "downmix_dmic_3_point_1_to_mono");
 
 	% Stereo to dual-mono downmix
 	sel.ch_count = [2 2];

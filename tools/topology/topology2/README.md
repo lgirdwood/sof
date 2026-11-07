@@ -961,6 +961,10 @@ Production and feature topologies can be built either via the CMake build system
 From your CMake build directory (e.g. `build-tools/`):
 
 ```bash
+# Build the PTL RT721 4-channel WoV feature topology. Load it alongside
+# sof-ptl-rt721-4ch with the snd_sof feature_topologies module parameter.
+make -C build-tools topology2_prod_sof-ptl-rt721-4ch-wov-single
+
 # Build SoundWire RT721 Multi-WoV (PTL and WCL)
 make -C build-tools \
     topology2_prod_sof-ptl-rt721-4ch-wov-multi \
@@ -982,6 +986,16 @@ make -C build-tools \
     topology2_prod_sof-dmic-4ch-wov-multi \
     topology2_prod_sof-ptl-dmic-wov-multi-4ch
 ```
+
+Load the feature topology alongside the base RT721 topology with:
+
+```conf
+options snd_sof feature_topologies=sof-ptl-rt721-4ch-wov-single.tplg
+```
+
+For `sof-ptl-rt721-4ch-wov-single`, load the same `hi_intel` model into the
+`PDM DMIC MWW bytes` and `Headset MWW bytes` controls. The feature topology adds
+one detector path for each source and does not include ECNS.
 
 ##### Method B: Direct CLI Preprocessor Invocation (`alsatplg -p`)
 
