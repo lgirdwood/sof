@@ -149,7 +149,7 @@ function(sof_llext_build module)
 	add_llext_command(TARGET ${module}
 		POST_PKG
 		COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_offset_calc.py
-			-i ${proc_pkg_file} -s ${size_file}
+			-i ${proc_pkg_file} -s ${size_file} -m ${CONFIG_LIBRARY_REGION_SIZE}
 	)
 endfunction()
 

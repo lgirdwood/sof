@@ -30,6 +30,12 @@ namespace {
 	free(ptr);
 }
 
+/* Clang doesn't use the sized form by default (no -fsized-deallocation) */
+[[maybe_unused]] void sof_operator_delete_unsized(void *ptr)
+{
+	free(ptr);
+}
+
 /*
  * Same problem as operator new/delete above, one level lower: an abstract
  * class's vtable (e.g. TFLM's MicroOpResolver base) fills the slots for its
@@ -58,5 +64,6 @@ extern "C" [[maybe_unused]] void __assert_no_args(void)
 
 EXPORT_SYMBOL_NAMED(sof_operator_new, _Znwj);
 EXPORT_SYMBOL_NAMED(sof_operator_delete, _ZdlPvj);
+EXPORT_SYMBOL_NAMED(sof_operator_delete_unsized, _ZdlPv);
 EXPORT_SYMBOL_NAMED(sof_cxa_pure_virtual, __cxa_pure_virtual);
 EXPORT_SYMBOL(__assert_no_args);

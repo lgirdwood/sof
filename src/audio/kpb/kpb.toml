@@ -1,16 +1,20 @@
+#ifndef LOAD_TYPE
+#define LOAD_TYPE "0"
+#endif
+
 	[[module.entry]]
 	name = "KPB"
 	uuid = UUIDREG_STR_KPB4
 	affinity_mask = "0x1"
 	instance_count = "4"
 	domain_types = "0"
-	load_type = "0"
+	load_type = LOAD_TYPE
 	module_type = "0xB"
 	auto_start = "0"
 	sched_caps = [1, 0x00008000]
 
 	REM # pin = [dir, type, sample rate, size, container, channel-cfg]
-	REM # 1 source, 2 sinks: kpb.c drives a sel_sink (buf_id 0, the real-time
+	REM # 1 source, 2 sinks: kpb/kpb.c drives a sel_sink (buf_id 0, the real-time
 	REM # feed to the detectors) and a host_sink (buf_id 1, the drain that
 	REM # bursts pre-roll to the host). Only one sink was declared here, so
 	REM # the drain path could not be bound from topology.

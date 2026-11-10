@@ -87,7 +87,7 @@
 #endif
 
 #if defined(CONFIG_COMP_KPB) || defined(LLEXT_FORCE_ALL_MODULAR)
-#include <audio/kpb.toml>
+#include <audio/kpb/kpb.toml>
 #endif
 
 #if defined(CONFIG_SAMPLE_SMART_AMP) || defined(LLEXT_FORCE_ALL_MODULAR)

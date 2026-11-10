@@ -128,9 +128,7 @@ if(NOT CONFIG_COMP_MODULE_SHARED_LIBRARY_BUILD)
 		add_local_sources(sof chain_dma.c)
 	endif()
 	if(CONFIG_COMP_KPB AND NOT CONFIG_LIBRARY_STATIC)
-		add_local_sources(sof
-			kpb.c
-		)
+		add_subdirectory(kpb)
 	endif()
 	if(CONFIG_INTEL_ADSP_MIC_PRIVACY)
 		add_subdirectory(mic_privacy_manager)

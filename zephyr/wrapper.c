@@ -22,6 +22,7 @@
 #include <sof/trace/trace.h>
 #include <rtos/wait.h>
 #include <rtos/clk.h>
+#include <rtos/symbol.h>
 #if CONFIG_IPC_MAJOR_4
 #include <ipc4/notification.h>
 #endif
@@ -46,6 +47,13 @@ extern K_KERNEL_STACK_ARRAY_DEFINE(z_interrupt_stacks, CONFIG_MP_MAX_NUM_CPUS,
 SOF_DEFINE_REG_UUID(zephyr);
 
 DECLARE_TR_CTX(zephyr_tr, SOF_UUID(zephyr_uuid), LOG_LEVEL_INFO);
+
+/*
+ * Zephyr scheduler locking for loadable modules: the KPB draining task
+ * blocks LL preemption while it writes into its sink buffer.
+ */
+EXPORT_SYMBOL(k_sched_lock);
+EXPORT_SYMBOL(k_sched_unlock);
 
 /*
  * Interrupts.

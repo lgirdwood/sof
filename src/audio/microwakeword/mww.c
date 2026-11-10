@@ -903,7 +903,8 @@ static int mww_process(struct processing_module *mod,
 				for (i = 0; i < cd->detect_avg_len; i++)
 					prob_sum += cd->prob_hist[i];
 
-				if (cd->total_inferences > MWW_WARMUP_INFERENCES &&
+				/* The arbiter may pause this slot while an inference is running */
+				if (!cd->paused && cd->total_inferences > MWW_WARMUP_INFERENCES &&
 				    prob_sum >= cd->detect_threshold_q8 * cd->detect_avg_len) {
 					cd->detections++;
 					comp_info(dev, "MWW keyword detected: avg probability=%d pct (slot %u, total=%u)",

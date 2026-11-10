@@ -6,6 +6,7 @@
 import argparse
 import pathlib
 import os
+import sys
 from elftools.elf.elffile import ELFFile
 from elftools.elf.constants import SH_FLAGS
 
@@ -20,6 +21,8 @@ def parse_args():
 						help='Object file name')
 	parser.add_argument("-s", "--size-file", required=True, type=str,
 						help='File to store accumulated size')
+	parser.add_argument("-m", "--max-size", type=lambda x: int(x, 0), default=0,
+						help='Size of the loadable module region, 0 for no check')
 
 	args = parser.parse_args()
 
@@ -71,6 +74,10 @@ def main():
 	# Failure will raise an exception
 	f_size = open(f_output, "w")
 	f_size.write(f'0x{size:x}\n')
+
+	if args.max_size and size > args.max_size:
+		sys.exit(f'llext_offset_calc.py: {args.input}: modules need 0x{size:x} bytes, '
+			 f'more than the 0x{args.max_size:x} bytes of CONFIG_LIBRARY_REGION_SIZE')
 
 if __name__ == "__main__":
 	main()

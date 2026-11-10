@@ -99,7 +99,7 @@ static void get_codec_info(struct sof_tlv **tuple)
 	codec_info.items[codec_info.count++] =
 		SET_CODEC_INFO_ITEM(SND_AUDIOCODEC_VORBIS, SOF_IPC_STREAM_PLAYBACK);
 #endif
-#ifdef CONFIG_COMP_MFCC
+#if defined(CONFIG_COMP_MFCC) || defined(CONFIG_COMP_MFCC_MODULE)
 	codec_info.items[codec_info.count++] =
 		SET_CODEC_INFO_ITEM(SND_AUDIOCODEC_BESPOKE, SOF_IPC_STREAM_CAPTURE);
 #endif

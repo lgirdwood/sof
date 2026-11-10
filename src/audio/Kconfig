@@ -103,8 +103,8 @@ config COMP_STUBS
 	  should only be used in testing environments like fuzzers or CI.
 
 config COMP_WOV_ARBITER
-	bool "WOV arbiter component"
-	depends on COMP_KPB
+	tristate "WOV arbiter component"
+	depends on COMP_KPB != n
 	depends on IPC_MAJOR_4
 	help
 	  Select to build the WOV (Wake-on-Voice) arbiter.  The arbiter sits
@@ -114,7 +114,7 @@ config COMP_WOV_ARBITER
 	  detectors to pause.
 
 config COMP_ECNS
-	bool "ECNS data processing component"
+	tristate "ECNS data processing component"
 	default y
 	depends on IPC_MAJOR_4
 	select MATH_IIR
@@ -181,7 +181,7 @@ config ECNS_TEST_SIGNAL
 endif # COMP_ECNS
 
 config COMP_KPB
-	bool "KPB component"
+	tristate "KPB component"
 	default y
 	help
 	  Select for KPB component
