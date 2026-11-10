@@ -621,6 +621,23 @@ static const struct module_interface wov_arbiter_interface = {
 	.free = wov_arb_free,
 };
 
+#if CONFIG_COMP_WOV_ARBITER_MODULE
+/* modular: llext dynamic link */
+
+#include <module/module/api_ver.h>
+#include <module/module/llext.h>
+#include <rimage/sof/user/manifest.h>
+
+static const struct sof_man_module_manifest mod_manifest __section(".module") __used =
+	SOF_LLEXT_MODULE_MANIFEST("WOVARB", &wov_arbiter_interface, 1,
+				  SOF_REG_UUID(wov_arbiter), 3);
+
+SOF_LLEXT_BUILDINFO;
+
+#else
+
 DECLARE_TR_CTX(wov_arbiter_tr, SOF_UUID(wov_arbiter_uuid), LOG_LEVEL_INFO);
 DECLARE_MODULE_ADAPTER(wov_arbiter_interface, wov_arbiter_uuid, wov_arbiter_tr);
 SOF_MODULE_INIT(wov_arbiter, sys_comp_module_wov_arbiter_interface_init);
+
+#endif

@@ -103,7 +103,7 @@ config COMP_STUBS
 	  should only be used in testing environments like fuzzers or CI.
 
 config COMP_WOV_ARBITER
-	bool "WOV arbiter component"
+	tristate "WOV arbiter component"
 	depends on COMP_KPB
 	depends on IPC_MAJOR_4
 	help
