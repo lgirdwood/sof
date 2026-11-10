@@ -1613,6 +1613,22 @@ static const struct module_interface kpb_interface = {
 	.free = kpb_free,
 };
 
+#if CONFIG_COMP_KPB_MODULE
+/* modular: llext dynamic link */
+
+#include <module/module/api_ver.h>
+#include <module/module/llext.h>
+#include <rimage/sof/user/manifest.h>
+
+static const struct sof_man_module_manifest mod_manifest __section(".module") __used =
+	SOF_LLEXT_MODULE_MANIFEST("KPB", &kpb_interface, 1, SOF_REG_UUID(kpb4), 4);
+
+SOF_LLEXT_BUILDINFO;
+
+#else
+
 DECLARE_TR_CTX(kpb_tr, SOF_UUID(kpb4_uuid), LOG_LEVEL_INFO);
 DECLARE_MODULE_ADAPTER(kpb_interface, kpb4_uuid, kpb_tr);
 SOF_MODULE_INIT(kpb, sys_comp_module_kpb_interface_init);
+
+#endif

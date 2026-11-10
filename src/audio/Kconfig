@@ -104,7 +104,7 @@ config COMP_STUBS
 
 config COMP_WOV_ARBITER
 	tristate "WOV arbiter component"
-	depends on COMP_KPB
+	depends on COMP_KPB != n
 	depends on IPC_MAJOR_4
 	help
 	  Select to build the WOV (Wake-on-Voice) arbiter.  The arbiter sits
@@ -181,7 +181,7 @@ config ECNS_TEST_SIGNAL
 endif # COMP_ECNS
 
 config COMP_KPB
-	bool "KPB component"
+	tristate "KPB component"
 	default y
 	help
 	  Select for KPB component
