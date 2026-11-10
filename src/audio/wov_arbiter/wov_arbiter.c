@@ -14,19 +14,16 @@
 //   Subscribes to NOTIFIER_ID_WOV_DETECT  (detector -> arbiter on keyword)
 //   Publishes   NOTIFIER_ID_WOV_CTRL      (arbiter -> detectors: pause/resume)
 
-#include <sof/audio/buffer.h>
 #include <sof/audio/component.h>
-#include <sof/audio/format.h>
-#include <sof/audio/ipc-config.h>
+#include <sof/audio/module_adapter/module/generic.h>
 #include <sof/audio/wov_arbiter.h>
 #include <sof/common.h>
-#include <rtos/alloc.h>
-#include <rtos/init.h>
 #include <sof/lib/notifier.h>
 #include <sof/lib/uuid.h>
-#include <sof/list.h>
+#include <rtos/init.h>
 #include <sof/trace/trace.h>
-#include <sof/ut.h>
+#include <module/audio/sink_api.h>
+#include <module/audio/source_api.h>
 #include <ipc/stream.h>
 #include <ipc/topology.h>
 #include <ipc4/base-config.h>
@@ -34,9 +31,6 @@
 #include <ipc4/module.h>
 #include <ipc4/notification.h>
 #include <sof/ipc/msg.h>
-#include <sof/ipc/common.h>
-#include <sof/ipc/topology.h>
-#include <sof/audio/pipeline.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -46,22 +40,19 @@
 LOG_MODULE_REGISTER(wov_arbiter, CONFIG_SOF_LOG_LEVEL);
 
 SOF_DEFINE_REG_UUID(wov_arbiter);
-DECLARE_TR_CTX(wov_arbiter_tr, SOF_UUID(wov_arbiter_uuid), LOG_LEVEL_INFO);
 
 /* Private runtime data. */
 struct wov_arb_data {
-	struct ipc4_base_module_cfg base_cfg;
 	/*
 	 * Index of the currently active KPB slot (0..num_slots-1).
 	 * WOV_ARB_NO_ACTIVE when no drain is in progress.
 	 * Protected by the scheduler; no extra lock needed.
 	 */
 	uint8_t active_slot;
-	/* Number of input pins (= KPB slots); read from nb_input_pins at init. */
+	/* Number of detector slots that may report a detection */
 	uint8_t num_slots;
 	uint16_t active_slot_ctl_id;
 	uint32_t copy_count;
-	uint32_t drain_frames_copied;
 	uint32_t drain_frames_total;
 #if CONFIG_IPC_MAJOR_4
 	/* Notification messages, allocated on first use and reused */
@@ -78,9 +69,10 @@ struct wov_arb_data {
 static unsigned int wov_arb_instances;
 
 #if CONFIG_IPC_MAJOR_4
-static void notify_control_change(const struct comp_dev *dev, struct wov_arb_data *cd,
+static void notify_control_change(struct processing_module *mod, struct wov_arb_data *cd,
 				  uint16_t control_id, uint32_t val)
 {
+	const struct comp_dev *dev = mod->dev;
 	struct sof_ipc4_notify_module_data *msg_module_data;
 	struct sof_ipc4_control_msg_payload *msg_payload;
 	struct ipc_msg *msg;
@@ -96,7 +88,7 @@ static void notify_control_change(const struct comp_dev *dev, struct wov_arb_dat
 		notif.primary.r.rsp = SOF_IPC4_MESSAGE_DIR_MSG_REQUEST;
 		notif.primary.r.msg_tgt = SOF_IPC4_MESSAGE_TARGET_FW_GEN_MSG;
 
-		cd->ctl_msg = ipc_msg_w_ext_init(NULL, notif.primary.dat, 0, data_size);
+		cd->ctl_msg = mod_ipc_msg_w_ext_init(mod, notif.primary.dat, 0, data_size);
 		if (!cd->ctl_msg)
 			return;
 	}
@@ -125,13 +117,14 @@ static void notify_control_change(const struct comp_dev *dev, struct wov_arb_dat
  * ALSA's normal period-elapsed IRQ path is not relied on here). This mirrors
  * detect_test.c's notify_host() so the kernel's sof_ipc4_rx_msg() can key off
  * SOF_IPC4_NOTIFY_PHRASE_DETECTED and call snd_sof_pcm_period_elapsed().
- * Sent once per detection (from arb_on_detect()), not repeated per copy():
+ * Sent once per detection (from arb_on_detect()), not repeated per process():
  * it is a one-shot simulated interrupt, not a substitute for the host's own
  * period-elapsed mechanism on streams that never requested no-period-wakeup.
  */
-static void notify_host_detect(const struct comp_dev *dev, struct wov_arb_data *cd,
+static void notify_host_detect(struct processing_module *mod, struct wov_arb_data *cd,
 			       uint32_t slot_id)
 {
+	const struct comp_dev *dev = mod->dev;
 	struct ipc4_voice_cmd_notification notif;
 
 	memset_s(&notif, sizeof(notif), 0, sizeof(notif));
@@ -145,8 +138,8 @@ static void notify_host_detect(const struct comp_dev *dev, struct wov_arb_data *
 	notif.extension.r.rsvd1 = (uint32_t)(dev_comp_id(dev) >> 16);
 
 	if (!cd->detect_msg) {
-		cd->detect_msg = ipc_msg_w_ext_init(NULL, notif.primary.dat,
-						    notif.extension.dat, 0);
+		cd->detect_msg = mod_ipc_msg_w_ext_init(mod, notif.primary.dat,
+							notif.extension.dat, 0);
 		if (!cd->detect_msg)
 			return;
 	}
@@ -157,6 +150,16 @@ static void notify_host_detect(const struct comp_dev *dev, struct wov_arb_data *
 }
 #endif
 
+/* Leave the active slot and let all detectors listen again. */
+static void wov_arb_resume_all(struct processing_module *mod, struct wov_arb_data *cd)
+{
+	struct wov_ctrl_notif ctrl = { .cmd = WOV_ARB_CMD_RESUME };
+
+	cd->active_slot = WOV_ARB_NO_ACTIVE;
+	notifier_event(mod->dev, NOTIFIER_ID_WOV_CTRL, NOTIFIER_TARGET_CORE_ALL_MASK,
+		       &ctrl, sizeof(ctrl));
+}
+
 /* -------------------------------------------------------------------------
  * Notifier callbacks
  * ---------------------------------------------------------------------- */
@@ -166,7 +169,8 @@ static void notify_host_detect(const struct comp_dev *dev, struct wov_arb_data *
 static void arb_on_detect(void *arg, enum notify_id id, void *data)
 {
 	struct comp_dev *dev = arg;
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct processing_module *mod = comp_mod(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
 	const struct wov_detect_notif *det = data;
 
 	if (det->slot_id >= cd->num_slots) {
@@ -187,9 +191,9 @@ static void arb_on_detect(void *arg, enum notify_id id, void *data)
 
 #if CONFIG_IPC_MAJOR_4
 	/* Notify host ALSA enum control: 1..N corresponds to Slot 1..N (0 is Listening) */
-	notify_control_change(dev, cd, cd->active_slot_ctl_id, (uint32_t)cd->active_slot + 1);
+	notify_control_change(mod, cd, cd->active_slot_ctl_id, (uint32_t)cd->active_slot + 1);
 	/* Wake a blocking read() on the host WOV capture PCM - see notify_host_detect(). */
-	notify_host_detect(dev, cd, det->slot_id);
+	notify_host_detect(mod, cd, det->slot_id);
 #endif
 
 	/* Broadcast PAUSE to all detectors. The winning slot continues draining
@@ -200,36 +204,22 @@ static void arb_on_detect(void *arg, enum notify_id id, void *data)
 }
 
 /* -------------------------------------------------------------------------
- * Component lifecycle
+ * Module lifecycle
  * ---------------------------------------------------------------------- */
 
-static struct comp_dev *wov_arb_new(const struct comp_driver *drv,
-				    const struct comp_ipc_config *config,
-				    const void *spec)
+static int wov_arb_init(struct processing_module *mod)
 {
-	struct comp_dev *dev;
+	struct comp_dev *dev = mod->dev;
 	struct wov_arb_data *cd;
 
-	comp_cl_info(drv, "wov_arb_new");
-
 	if (wov_arb_instances) {
-		comp_cl_err(drv, "wov_arb_new: another WOV PCM is already active");
-		return NULL;
+		comp_err(dev, "wov_arb_init: another WOV PCM is already active");
+		return -EBUSY;
 	}
 
-	dev = comp_alloc(drv, sizeof(*dev));
-	if (!dev)
-		return NULL;
-	dev->ipc_config = *config;
-
-	cd = rzalloc(SOF_MEM_FLAG_USER, sizeof(*cd));
-	if (!cd) {
-		comp_free_device(dev);
-		return NULL;
-	}
-
-	const struct ipc4_base_module_cfg *base_cfg = spec;
-	memcpy_s(&cd->base_cfg, sizeof(cd->base_cfg), base_cfg, sizeof(*base_cfg));
+	cd = mod_zalloc(mod, sizeof(*cd));
+	if (!cd)
+		return -ENOMEM;
 
 	/* Detection notifications arrive via notifier bus across pipelines, so support up to MAX_SLOTS */
 	cd->num_slots = WOV_ARB_MAX_SLOTS;
@@ -238,162 +228,101 @@ static struct comp_dev *wov_arb_new(const struct comp_driver *drv,
 	/* Start with no active slot; first WOV_DETECT notifier will activate one. */
 	cd->active_slot = WOV_ARB_NO_ACTIVE;
 
-	comp_set_drvdata(dev, cd);
-	/* Arbiter produces a capture stream that feeds the host PCM copier. */
-	dev->direction = SOF_IPC_STREAM_CAPTURE;
-	dev->direction_set = true;
-	dev->state = COMP_STATE_READY;
-
-#if CONFIG_IPC_MAJOR_4
-	struct ipc_comp_dev *ipc_pipe;
-	struct ipc *ipc = ipc_get();
-
-	ipc_pipe = ipc_get_comp_by_ppl_id(ipc, COMP_TYPE_PIPELINE, config->pipeline_id,
-					  IPC_COMP_IGNORE_REMOTE);
-	if (ipc_pipe && ipc_pipe->pipeline) {
-		dev->pipeline = ipc_pipe->pipeline;
-		if (dev->ipc_config.proc_domain == COMP_PROCESSING_DOMAIN_LL || !dev->period)
-			dev->period = ipc_pipe->pipeline->period;
-	}
-
-	if (!dev->period)
-		dev->period = 10000;
-
-	component_set_nearest_period_frames(dev, cd->base_cfg.audio_fmt.sampling_frequency);
-	if (!dev->frames)
-		dev->frames = 160;
-#endif
-
-	comp_info(dev, "wov_arb_new: num_slots=%u, ppl=%u, period=%u, frames=%u",
-		  cd->num_slots, config->pipeline_id, dev->period, dev->frames);
-
+	module_set_private_data(mod, cd);
+	/* Pin 0 from KPB and the detector outputs */
+	mod->max_sources = CONFIG_MODULE_MAX_CONNECTIONS;
 	wov_arb_instances++;
 
-	return dev;
+	comp_info(dev, "wov_arb_init: num_slots=%u, period=%u, frames=%u",
+		  cd->num_slots, dev->period, dev->frames);
+
+	return 0;
 }
 
-static void wov_arb_free(struct comp_dev *dev)
+static int wov_arb_free(struct processing_module *mod)
 {
-	comp_info(dev, "wov_arb_free");
+	struct wov_arb_data *cd = module_get_private_data(mod);
 
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	comp_info(mod->dev, "wov_arb_free");
 
-	if (cd && cd->active_slot != WOV_ARB_NO_ACTIVE) {
-		cd->active_slot = WOV_ARB_NO_ACTIVE;
-		struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
-		notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-			       NOTIFIER_TARGET_CORE_ALL_MASK,
-			       &c, sizeof(c));
-	}
+	if (cd->active_slot != WOV_ARB_NO_ACTIVE)
+		wov_arb_resume_all(mod, cd);
 
-	notifier_unregister(dev, NULL, NOTIFIER_ID_WOV_DETECT);
+	notifier_unregister(mod->dev, NULL, NOTIFIER_ID_WOV_DETECT);
 
 #if CONFIG_IPC_MAJOR_4
-	if (cd) {
-		ipc_msg_free(cd->ctl_msg);
-		ipc_msg_free(cd->detect_msg);
-	}
+	mod_ipc_msg_free(mod, cd->ctl_msg);
+	mod_ipc_msg_free(mod, cd->detect_msg);
 #endif
-	rfree(cd);
-	comp_free_device(dev);
+	mod_free(mod, cd);
 
 	if (wov_arb_instances)
 		wov_arb_instances--;
+
+	return 0;
 }
 
-static int wov_arb_params(struct comp_dev *dev,
-			   struct sof_ipc_stream_params *params);
-
-static int wov_arb_prepare(struct comp_dev *dev)
+static int wov_arb_prepare(struct processing_module *mod,
+			   struct sof_source **sources, int num_of_sources,
+			   struct sof_sink **sinks, int num_of_sinks)
 {
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
+	const struct ipc4_audio_format *fmt = &mod->priv.cfg.base_cfg.audio_fmt;
+	struct comp_dev *dev = mod->dev;
+	int i;
 
 	comp_info(dev, "wov_arb_prepare: period=%u, frames=%u", dev->period, dev->frames);
 
 	cd->active_slot = WOV_ARB_NO_ACTIVE;
 	cd->copy_count = 0;
-	cd->drain_frames_copied = 0;
 	cd->drain_frames_total = 0;
 
 #if CONFIG_IPC_MAJOR_4
-	notify_control_change(dev, cd, cd->active_slot_ctl_id, 0);
+	notify_control_change(mod, cd, cd->active_slot_ctl_id, 0);
 #endif
 
-	if (!dev->frames) {
-		component_set_nearest_period_frames(dev, cd->base_cfg.audio_fmt.sampling_frequency);
-		if (!dev->frames)
-			dev->frames = 160;
-	}
+	if (num_of_sinks)
+		ipc4_update_sink_format(sinks[0], fmt);
 
-	struct comp_buffer *sink = comp_dev_get_first_data_consumer(dev);
-	if (sink) {
-#if CONFIG_IPC_MAJOR_4
-		ipc4_update_buffer_format(sink, &cd->base_cfg.audio_fmt);
-#else
-		struct sof_ipc_stream_params p;
-		wov_arb_params(dev, &p);
-		buffer_set_params(sink, &p, true);
-#endif
-	}
-
-	struct comp_buffer *source;
-	struct list_item *src_item;
-	list_for_item(src_item, &dev->bsource_list) {
-		source = list_item(src_item, struct comp_buffer, sink_list);
-		if ((buf_get_id(source) >> 16) == 0) {
-			/* Pin 0 is audio from KPB: 1ch mono S32_LE */
-#if CONFIG_IPC_MAJOR_4
-			ipc4_update_buffer_format(source, &cd->base_cfg.audio_fmt);
-#else
-			struct sof_ipc_stream_params p;
-			wov_arb_params(dev, &p);
-			buffer_set_params(source, &p, true);
-#endif
-		}
-	}
+	/* Pin 0 is the drained audio from KPB */
+	for (i = 0; i < num_of_sources; i++)
+		if (IPC4_SINK_QUEUE_ID(source_get_id(sources[i])) == 0)
+			ipc4_update_source_format(sources[i], fmt);
 
 	/* Subscribe to keyword-detected events from any WOV detector. */
 	notifier_unregister(dev, NULL, NOTIFIER_ID_WOV_DETECT);
 	notifier_register(dev, NULL, NOTIFIER_ID_WOV_DETECT, arb_on_detect, 0);
 
 	/* Broadcast RESUME so all WOV detector slots start unpaused. */
-	struct wov_ctrl_notif ctrl = { .cmd = WOV_ARB_CMD_RESUME };
-	notifier_event(dev, NOTIFIER_ID_WOV_CTRL, NOTIFIER_TARGET_CORE_ALL_MASK,
-		       &ctrl, sizeof(ctrl));
+	wov_arb_resume_all(mod, cd);
 
-	return comp_set_state(dev, COMP_TRIGGER_PREPARE);
+	return 0;
 }
 
-static int wov_arb_reset(struct comp_dev *dev)
+static int wov_arb_reset(struct processing_module *mod)
 {
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
 
-	comp_info(dev, "wov_arb_reset");
+	comp_info(mod->dev, "wov_arb_reset");
 
-	if (cd && cd->active_slot != WOV_ARB_NO_ACTIVE) {
-		cd->active_slot = WOV_ARB_NO_ACTIVE;
-		struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
-		notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-			       NOTIFIER_TARGET_CORE_ALL_MASK,
-			       &c, sizeof(c));
-	}
+	if (cd->active_slot != WOV_ARB_NO_ACTIVE)
+		wov_arb_resume_all(mod, cd);
 
-	cd->drain_frames_copied = 0;
 	cd->drain_frames_total = 0;
 
-	notifier_unregister(dev, NULL, NOTIFIER_ID_WOV_DETECT);
+	notifier_unregister(mod->dev, NULL, NOTIFIER_ID_WOV_DETECT);
 
-	return comp_set_state(dev, COMP_TRIGGER_RESET);
+	return 0;
 }
 
-static int wov_arb_trigger(struct comp_dev *dev, int cmd)
+static int wov_arb_trigger(struct processing_module *mod, int cmd)
 {
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
 	int ret;
 
-	comp_info(dev, "wov_arb_trigger cmd %d", cmd);
+	comp_info(mod->dev, "wov_arb_trigger cmd %d", cmd);
 
-	ret = comp_set_state(dev, cmd);
+	ret = module_adapter_set_state(mod, mod->dev, cmd);
 	if (ret)
 		return ret;
 
@@ -402,42 +331,15 @@ static int wov_arb_trigger(struct comp_dev *dev, int cmd)
 	 * all detectors so they return to listening mode.
 	 */
 	if (cmd == COMP_TRIGGER_STOP || cmd == COMP_TRIGGER_PAUSE) {
-		cd->drain_frames_copied = 0;
 		cd->drain_frames_total = 0;
 		if (cd->active_slot != WOV_ARB_NO_ACTIVE) {
-			comp_info(dev, "wov_arb: stream stopped, resuming all slots");
-			cd->active_slot = WOV_ARB_NO_ACTIVE;
+			comp_info(mod->dev, "wov_arb: stream stopped, resuming all slots");
 #if CONFIG_IPC_MAJOR_4
-			notify_control_change(dev, cd, cd->active_slot_ctl_id, 0);
+			notify_control_change(mod, cd, cd->active_slot_ctl_id, 0);
 #endif
-			struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
-			notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-				       NOTIFIER_TARGET_CORE_ALL_MASK,
-				       &c, sizeof(c));
+			wov_arb_resume_all(mod, cd);
 		}
 	}
-
-	return 0;
-}
-
-static int wov_arb_params(struct comp_dev *dev,
-			   struct sof_ipc_stream_params *params)
-{
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
-
-#if CONFIG_IPC_MAJOR_4
-	ipc4_base_module_cfg_to_stream_params(&cd->base_cfg, params);
-#else
-	/* Translate IPC4 base_cfg audio_fmt to IPC3-style stream params. */
-	memset(params, 0, sizeof(*params));
-	params->channels = cd->base_cfg.audio_fmt.channels_count;
-	params->rate     = cd->base_cfg.audio_fmt.sampling_frequency;
-	params->sample_container_bytes = cd->base_cfg.audio_fmt.depth / 8;
-	params->sample_valid_bytes =
-		cd->base_cfg.audio_fmt.valid_bit_depth / 8;
-	params->buffer_fmt = cd->base_cfg.audio_fmt.interleaving_style;
-#endif
-	component_set_nearest_period_frames(dev, params->rate);
 
 	return 0;
 }
@@ -446,19 +348,21 @@ static int wov_arb_params(struct comp_dev *dev,
  * IPC4 large-config: allow host to force-select a slot (debug/test use).
  * ---------------------------------------------------------------------- */
 
-static int wov_arb_set_large_config(struct comp_dev *dev,
-				    uint32_t param_id,
-				    bool first_block,
-				    bool last_block,
-				    uint32_t data_offset,
-				    const char *data)
+static int wov_arb_set_config(struct processing_module *mod, uint32_t param_id,
+			      enum module_cfg_fragment_position pos, uint32_t data_offset_size,
+			      const uint8_t *fragment, size_t fragment_size, uint8_t *response,
+			      size_t response_size)
 {
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
+	struct comp_dev *dev = mod->dev;
 
 	switch (param_id) {
 	case SOF_IPC4_ENUM_CONTROL_PARAM_ID: {
 		const struct sof_ipc4_control_msg_payload *cp =
-			(const struct sof_ipc4_control_msg_payload *)data;
+			(const struct sof_ipc4_control_msg_payload *)fragment;
+
+		if (fragment_size < sizeof(*cp))
+			return -EINVAL;
 
 		cd->active_slot_ctl_id = cp->id;
 		if (cp->num_elems > 0) {
@@ -466,11 +370,7 @@ static int wov_arb_set_large_config(struct comp_dev *dev,
 
 			if (val == 0) {
 				comp_info(dev, "wov_arb: reset active_slot to listening (0)");
-				cd->active_slot = WOV_ARB_NO_ACTIVE;
-				struct wov_ctrl_notif c = { .cmd = WOV_ARB_CMD_RESUME };
-				notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-					       NOTIFIER_TARGET_CORE_ALL_MASK,
-					       &c, sizeof(c));
+				wov_arb_resume_all(mod, cd);
 			} else {
 				uint8_t selected_slot = (uint8_t)(val - 1);
 
@@ -487,11 +387,7 @@ static int wov_arb_set_large_config(struct comp_dev *dev,
 				 * slot_id = selected_slot so every OTHER slot suspends
 				 * inference and yields CPU time to the selected detector.
 				 */
-				cd->active_slot = WOV_ARB_NO_ACTIVE;
-				struct wov_ctrl_notif r = { .cmd = WOV_ARB_CMD_RESUME };
-				notifier_event(dev, NOTIFIER_ID_WOV_CTRL,
-					       NOTIFIER_TARGET_CORE_ALL_MASK,
-					       &r, sizeof(r));
+				wov_arb_resume_all(mod, cd);
 				struct wov_ctrl_notif p = {
 					.cmd = WOV_ARB_CMD_PAUSE,
 					.slot_id = selected_slot,
@@ -507,7 +403,9 @@ static int wov_arb_set_large_config(struct comp_dev *dev,
 	case IPC4_WOV_ARB_GET_ACTIVE_SLOT:
 		return 0;
 	case IPC4_WOV_ARB_SET_ACTIVE_SLOT:
-		cd->active_slot = *(const uint8_t *)data;
+		if (!fragment_size)
+			return -EINVAL;
+		cd->active_slot = *fragment;
 		comp_info(dev, "wov_arb: force active_slot=%u", cd->active_slot);
 		return 0;
 	default:
@@ -515,202 +413,33 @@ static int wov_arb_set_large_config(struct comp_dev *dev,
 	}
 }
 
-static int wov_arb_get_attribute(struct comp_dev *dev,
-				 uint32_t type, void *value)
-{
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
-
-	if (type == COMP_ATTR_BASE_CONFIG) {
-		*(struct ipc4_base_module_cfg *)value = cd->base_cfg;
-		return 0;
-	}
-	return -EINVAL;
-}
-
-/* -------------------------------------------------------------------------
- * copy() -- main audio processing
- *
- * For the active input pin: forward frames to the output.
- * For all other input pins: consume and discard to prevent buffer stalls.
- *
- * Input buffers are ordered by connection order in bsource_list.
- * Slot 0 = first connected source, etc.
- * ---------------------------------------------------------------------- */
-static int wov_arb_copy(struct comp_dev *dev)
-{
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
-	struct comp_buffer *sink;
-	struct comp_buffer *source;
-	struct list_item *src_item;
-	uint32_t sink_free;
-	uint32_t active_avail = 0;
-
-	comp_dbg(dev, "wov_arb_copy active=%u", cd->active_slot);
-
-	sink = comp_dev_get_first_data_consumer(dev);
-	if (!sink)
-		return 0;
-
-	sink_free = audio_stream_get_free_bytes(&sink->stream);
-
-	uint32_t num_sources = 0;
-	uint32_t num_kpb_sources = 0;
-	list_for_item(src_item, &dev->bsource_list) {
-		source = list_item(src_item, struct comp_buffer, sink_list);
-		num_sources++;
-		if (source->source && dev_comp_type(source->source) == SOF_COMP_KPB)
-			num_kpb_sources++;
-	}
-
-	/*
-	 * Do NOT force a lone source "active" while listening: the host PCM must
-	 * stay silent/idle (no data, no host-copier IRQs) until a real WOV
-	 * detection (or the fake-wake test path) sets cd->active_slot via
-	 * on_wov_detect(). That is what lets the host block in read() and the
-	 * platform actually reach D0i3/suspend instead of being kept awake by a
-	 * continuous keep-alive stream.
-	 */
-	uint32_t eff_active_slot = cd->active_slot;
-	struct comp_buffer *active_source = NULL;
-
-	/* Find active audio source buffer if a slot is triggered */
-	if (eff_active_slot != WOV_ARB_NO_ACTIVE) {
-		list_for_item(src_item, &dev->bsource_list) {
-			source = list_item(src_item, struct comp_buffer, sink_list);
-			if ((source->source && (source->source->drv->type == SOF_COMP_KPB ||
-						dev_comp_type(source->source) == SOF_COMP_KPB)) ||
-			    (buf_get_id(source) >> 16) == 0) {
-				active_source = source;
-				break;
-			}
-		}
-
-		if (active_source)
-			active_avail = audio_stream_get_avail_bytes(&active_source->stream);
-	}
-
-	uint32_t copied_dst_bytes = 0;
-
-	/* Second pass: copy active audio slot, silently drain idle/detector slots. */
-	list_for_item(src_item, &dev->bsource_list) {
-		source = list_item(src_item, struct comp_buffer, sink_list);
-
-		if (source == active_source) {
-			if (active_avail > 0 && sink_free > 0) {
-				uint32_t src_frame_bytes = audio_stream_frame_bytes(&source->stream);
-				uint32_t dst_frame_bytes = audio_stream_frame_bytes(&sink->stream);
-				if (!src_frame_bytes)
-					src_frame_bytes = cd->base_cfg.audio_fmt.depth ?
-						(cd->base_cfg.audio_fmt.channels_count * cd->base_cfg.audio_fmt.depth / 8) : 4;
-				if (!dst_frame_bytes)
-					dst_frame_bytes = cd->base_cfg.audio_fmt.depth ?
-						(cd->base_cfg.audio_fmt.channels_count * cd->base_cfg.audio_fmt.depth / 8) : 4;
-
-				uint32_t src_frames = active_avail / src_frame_bytes;
-				uint32_t dst_frames = sink_free / dst_frame_bytes;
-				uint32_t frames = MIN(src_frames, dst_frames);
-
-				if (frames > 0) {
-					uint32_t src_bytes = frames * src_frame_bytes;
-					uint32_t dst_bytes = frames * dst_frame_bytes;
-					uint32_t src_ch = audio_stream_get_channels(&source->stream);
-					uint32_t dst_ch = audio_stream_get_channels(&sink->stream);
-					uint32_t src_sb = audio_stream_sample_bytes(&source->stream);
-					uint32_t dst_sb = audio_stream_sample_bytes(&sink->stream);
-
-					buffer_stream_invalidate(source, src_bytes);
-
-					if (src_ch == 1 && dst_ch == 2) {
-						for (uint32_t i = 0; i < frames; i++) {
-							int32_t s = (src_sb == sizeof(int32_t)) ?
-								*(int32_t *)audio_stream_read_frag_s32(&source->stream, i) :
-								(((int32_t)*(int16_t *)audio_stream_read_frag_s16(&source->stream, i)) << 16);
-							if (dst_sb == sizeof(int32_t)) {
-								*(int32_t *)audio_stream_write_frag_s32(&sink->stream, 2 * i) = s;
-								*(int32_t *)audio_stream_write_frag_s32(&sink->stream, 2 * i + 1) = s;
-							} else {
-								int16_t s16 = (int16_t)(s >> 16);
-								*(int16_t *)audio_stream_write_frag_s16(&sink->stream, 2 * i) = s16;
-								*(int16_t *)audio_stream_write_frag_s16(&sink->stream, 2 * i + 1) = s16;
-							}
-						}
-					} else if (src_sb != dst_sb) {
-						if (src_sb == sizeof(int32_t) && dst_sb == sizeof(int16_t)) {
-							for (uint32_t i = 0; i < frames * src_ch; i++) {
-								int32_t s = *(int32_t *)audio_stream_read_frag_s32(&source->stream, i);
-								*(int16_t *)audio_stream_write_frag_s16(&sink->stream, i) = (int16_t)(s >> 16);
-							}
-						} else if (src_sb == sizeof(int16_t) && dst_sb == sizeof(int32_t)) {
-							for (uint32_t i = 0; i < frames * src_ch; i++) {
-								int16_t s = *(int16_t *)audio_stream_read_frag_s16(&source->stream, i);
-								*(int32_t *)audio_stream_write_frag_s32(&sink->stream, i) = ((int32_t)s) << 16;
-							}
-						} else {
-							audio_stream_copy(&source->stream, 0,
-									  &sink->stream, 0,
-									  frames * src_ch);
-						}
-					} else {
-						audio_stream_copy(&source->stream, 0,
-								  &sink->stream, 0,
-								  frames * src_ch);
-					}
-
-					comp_update_buffer_consume(source, src_bytes);
-					buffer_stream_writeback(sink, dst_bytes);
-					comp_update_buffer_produce(sink, dst_bytes);
-					copied_dst_bytes = dst_bytes;
-
-					cd->drain_frames_total += frames;
-				}
-			}
-		} else {
-			uint32_t avail = audio_stream_get_avail_bytes(&source->stream);
-
-			if (avail > 0)
-				comp_update_buffer_consume(source, avail);
-		}
-	}
-
-	cd->copy_count++;
-	if ((cd->copy_count % 100) == 1) {
-		comp_dbg(dev, "wov_arb_copy #%u: active=%u, num_src=%u, act_avail=%u, copied=%u, sink_free=%u",
-			 cd->copy_count, cd->active_slot, num_sources, active_avail, copied_dst_bytes, sink_free);
-	}
-
-	return 0;
-}
-
 /* -------------------------------------------------------------------------
  * IPC4 large-config (get): expose active slot to userspace as a volatile
  * RO enum kcontrol; the host reads this via GET_MODULE_LARGE_CONFIG.
  * ---------------------------------------------------------------------- */
 
-static int wov_arb_get_large_config(struct comp_dev *dev,
-				    uint32_t param_id,
-				    bool first_block,
-				    bool last_block,
-				    uint32_t *data_offset,
-				    char *data)
+static int wov_arb_get_config(struct processing_module *mod,
+			      uint32_t config_id, uint32_t *data_offset_size,
+			      uint8_t *fragment, size_t fragment_size)
 {
-	struct wov_arb_data *cd = comp_get_drvdata(dev);
+	struct wov_arb_data *cd = module_get_private_data(mod);
 
-	switch (param_id) {
+	switch (config_id) {
 	case SOF_IPC4_ENUM_CONTROL_PARAM_ID: {
 		struct sof_ipc4_control_msg_payload *cp =
-			(struct sof_ipc4_control_msg_payload *)data;
+			(struct sof_ipc4_control_msg_payload *)fragment;
 		uint16_t ctl_id = cp->id;
 		uint32_t resp_size = sizeof(struct sof_ipc4_control_msg_payload) +
 				     sizeof(struct sof_ipc4_ctrl_value_chan);
 
-		if (resp_size > *data_offset) {
-			comp_err(dev, "wrong enum control response size %u vs %u",
-				 resp_size, *data_offset);
+		if (resp_size > *data_offset_size) {
+			comp_err(mod->dev, "wrong enum control response size %u vs %u",
+				 resp_size, *data_offset_size);
 			return -EINVAL;
 		}
 
 		cd->active_slot_ctl_id = ctl_id;
-		*data_offset = resp_size;
+		*data_offset_size = resp_size;
 		memset_s(cp, resp_size, 0, resp_size);
 		cp->id = ctl_id;
 		cp->num_elems = 1;
@@ -723,8 +452,8 @@ static int wov_arb_get_large_config(struct comp_dev *dev,
 		return 0;
 	}
 	case IPC4_WOV_ARB_GET_ACTIVE_SLOT:
-		*(uint32_t *)data = (uint32_t)cd->active_slot;
-		*data_offset = sizeof(uint32_t);
+		*(uint32_t *)fragment = (uint32_t)cd->active_slot;
+		*data_offset_size = sizeof(uint32_t);
 		return 0;
 	default:
 		return -EINVAL;
@@ -732,35 +461,166 @@ static int wov_arb_get_large_config(struct comp_dev *dev,
 }
 
 /* -------------------------------------------------------------------------
- * Component driver registration
+ * process() -- main audio processing
+ *
+ * While a slot is active: forward the drained KPB audio on input pin 0 to
+ * the output, converting channels and sample size as needed.
+ * All other input pins, and pin 0 while listening: consume and discard to
+ * prevent buffer stalls.
  * ---------------------------------------------------------------------- */
 
-static const struct comp_driver wov_arbiter_drv = {
-	.type  = SOF_COMP_KEYWORD_DETECT,
-	.uid   = SOF_RT_UUID(wov_arbiter_uuid),
-	.tctx  = &wov_arbiter_tr,
-	.ops   = {
-		.create            = wov_arb_new,
-		.free              = wov_arb_free,
-		.params            = wov_arb_params,
-		.trigger           = wov_arb_trigger,
-		.copy              = wov_arb_copy,
-		.prepare           = wov_arb_prepare,
-		.reset             = wov_arb_reset,
-		.set_large_config  = wov_arb_set_large_config,
-		.get_large_config  = wov_arb_get_large_config,
-		.get_attribute     = wov_arb_get_attribute,
-	},
-};
-
-static struct comp_driver_info wov_arbiter_info = {
-	.drv = &wov_arbiter_drv,
-};
-
-UT_STATIC void sys_comp_wov_arbiter_init(void)
+/* Read one sample from a circular buffer as S32, S16 is MSB aligned */
+static inline int32_t wov_arb_read_sample(const uint8_t **p, const uint8_t *start,
+					  const uint8_t *end, size_t sample_bytes)
 {
-	comp_register(&wov_arbiter_info);
+	int32_t s = sample_bytes == sizeof(int32_t) ? *(const int32_t *)*p :
+		    (int32_t)*(const int16_t *)*p << 16;
+
+	*p += sample_bytes;
+	if (*p >= end)
+		*p = start;
+
+	return s;
 }
 
-DECLARE_MODULE(sys_comp_wov_arbiter_init);
-SOF_MODULE_INIT(wov_arbiter, sys_comp_wov_arbiter_init);
+/* Write one S32 sample to a circular buffer, S16 takes the MSBs */
+static inline void wov_arb_write_sample(uint8_t **p, uint8_t *start, uint8_t *end,
+					size_t sample_bytes, int32_t s)
+{
+	if (sample_bytes == sizeof(int32_t))
+		*(int32_t *)*p = s;
+	else
+		*(int16_t *)*p = (int16_t)(s >> 16);
+
+	*p += sample_bytes;
+	if (*p >= end)
+		*p = start;
+}
+
+/* Copy frames from source to sink. Mono input is copied to all output
+ * channels, otherwise channels map 1:1 and extra input channels are dropped.
+ */
+static int wov_arb_copy_frames(struct sof_source *source, struct sof_sink *sink,
+			       uint32_t frames)
+{
+	size_t src_frame_bytes = source_get_frame_bytes(source);
+	size_t dst_frame_bytes = sink_get_frame_bytes(sink);
+	unsigned int src_ch = source_get_channels(source);
+	unsigned int dst_ch = sink_get_channels(sink);
+	size_t src_sb = src_frame_bytes / src_ch;
+	size_t dst_sb = dst_frame_bytes / dst_ch;
+	int32_t frame[PLATFORM_MAX_CHANNELS];
+	const uint8_t *src_start, *src_end, *in;
+	uint8_t *dst_start, *dst_end, *out;
+	const void *src_ptr, *src_buf;
+	void *dst_ptr, *dst_buf;
+	size_t src_size, dst_size;
+	unsigned int ch;
+	uint32_t i;
+	int ret;
+
+	if (src_ch > PLATFORM_MAX_CHANNELS)
+		return -EINVAL;
+
+	ret = source_get_data(source, frames * src_frame_bytes, &src_ptr, &src_buf, &src_size);
+	if (ret)
+		return ret;
+
+	ret = sink_get_buffer(sink, frames * dst_frame_bytes, &dst_ptr, &dst_buf, &dst_size);
+	if (ret) {
+		source_release_data(source, 0);
+		return ret;
+	}
+
+	in = src_ptr;
+	src_start = src_buf;
+	src_end = src_start + src_size;
+	out = dst_ptr;
+	dst_start = dst_buf;
+	dst_end = dst_start + dst_size;
+
+	for (i = 0; i < frames; i++) {
+		for (ch = 0; ch < src_ch; ch++)
+			frame[ch] = wov_arb_read_sample(&in, src_start, src_end, src_sb);
+		for (ch = 0; ch < dst_ch; ch++)
+			wov_arb_write_sample(&out, dst_start, dst_end, dst_sb,
+					     frame[src_ch == 1 ? 0 : MIN(ch, src_ch - 1)]);
+	}
+
+	source_release_data(source, frames * src_frame_bytes);
+	sink_commit_buffer(sink, frames * dst_frame_bytes);
+
+	return 0;
+}
+
+/* Consume and discard everything available on a source */
+static void wov_arb_drop(struct sof_source *source)
+{
+	size_t avail = source_get_data_available(source);
+	const void *ptr, *buf;
+	size_t size;
+
+	if (avail && !source_get_data(source, avail, &ptr, &buf, &size))
+		source_release_data(source, avail);
+}
+
+static int wov_arb_process(struct processing_module *mod,
+			   struct sof_source **sources, int num_of_sources,
+			   struct sof_sink **sinks, int num_of_sinks)
+{
+	struct wov_arb_data *cd = module_get_private_data(mod);
+	struct sof_sink *sink = num_of_sinks ? sinks[0] : NULL;
+	uint32_t copied_frames = 0;
+	uint32_t frames;
+	int ret;
+	int i;
+
+	/*
+	 * Do NOT forward anything while listening: the host PCM must stay
+	 * silent/idle (no data, no host-copier IRQs) until a real WOV
+	 * detection (or the fake-wake test path) sets cd->active_slot via
+	 * arb_on_detect(). That is what lets the host block in read() and the
+	 * platform actually reach D0i3/suspend instead of being kept awake by a
+	 * continuous keep-alive stream.
+	 */
+	for (i = 0; i < num_of_sources; i++) {
+		struct sof_source *source = sources[i];
+
+		if (sink && cd->active_slot != WOV_ARB_NO_ACTIVE &&
+		    IPC4_SINK_QUEUE_ID(source_get_id(source)) == 0) {
+			frames = MIN(source_get_data_frames_available(source),
+				     sink_get_free_frames(sink));
+			if (frames) {
+				ret = wov_arb_copy_frames(source, sink, frames);
+				if (ret)
+					return ret;
+				copied_frames = frames;
+				cd->drain_frames_total += frames;
+			}
+		} else {
+			wov_arb_drop(source);
+		}
+	}
+
+	cd->copy_count++;
+	if ((cd->copy_count % 100) == 1)
+		comp_dbg(mod->dev, "wov_arb_process #%u: active=%u, num_src=%d, copied=%u",
+			 cd->copy_count, cd->active_slot, num_of_sources, copied_frames);
+
+	return 0;
+}
+
+static const struct module_interface wov_arbiter_interface = {
+	.init = wov_arb_init,
+	.prepare = wov_arb_prepare,
+	.process = wov_arb_process,
+	.set_configuration = wov_arb_set_config,
+	.get_configuration = wov_arb_get_config,
+	.trigger = wov_arb_trigger,
+	.reset = wov_arb_reset,
+	.free = wov_arb_free,
+};
+
+DECLARE_TR_CTX(wov_arbiter_tr, SOF_UUID(wov_arbiter_uuid), LOG_LEVEL_INFO);
+DECLARE_MODULE_ADAPTER(wov_arbiter_interface, wov_arbiter_uuid, wov_arbiter_tr);
+SOF_MODULE_INIT(wov_arbiter, sys_comp_module_wov_arbiter_interface_init);
