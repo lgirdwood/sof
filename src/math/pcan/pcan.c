@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <rtos/symbol.h>
 
 /* ln(2) in Q5.27:  round(ln(2) * 2^27) */
 #define PCAN_LN2_Q27		93032640
@@ -197,6 +198,7 @@ int pcan_populate_state(const struct pcan_config *config, struct pcan_state *sta
 
 	return 0;
 }
+EXPORT_SYMBOL(pcan_populate_state);
 
 void pcan_free_state(struct pcan_state *state)
 {
@@ -232,3 +234,8 @@ void pcan_log_scale(struct pcan_state *state, uint32_t *signal)
 	for (i = state->num_channels - 1; i >= 0; --i)
 		signal[i] = scaled[i];
 }
+EXPORT_SYMBOL(pcan_log_scale);
+
+/* Called from the inline helpers in pcan.h, so needed by loadable modules */
+EXPORT_SYMBOL(NoiseReductionApply);
+EXPORT_SYMBOL(PcanGainControlApply);
