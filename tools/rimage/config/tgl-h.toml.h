@@ -65,7 +65,7 @@
 #endif
 
 #if defined(CONFIG_COMP_KPB) || defined(LLEXT_FORCE_ALL_MODULAR)
-#include <audio/kpb.toml>
+#include <audio/kpb/kpb.toml>
 #endif
 
 #if defined(CONFIG_COMP_SEL) || defined(LLEXT_FORCE_ALL_MODULAR)
