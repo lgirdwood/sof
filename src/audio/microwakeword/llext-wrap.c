@@ -117,7 +117,7 @@ float __math_invalidf(float x)
 }
 
 /* TFLM needs exit if build as a llext module only atm */
-#if CONFIG_COMP_MWW == m
+#if CONFIG_COMP_MWW_MODULE
 void _exit(int status)
 {
 	/*
