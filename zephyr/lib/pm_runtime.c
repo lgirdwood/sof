@@ -6,6 +6,7 @@
 #include <sof/lib/pm_runtime.h>
 #include <sof/lib/uuid.h>
 #include <sof/trace/trace.h>
+#include <rtos/symbol.h>
 #include <user/trace.h>
 #include <sof_versions.h>
 #include <stdint.h>
@@ -76,6 +77,7 @@ void pm_runtime_enable(enum pm_runtime_context context, uint32_t index)
 		break;
 	}
 }
+EXPORT_SYMBOL(pm_runtime_enable);
 
 /** Disables power _management_. The management, not the power. */
 void pm_runtime_disable(enum pm_runtime_context context, uint32_t index)
@@ -89,6 +91,7 @@ void pm_runtime_disable(enum pm_runtime_context context, uint32_t index)
 		break;
 	}
 }
+EXPORT_SYMBOL(pm_runtime_disable);
 
 /** Is the _power_ active. The power, not its management. */
 bool pm_runtime_is_active(enum pm_runtime_context context, uint32_t index)
@@ -105,3 +108,4 @@ bool pm_runtime_is_active(enum pm_runtime_context context, uint32_t index)
 	}
 	return false;
 }
+EXPORT_SYMBOL(pm_runtime_is_active);

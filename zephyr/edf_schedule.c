@@ -7,6 +7,7 @@
 #include <sof/audio/component.h>
 #include <sof/lib/memory.h>
 #include <rtos/alloc.h>
+#include <rtos/symbol.h>
 #include <rtos/task.h>
 #include <stdint.h>
 #include <sof/schedule/edf_schedule.h>
@@ -145,6 +146,7 @@ int schedule_task_init_edf(struct task *task, const struct sof_uuid_entry *uid,
 
 	return 0;
 }
+EXPORT_SYMBOL(schedule_task_init_edf);
 
 int schedule_task_init_edf_with_budget(struct task *task,
 				       const struct sof_uuid_entry *uid,
