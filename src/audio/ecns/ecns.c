@@ -909,6 +909,22 @@ static const struct module_interface ecns_interface = {
 	.free = ecns_free,
 };
 
+#if CONFIG_COMP_ECNS_MODULE
+/* modular: llext dynamic link */
+
+#include <module/module/api_ver.h>
+#include <module/module/llext.h>
+#include <rimage/sof/user/manifest.h>
+
+static const struct sof_man_module_manifest mod_manifest __section(".module") __used =
+	SOF_LLEXT_MODULE_MANIFEST("ECNS", &ecns_interface, 1, SOF_REG_UUID(ecns), 2);
+
+SOF_LLEXT_BUILDINFO;
+
+#else
+
 DECLARE_TR_CTX(ecns_tr, SOF_UUID(ecns_uuid), LOG_LEVEL_INFO);
 DECLARE_MODULE_ADAPTER(ecns_interface, ecns_uuid, ecns_tr);
 SOF_MODULE_INIT(ecns, sys_comp_module_ecns_interface_init);
+
+#endif

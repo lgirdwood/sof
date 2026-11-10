@@ -114,7 +114,7 @@ config COMP_WOV_ARBITER
 	  detectors to pause.
 
 config COMP_ECNS
-	bool "ECNS data processing component"
+	tristate "ECNS data processing component"
 	default y
 	depends on IPC_MAJOR_4
 	select MATH_IIR
