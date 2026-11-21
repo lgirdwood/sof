@@ -87,6 +87,14 @@ manifest:
 
     # Standalone ALSA topologies and build/packaging tooling.
     # Imports pinned alsa-lib and alsa-utils revisions from sof-topologies/west.yml.
+    #
+    # Workspace update conventions (when initialized via `west init -l sof`):
+    # - Standard sync (updates all pinned projects, not `sof` itself):
+    #     git -C sof pull && west update
+    # - Developing on a branch inside sof-topologies/ or sof-utils/:
+    #     west update --keep-descendants   (avoids detaching local feature branches)
+    # - Firmware-only CI/builds that want to skip sof-utils:
+    #     west config manifest.group-filter -tools && west update
     - name: sof-topologies
       repo-path: sof-topologies
       path: sof-topologies
@@ -98,7 +106,8 @@ manifest:
           - alsa-utils
 
     # Host utilities, visual tools, remote server, and sof-testbench4.
-    # Note: do not import sof-utils/west.yml here to avoid a circular `sof` entry.
+    # Do NOT import sof-utils/west.yml here: sof-utils/west.yml references `sof`,
+    # so importing it back would create a circular project entry.
     - name: sof-utils
       repo-path: sof-utils
       path: sof-utils
