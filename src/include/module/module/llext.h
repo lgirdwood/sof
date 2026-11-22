@@ -41,8 +41,20 @@
 	} \
 }
 
+#ifndef SOF_LLEXT_RETAIN
+#ifdef __has_attribute
+#if __has_attribute(__retain__)
+#define SOF_LLEXT_RETAIN __attribute__((__retain__))
+#endif
+#endif
+#ifndef SOF_LLEXT_RETAIN
+#define SOF_LLEXT_RETAIN
+#endif
+#endif
+
 #define SOF_LLEXT_BUILDINFO \
-static const struct sof_module_api_build_info buildinfo __section(".mod_buildinfo") __used = { \
+static const struct sof_module_api_build_info buildinfo __section(".mod_buildinfo") __used \
+	SOF_LLEXT_RETAIN = { \
 	.format = SOF_MODULE_API_BUILD_INFO_FORMAT, \
 	.api_version_number.full = SOF_MODULE_API_CURRENT_VERSION, \
 }

@@ -41,7 +41,8 @@ previously added LLEXT module for the establishment of a dependency chain."
 # Build an LLEXT module. Provice a module name, a list of sources and an address
 # of the .text section as arguments.
 function(sof_llext_build module)
-	set(multi_args SOURCES INCLUDES CFLAGS LIBS LIBS_PATH)
+	set(options NO_OFFSET_ADVANCE TOP_DOWN)
+	set(multi_args SOURCES INCLUDES CFLAGS LIBS LIBS_PATH LINK_OPTIONS)
 	set(single_args LIB)
 	cmake_parse_arguments(PARSE_ARGV 1 SOF_LLEXT "${options}" "${single_args}" "${multi_args}")
 
@@ -107,16 +108,31 @@ function(sof_llext_build module)
 		set(EXTRA_LINKER_PARAMS ${EXTRA_LINKER_PARAMS} -L${path})
 	endforeach()
 
+	foreach(opt ${SOF_LLEXT_LINK_OPTIONS})
+		llext_link_options(${module} ${opt})
+		set(EXTRA_LINKER_PARAMS ${EXTRA_LINKER_PARAMS} ${opt})
+	endforeach()
+
 	get_target_property(proc_in_file ${module} lib_output)
 	get_target_property(proc_out_file ${module} pkg_input)
 	get_target_property(proc_pkg_file ${module} pkg_output)
 	set(size_file ${PROJECT_BINARY_DIR}/module_size)
 
-	get_property(last_target GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET)
-	if(NOT "${last_target}" STREQUAL "")
-		add_dependencies(${module}_llext_proc ${last_target})
+	set(_reset_offset_arg "")
+	if(SOF_LLEXT_NO_OFFSET_ADVANCE)
+		# Standalone per-codec modules share the post-stock VA range without
+		# advancing the global module_size accumulator used by openmodules.
+		set_property(GLOBAL APPEND PROPERTY SOF_LLEXT_STANDALONE_TARGETS ${module})
+	else()
+		get_property(last_target GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET)
+		if(NOT "${last_target}" STREQUAL "")
+			add_dependencies(${module}_llext_proc ${last_target})
+			set(_reset_offset_arg "")
+		else()
+			set(_reset_offset_arg --reset)
+		endif()
+		set_property(GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET ${module})
 	endif()
-	set_property(GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET ${module})
 
 	add_llext_command(TARGET ${module}
 		POST_BUILD
@@ -124,20 +140,29 @@ function(sof_llext_build module)
 			-P ${SOF_BASE}scripts/cmake/llext_write_uuids.cmake
 	)
 
+	set(_end_addr_arg "")
+	if(SOF_LLEXT_TOP_DOWN AND CONFIG_LIBRARY_MANAGER AND CONFIG_LIBRARY_REGION_SIZE)
+		math(EXPR _lib_end "${CONFIG_LIBRARY_BASE_ADDRESS} + ${CONFIG_LIBRARY_REGION_SIZE}"
+			OUTPUT_FORMAT HEXADECIMAL)
+		set(_end_addr_arg --end-addr=${_lib_end})
+	endif()
+
 	add_llext_command(TARGET ${module}
 		POST_BUILD
 		COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_link_helper.py -s ${size_file}
-			--text-addr=${CONFIG_LIBRARY_BASE_ADDRESS}
+			${_reset_offset_arg} --text-addr=${CONFIG_LIBRARY_BASE_ADDRESS} ${_end_addr_arg}
 			-c $<TARGET_PROPERTY:bintools,elfconvert_command>
 			-f ${proc_in_file} -o ${proc_out_file} ${CMAKE_C_COMPILER} --
 			${EXTRA_LINKER_PARAMS} $<TARGET_OBJECTS:${module}_llext_lib> ${EXTRA_LIBS}
 	)
 
-	add_llext_command(TARGET ${module}
-		POST_PKG
-		COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_offset_calc.py
-			-i ${proc_pkg_file} -s ${size_file}
-	)
+	if(NOT SOF_LLEXT_NO_OFFSET_ADVANCE)
+		add_llext_command(TARGET ${module}
+			POST_PKG
+			COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_offset_calc.py
+				${_reset_offset_arg} -i ${proc_pkg_file} -s ${size_file}
+		)
+	endif()
 endfunction()
 
 # Initial SOF module will contain
@@ -702,5 +727,16 @@ endif()
 # Create Trace realtive file paths
 sof_append_relative_path_definitions(modules_sof)
 sof_append_relative_path_definitions(sof_kernel)
+
+get_property(_standalone_llexts GLOBAL PROPERTY SOF_LLEXT_STANDALONE_TARGETS)
+get_property(_last_stock_llext GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET)
+if(_standalone_llexts)
+	foreach(_mod IN LISTS _standalone_llexts)
+		add_dependencies(${_mod}_llext_lib uuid_reg_h)
+		if(NOT "${_last_stock_llext}" STREQUAL "")
+			add_dependencies(${_mod}_llext_proc ${_last_stock_llext})
+		endif()
+	endforeach()
+endif()
 
 endif() # CONFIG_SOF_FULL_ZEPHYR_APPLICATION

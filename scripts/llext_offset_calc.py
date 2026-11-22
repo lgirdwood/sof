@@ -20,6 +20,8 @@ def parse_args():
 						help='Object file name')
 	parser.add_argument("-s", "--size-file", required=True, type=str,
 						help='File to store accumulated size')
+	parser.add_argument("-r", "--reset", action="store_true",
+						help='Reset accumulated size before adding this module')
 
 	args = parser.parse_args()
 
@@ -58,11 +60,14 @@ def main():
 
 	f_output = pathlib.Path(args.size_file)
 
-	try:
-		with open(f_output, 'r') as f_size:
-			size = int(f_size.read().strip(), base = 0)
-	except OSError:
+	if args.reset:
 		size = 0
+	else:
+		try:
+			with open(f_output, 'r') as f_size:
+				size = int(f_size.read().strip(), base = 0)
+		except OSError:
+			size = 0
 
 	size += get_elf_size(args.input) + 0xfff
 	# align to a page border

@@ -36,6 +36,10 @@ def parse_args():
 						help='.text section address')
 	parser.add_argument("-s", "--size-file", required=True, type=str,
 						help='File with stored accumulated size')
+	parser.add_argument("-e", "--end-addr", required=False, type=str,
+						help='Optional exclusive region end address for top-down placement')
+	parser.add_argument("-r", "--reset", action="store_true",
+						help='Ignore any existing size file and start at text-addr')
 
 	args = parser.parse_args()
 
@@ -211,11 +215,14 @@ def main():
 	# Get the size of the previous module, if this isn't the first one.
 	# It is used to automatically calculate starting address of the current
 	# module.
-	try:
-		with open(args.size_file, 'r') as f_size:
-			size = int(f_size.read().strip(), base = 0)
-	except OSError:
+	if args.reset:
 		size = 0
+	else:
+		try:
+			with open(args.size_file, 'r') as f_size:
+				size = int(f_size.read().strip(), base = 0)
+		except OSError:
+			size = 0
 
 	text_addr = int(args.text_addr, 0) + size
 	text_size = 0
@@ -296,6 +303,36 @@ def main():
 
 	if not text_found:
 		raise RuntimeError('No .text section found in the object file')
+
+	if args.end_addr:
+		end_addr = int(args.end_addr, 0)
+		text_align = next(s.header['sh_addralign']
+				  for s in elf.iter_sections()
+				  if s.name == '.text' and (s.header['sh_flags'] & SH_FLAGS.SHF_ALLOC))
+		max_align = max([0x1000, text_align] +
+				[s.header['sh_addralign'] for s in readonly + writable])
+
+		def _compute_end(base):
+			t_addr = max_alignment(base, 0x1000, text_align)
+			cur = align_up(t_addr + text_size, 0x1000)
+			for sec in readonly:
+				cur = align_up(cur, sec.header['sh_addralign']) + sec.header['sh_size']
+			cur = align_up(cur, 0x1000)
+			for sec in writable:
+				cur = align_up(cur, sec.header['sh_addralign']) + sec.header['sh_size']
+			return align_up(cur, 0x1000)
+
+		span = _compute_end(text_addr) - text_addr
+		top_base = (end_addr - span) & ~(max_align - 1)
+		top_end = _compute_end(top_base)
+		if top_end > end_addr:
+			top_base -= align_up(top_end - end_addr, max_align)
+		if top_base < text_addr:
+			print(f'llext_link_helper.py: WARNING: {module} top-down base 0x{top_base:x} '
+			      f'overlaps modules ending at 0x{text_addr:x}', file=sys.stderr)
+		text_addr = max_alignment(top_base, 0x1000, text_align)
+		command = [c for c in command if not c.startswith('-Wl,-Ttext=')]
+		command.append(f'-Wl,-Ttext=0x{text_addr:x}')
 
 	# The original LLEXT support in SOF linked all LLEXT modules with pre-
 	# calculated addresses. Such modules can only be used at those exact
