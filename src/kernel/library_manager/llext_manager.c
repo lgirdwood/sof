@@ -231,7 +231,7 @@ static int llext_manager_rm_cold_partitions(struct lib_manager_module *mctx,
 						 mctx->segment[LIB_MANAGER_COLD].size,
 						 K_MEM_PARTITION_P_RX_U_RX | XTENSA_MMU_CACHED_WB);
 		if (ret < 0)
-			tr_err(&lib_manager_tr, "failed to remove .cold memory partition: %d", ret);
+			LOG_ERR("failed to remove .cold memory partition: %d", ret);
 	}
 
 	if (mctx->segment[LIB_MANAGER_COLDRODATA].addr) {
@@ -240,8 +240,7 @@ static int llext_manager_rm_cold_partitions(struct lib_manager_module *mctx,
 						 mctx->segment[LIB_MANAGER_COLDRODATA].size,
 						 K_MEM_PARTITION_P_RO_U_RO | XTENSA_MMU_CACHED_WB);
 		if (err < 0) {
-			tr_err(&lib_manager_tr,
-			       "failed to remove .coldrodata memory partition: %d", err);
+			LOG_ERR("failed to remove .coldrodata memory partition: %d", err);
 			if (!ret)
 				ret = err;
 		}
@@ -1476,8 +1475,7 @@ __cold void llext_manager_register_lib_codecs(const struct lib_manager_mod_ctx *
 
 		ret = sof_codec_info_add_items(mctx, sec, sec_size / sizeof(uint32_t));
 		if (ret < 0)
-			tr_warn(&lib_manager_tr, "failed to register codec info for mod %u: %d",
-				k, ret);
+			LOG_WRN("failed to register codec info for mod %u: %d", k, ret);
 	}
 }
 
@@ -1563,14 +1561,13 @@ __cold int llext_manager_remove_library(uint32_t module_id)
 			int ret = llext_free_inspection_data(&mctx->ebl->loader, mctx->llext);
 
 			if (ret < 0)
-				tr_warn(&lib_manager_tr,
-					"llext_free_inspection_data(%u) failed: %d", k, ret);
+				LOG_WRN("llext_free_inspection_data(%u) failed: %d", k, ret);
 		}
 		if (mctx->llext) {
 			int ret = llext_unload(&mctx->llext);
 
 			if (ret < 0)
-				tr_warn(&lib_manager_tr, "llext_unload(%u) failed: %d", k, ret);
+				LOG_WRN("llext_unload(%u) failed: %d", k, ret);
 			mctx->llext = NULL;
 		}
 		if (mctx->vma.size) {

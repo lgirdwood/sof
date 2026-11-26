@@ -142,6 +142,30 @@ __cold int sof_codec_info_add(const void *owner, uint32_t item)
 	return 0;
 }
 
+__cold int sof_codec_info_add_items(const void *owner, const uint32_t *items, size_t count)
+{
+	size_t i;
+
+	assert_can_be_cold();
+
+	if (!items) {
+		LOG_ERR("sof_codec_info_add_items: NULL items for owner %p", owner);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < count; i++) {
+		int ret = sof_codec_info_add(owner, items[i]);
+
+		if (ret < 0) {
+			LOG_ERR("sof_codec_info_add(%#x) failed for owner %p: %d",
+				items[i], owner, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 __cold void sof_codec_info_remove(const void *owner, uint32_t item)
 {
 	k_spinlock_key_t key;
@@ -933,13 +957,18 @@ __cold static int basefw_library_unload(bool first_block, bool last_block,
 
 	assert_can_be_cold();
 
-	if (!first_block || !last_block || data_offset < sizeof(lib_id) || !data)
+	if (!first_block || !last_block || data_offset < sizeof(lib_id) || !data) {
+		LOG_ERR("Invalid library unload params: first %d last %d size %u data %p",
+			first_block, last_block, data_offset, data);
 		return IPC4_ERROR_INVALID_PARAM;
+	}
 
 	lib_id = *(const uint32_t *)data;
 	ret = lib_manager_unload_library(lib_id);
 	if (!ret)
 		return IPC4_SUCCESS;
+
+	LOG_ERR("Failed to unload library id %u: %d", lib_id, ret);
 
 	switch (ret) {
 	case -EBUSY:

@@ -37,6 +37,15 @@ int sof_codec_info_add(const void *owner, uint32_t item);
  * \param[in] item Encoded item to remove, or 0 to remove all items for @p owner.
  */
 void sof_codec_info_remove(const void *owner, uint32_t item);
+
+/**
+ * \brief Add multiple runtime codec capability items for a module or library.
+ * \param[in] owner Opaque owner token (e.g. module interface or library module ctx).
+ * \param[in] items Array of encoded SOF_CODEC_INFO_ITEM(codec, dir) values.
+ * \param[in] count Number of entries in @p items.
+ * \return 0 on success, negative error code on failure.
+ */
+int sof_codec_info_add_items(const void *owner, const uint32_t *items, size_t count);
 #else
 static inline int sof_codec_info_add(const void *owner, uint32_t item)
 {
@@ -50,23 +59,14 @@ static inline void sof_codec_info_remove(const void *owner, uint32_t item)
 	(void)owner;
 	(void)item;
 }
-#endif
 
 static inline int sof_codec_info_add_items(const void *owner, const uint32_t *items, size_t count)
 {
-	size_t i;
-
-	if (!items)
-		return -EINVAL;
-
-	for (i = 0; i < count; i++) {
-		int ret = sof_codec_info_add(owner, items[i]);
-
-		if (ret < 0)
-			return ret;
-	}
-
+	(void)owner;
+	(void)items;
+	(void)count;
 	return 0;
 }
+#endif
 
 #endif /* __SOF_AUDIO_CODEC_INFO_H__ */

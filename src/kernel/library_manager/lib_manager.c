@@ -1398,20 +1398,29 @@ __cold int lib_manager_unload_library(uint32_t lib_id)
 
 	assert_can_be_cold();
 
-	if (lib_id == 0 || lib_id >= LIB_MANAGER_MAX_LIBS || !_ext_lib)
+	if (lib_id == 0 || lib_id >= LIB_MANAGER_MAX_LIBS || !_ext_lib) {
+		LOG_ERR("Invalid library id %u (ext_lib %p)", lib_id, _ext_lib);
 		return -EINVAL;
+	}
 
 	ctx = _ext_lib->desc[lib_id];
-	if (!ctx)
+	if (!ctx) {
+		LOG_ERR("Library id %u is not loaded", lib_id);
 		return -ENOENT;
+	}
 
 	module_id = LIB_MANAGER_PACK_LIB_ID(lib_id);
 	if (ctx->load_type == SOF_MAN_MOD_TYPE_LLEXT ||
 	    ctx->load_type == SOF_MAN_MOD_TYPE_LLEXT_AUX) {
 		ret = llext_manager_remove_library(module_id);
-		if (ret < 0)
+		if (ret < 0) {
+			LOG_ERR("Failed to remove LLEXT library id %u (mod %#x): %d",
+				lib_id, module_id, ret);
 			return ret;
+		}
 	} else {
+		LOG_ERR("Unsupported load type %u for unloading library id %u",
+			ctx->load_type, lib_id);
 		return -ENOTSUP;
 	}
 
@@ -1421,7 +1430,7 @@ __cold int lib_manager_unload_library(uint32_t lib_id)
 	rfree(ctx);
 	_ext_lib->desc[lib_id] = NULL;
 
-	tr_info(&lib_manager_tr, "unloaded library id: %u", lib_id);
+	LOG_INF("unloaded library id: %u", lib_id);
 
 	return 0;
 }
