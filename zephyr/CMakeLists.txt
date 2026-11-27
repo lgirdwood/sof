@@ -46,7 +46,7 @@ function(sof_llext_build module)
 	set(single_args LIB)
 	cmake_parse_arguments(PARSE_ARGV 1 SOF_LLEXT "${options}" "${single_args}" "${multi_args}")
 
-	cmake_path(SET SOF_BASE NORMALIZE ${APPLICATION_SOURCE_DIR}/..)
+	cmake_path(SET SOF_BASE NORMALIZE ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/..)
 
 	add_llext_target(${module}
 		OUTPUT  ${PROJECT_BINARY_DIR}/${module}_llext/${module}.llext
@@ -118,7 +118,7 @@ function(sof_llext_build module)
 	get_target_property(proc_pkg_file ${module} pkg_output)
 	set(size_file ${PROJECT_BINARY_DIR}/module_size)
 
-	set(_reset_offset_arg "")
+	set(_reset_size_file FALSE)
 	if(SOF_LLEXT_NO_OFFSET_ADVANCE)
 		# Standalone per-codec modules share the post-stock VA range without
 		# advancing the global module_size accumulator used by openmodules.
@@ -127,9 +127,8 @@ function(sof_llext_build module)
 		get_property(last_target GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET)
 		if(NOT "${last_target}" STREQUAL "")
 			add_dependencies(${module}_llext_proc ${last_target})
-			set(_reset_offset_arg "")
 		else()
-			set(_reset_offset_arg --reset)
+			set(_reset_size_file TRUE)
 		endif()
 		set_property(GLOBAL PROPERTY SOF_LLEXT_LAST_TARGET ${module})
 	endif()
@@ -139,6 +138,15 @@ function(sof_llext_build module)
 		COMMAND ${CMAKE_COMMAND} -DMODULE=${module} -DZEPHYR_BINARY_DIR=${ZEPHYR_BINARY_DIR}
 			-P ${SOF_BASE}scripts/cmake/llext_write_uuids.cmake
 	)
+
+	if(_reset_size_file)
+		# Reset the accumulated size file before the first stock module so
+		# incremental rebuilds start from --text-addr without extra CLI flags.
+		add_llext_command(TARGET ${module}
+			POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E rm -f ${size_file}
+		)
+	endif()
 
 	set(_end_addr_arg "")
 	if(SOF_LLEXT_TOP_DOWN AND CONFIG_LIBRARY_MANAGER AND CONFIG_LIBRARY_REGION_SIZE)
@@ -150,7 +158,7 @@ function(sof_llext_build module)
 	add_llext_command(TARGET ${module}
 		POST_BUILD
 		COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_link_helper.py -s ${size_file}
-			${_reset_offset_arg} --text-addr=${CONFIG_LIBRARY_BASE_ADDRESS} ${_end_addr_arg}
+			--text-addr=${CONFIG_LIBRARY_BASE_ADDRESS} ${_end_addr_arg}
 			-c $<TARGET_PROPERTY:bintools,elfconvert_command>
 			-f ${proc_in_file} -o ${proc_out_file} ${CMAKE_C_COMPILER} --
 			${EXTRA_LINKER_PARAMS} $<TARGET_OBJECTS:${module}_llext_lib> ${EXTRA_LIBS}
@@ -160,7 +168,7 @@ function(sof_llext_build module)
 		add_llext_command(TARGET ${module}
 			POST_PKG
 			COMMAND ${PYTHON_EXECUTABLE} ${SOF_BASE}scripts/llext_offset_calc.py
-				${_reset_offset_arg} -i ${proc_pkg_file} -s ${size_file}
+				-i ${proc_pkg_file} -s ${size_file}
 		)
 	endif()
 endfunction()
