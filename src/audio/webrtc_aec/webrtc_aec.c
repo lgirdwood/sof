@@ -19,9 +19,11 @@
 #include <module/audio/source_api.h>
 #include <module/audio/sink_api.h>
 #include <sof/audio/audio_stream.h>
-#include <ipc4/aec.h>
+#ifdef CONFIG_IPC_MAJOR_4
 #include <ipc4/header.h>
-#include <ipc4/module.h>
+#else
+#include <ipc/control.h>
+#endif
 #include <sof/math/numbers.h>
 #include <rtos/init.h>
 #include <rtos/string.h>
@@ -568,11 +570,37 @@ __cold static int webrtc_aec_free(struct processing_module *mod)
 	assert_can_be_cold();
 	comp_dbg(mod->dev, "webrtc_aec: free");
 
-	if (cd->backend->free)
+	if (cd && cd->backend && cd->backend->free)
 		cd->backend->free(mod);
+
+	if (webrtc_aec_get_active_mod() == mod)
+		webrtc_aec_set_active_mod(NULL);
 
 	mod_free(mod, cd);
 	return 0;
+}
+
+static int webrtc_aec_apply_ctl(struct processing_module *mod,
+				struct webrtc_aec_comp_data *cd,
+				uint32_t id, uint32_t value)
+{
+	struct comp_dev *dev = mod->dev;
+
+	if (id == 0) {
+		cd->enabled = (value != 0);
+		comp_info(dev, "webrtc_aec: switch enable = %d", cd->enabled);
+		return 0;
+	}
+	if (id == 1) {
+		cd->high_suppression = (value != 0);
+		comp_info(dev, "webrtc_aec: high suppression = %d", cd->high_suppression);
+		if (cd->backend && cd->backend->set_suppression)
+			return cd->backend->set_suppression(mod, cd->high_suppression);
+		return 0;
+	}
+
+	comp_err(dev, "webrtc_aec: unknown control id %d", id);
+	return -EINVAL;
 }
 
 static int webrtc_aec_set_config(struct processing_module *mod, uint32_t param_id,
@@ -584,6 +612,7 @@ static int webrtc_aec_set_config(struct processing_module *mod, uint32_t param_i
 	struct comp_dev *dev = mod->dev;
 
 	webrtc_aec_set_active_mod(mod);
+#ifdef CONFIG_IPC_MAJOR_4
 	if (param_id == SOF_IPC4_SWITCH_CONTROL_PARAM_ID) {
 		const struct sof_ipc4_control_msg_payload *ctl =
 			(const struct sof_ipc4_control_msg_payload *)fragment;
@@ -600,22 +629,18 @@ static int webrtc_aec_set_config(struct processing_module *mod, uint32_t param_i
 			return -EINVAL;
 		}
 
-		if (ctl->id == 0) {
-			cd->enabled = (ctl->chanv[0].value != 0);
-			comp_info(dev, "webrtc_aec: switch enable = %d", cd->enabled);
-			return 0;
-		}
-		if (ctl->id == 1) {
-			cd->high_suppression = (ctl->chanv[0].value != 0);
-			comp_info(dev, "webrtc_aec: high suppression = %d", cd->high_suppression);
-			if (cd->backend && cd->backend->set_suppression)
-				return cd->backend->set_suppression(mod, cd->high_suppression);
-			return 0;
-		}
-
-		comp_err(dev, "webrtc_aec: unknown control id %d", ctl->id);
-		return -EINVAL;
+		return webrtc_aec_apply_ctl(mod, cd, ctl->id, ctl->chanv[0].value);
 	}
+#else
+	if (fragment_size >= sizeof(struct sof_ipc_ctrl_data) +
+	    sizeof(struct sof_ipc_ctrl_value_chan)) {
+		const struct sof_ipc_ctrl_data *cdata =
+			(const struct sof_ipc_ctrl_data *)fragment;
+
+		if (cdata->cmd == SOF_CTRL_CMD_SWITCH && cdata->num_elems >= 1)
+			return webrtc_aec_apply_ctl(mod, cd, cdata->index, cdata->chanv[0].value);
+	}
+#endif
 
 	comp_err(dev, "webrtc_aec: unsupported param_id 0x%x", param_id);
 	return -EINVAL;
@@ -627,22 +652,34 @@ static int webrtc_aec_get_config(struct processing_module *mod, uint32_t config_
 {
 	struct webrtc_aec_comp_data *cd = module_get_private_data(mod);
 
+#ifdef CONFIG_IPC_MAJOR_4
 	if (config_id == SOF_IPC4_SWITCH_CONTROL_PARAM_ID) {
 		struct sof_ipc4_control_msg_payload *ctl =
 			(struct sof_ipc4_control_msg_payload *)fragment;
+
+		if (fragment_size < sizeof(struct sof_ipc4_control_msg_payload) +
+		    sizeof(struct sof_ipc4_ctrl_value_chan))
+			return -EINVAL;
+
 		ctl->num_elems = 1;
 		ctl->chanv[0].channel = 0;
-		if (ctl->id == 0) {
+		if (ctl->id == 0)
 			ctl->chanv[0].value = cd->enabled ? 1 : 0;
-		} else if (ctl->id == 1) {
+		else if (ctl->id == 1)
 			ctl->chanv[0].value = cd->high_suppression ? 1 : 0;
-		} else {
+		else
 			return -EINVAL;
-		}
 		*data_offset_size = sizeof(struct sof_ipc4_control_msg_payload) +
 				    sizeof(struct sof_ipc4_ctrl_value_chan);
 		return 0;
 	}
+#else
+	(void)cd;
+	(void)config_id;
+	(void)data_offset_size;
+	(void)fragment;
+	(void)fragment_size;
+#endif
 
 	return -EINVAL;
 }

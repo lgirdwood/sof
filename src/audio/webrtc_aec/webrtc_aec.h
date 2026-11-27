@@ -21,7 +21,6 @@
 #define __SOF_AUDIO_WEBRTC_AEC_H__
 
 #include <sof/audio/module_adapter/module/generic.h>
-#include <ipc4/aec.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -156,9 +155,6 @@ struct webrtc_aec_comp_data {
 
 	/* Ref stream liveness (IPC4: always active). */
 	bool last_ref_ok;
-
-	/* IPC4 tuning (echo path delay, etc.) — reserved for set_config. */
-	struct sof_ipc4_aec_config config;
 
 	bool configured;
 };
