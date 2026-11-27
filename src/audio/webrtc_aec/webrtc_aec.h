@@ -29,6 +29,7 @@
  * At 48 kHz: 480 samples/channel (resampled to/from 16 kHz for AECm).
  */
 #define WEBRTC_AEC_FRAME_SAMPLES_16K	160
+#define WEBRTC_AEC_FRAME_SAMPLES_32K	320
 #define WEBRTC_AEC_FRAME_SAMPLES_48K	480
 #define WEBRTC_AEC_FRAME_SAMPLES_MAX	WEBRTC_AEC_FRAME_SAMPLES_48K
 #define WEBRTC_AEC_FIFO_FRAMES		(WEBRTC_AEC_FRAME_SAMPLES_MAX * 2)
@@ -38,6 +39,12 @@
 
 /* Maximum DMA buffer alignment. */
 #define WEBRTC_AEC_MEM_ALIGN		64
+
+enum webrtc_aec_resamp_mode {
+	WEBRTC_AEC_RESAMP_NONE = 0,
+	WEBRTC_AEC_RESAMP_48_TO_16,
+	WEBRTC_AEC_RESAMP_32_TO_16,
+};
 
 /* Fixed-point 48kHz <-> 16kHz resampler states (WebRTC APM SPL). */
 struct webrtc_aec_state_48_to_16 {
@@ -138,7 +145,7 @@ struct webrtc_aec_comp_data {
 	int ref_frame_bytes;  /* bytes per pipeline frame on ref input */
 	int out_frame_bytes;
 	bool is_s32;          /* true for S32_LE pipeline */
-	bool needs_resample;  /* true when rate == 48000 and proc_rate == 16000 */
+	enum webrtc_aec_resamp_mode resamp_mode;
 
 	/* Processing frame size at proc_rate. */
 	int frame_samples;    /* pipeline frames per 10 ms */
@@ -160,6 +167,11 @@ struct webrtc_aec_comp_data {
 	struct webrtc_aec_state_48_to_16 ref_resamp[WEBRTC_AEC_CHANNELS_MAX];
 	struct webrtc_aec_state_16_to_48 out_resamp[WEBRTC_AEC_CHANNELS_MAX];
 	int32_t resamp_tmpmem[512];
+
+	/* Resampler state for 32kHz <-> 16kHz (WebRtcSpl_DownsampleBy2/UpsampleBy2) */
+	int32_t mic_resamp32[WEBRTC_AEC_CHANNELS_MAX][8];
+	int32_t ref_resamp32[WEBRTC_AEC_CHANNELS_MAX][8];
+	int32_t out_resamp32[WEBRTC_AEC_CHANNELS_MAX][8];
 
 	/* Ref stream liveness. */
 	bool last_ref_ok;
