@@ -268,6 +268,11 @@ __cold static int webrtc_aec_init(struct processing_module *mod)
 	cd->backend = &webrtc_aec_backend;
 	cd->enabled = false;
 	cd->high_suppression = false;
+#ifdef CONFIG_WEBRTC_AEC_DELAY_MS
+	cd->delay_ms = CONFIG_WEBRTC_AEC_DELAY_MS;
+#else
+	cd->delay_ms = 20;
+#endif
 	cd->downmix_ref = IS_ENABLED(CONFIG_WEBRTC_AEC_STEREO_DOWNMIX_REF);
 
 	/* Two input pins: mic + echo reference. */
@@ -422,6 +427,9 @@ __cold static int webrtc_aec_prepare(struct processing_module *mod,
 			return ret;
 		}
 	}
+
+	if (cd->backend->set_delay)
+		cd->backend->set_delay(mod, cd->delay_ms);
 
 	cd->buffered_in_frames = 0;
 	for (ret = 0; ret < cd->mic_channels; ret++)
